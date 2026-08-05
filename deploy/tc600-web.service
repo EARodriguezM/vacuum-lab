@@ -1,0 +1,25 @@
+# Optional: run the control panel automatically at boot.
+#
+#   sudo cp deploy/tc600-web.service /etc/systemd/system/
+#   sudo systemctl enable --now tc600-web
+#
+# Not installed by default. Read the security note in README.md first: with no
+# --token, anyone who can reach port 8600 can start and stop the pump, and a
+# service starts that exposure automatically on every boot.
+
+[Unit]
+Description=TC 600 turbopump control panel
+After=network.target
+
+[Service]
+Type=simple
+User=esarodriguezm
+Group=dialout
+WorkingDirectory=/home/esarodriguezm/tc600-control
+ExecStart=/usr/bin/python3 /home/esarodriguezm/tc600-control/webserver.py \
+    --serial /dev/ttyS1 --address 1 --port 8600
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

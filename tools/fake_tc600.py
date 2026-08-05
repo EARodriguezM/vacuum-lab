@@ -43,6 +43,10 @@ STATE: dict[int, object] = {
     354: "0201",
     302: False, 306: False, 307: False, 300: False, 304: False, 305: False,
     707: 100.0, 717: 66, 797: 1,
+    # Accessory connectors: HEAT/TMS, VENT, FV PUMP.
+    1: False, 331: 0, 333: False, 334: 90, 335: 1, 704: 40, 32: 0,
+    12: True, 30: 0, 720: 50, 721: 3600,
+    25: 0, 710: 0, 711: 0,
 }
 
 # Parameters this fake firmware deliberately does not implement, so the
@@ -58,7 +62,10 @@ _speed = 0.0
 def advance(dt: float) -> None:
     """Move the simulated rotor towards its target speed."""
     global _speed
-    running = STATE[10] or STATE[23]
+    # Measured on the real TC 600: the rotor turns only when the pumping
+    # station is on AND the turbopump motor is enabled. Either one alone holds
+    # it at 0 Hz -- which is exactly what makes "backing pump only" possible.
+    running = STATE[10] and STATE[23]
     if running:
         target = STATE[308]
         if STATE[2]:

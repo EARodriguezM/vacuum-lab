@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TC 600 Control Panel — Manual</title>
+<style>
+  :root{
+    --paper:#eef1f2; --card:#f8fafa; --ink:#141b21; --ink-soft:#4a565f;
+    --ink-faint:#7d8a93; --rule:#ccd5d8; --accent:#0d6d78; --accent-ink:#fff;
+    --good:#2c7a5b; --good-bg:#e3f2ea; --warn:#a8791a; --warn-bg:#fdf3e0;
+    --crit:#b8372c; --crit-bg:#fbe9e7; --idle:#6f7a82; --idle-bg:#e8edee;
+    --field:#fff;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --paper:#0e1418; --card:#161f25; --ink:#e4ebee; --ink-soft:#a7b4bc;
+      --ink-faint:#77858e; --rule:#2a373f; --accent:#46b3bd; --accent-ink:#06222a;
+      --good:#5fc194; --good-bg:#12291f; --warn:#d6a640; --warn-bg:#2b2210;
+      --crit:#e2695c; --crit-bg:#2d1613; --idle:#93a1aa; --idle-bg:#1c262c;
+      --field:#0d1418;
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#0e1418; --card:#161f25; --ink:#e4ebee; --ink-soft:#a7b4bc;
+    --ink-faint:#77858e; --rule:#2a373f; --accent:#46b3bd; --accent-ink:#06222a;
+    --good:#5fc194; --good-bg:#12291f; --warn:#d6a640; --warn-bg:#2b2210;
+    --crit:#e2695c; --crit-bg:#2d1613; --idle:#93a1aa; --idle-bg:#1c262c;
+    --field:#0d1418;
+  }
+  :root[data-theme="light"]{
+    --paper:#eef1f2; --card:#f8fafa; --ink:#141b21; --ink-soft:#4a565f;
+    --ink-faint:#7d8a93; --rule:#ccd5d8; --accent:#0d6d78; --accent-ink:#fff;
+    --good:#2c7a5b; --good-bg:#e3f2ea; --warn:#a8791a; --warn-bg:#fdf3e0;
+    --crit:#b8372c; --crit-bg:#fbe9e7; --idle:#6f7a82; --idle-bg:#e8edee;
+    --field:#fff;
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);
+       font-family:ui-sans-serif,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       font-size:16px;line-height:1.62}
+  .mono,code,pre{font-family:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace}
+
+  .shell{max-width:1180px;margin:0 auto;padding:36px 20px 80px}
+  .layout{display:grid;gap:36px;grid-template-columns:minmax(0,1fr)}
+  @media(min-width:940px){.layout{grid-template-columns:216px minmax(0,1fr);gap:44px}}
+
+  /* --- masthead --- */
+  .masthead{border-bottom:2px solid var(--ink);padding-bottom:16px;margin-bottom:32px}
+  .eyebrow{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;
+           letter-spacing:.17em;text-transform:uppercase;color:var(--accent);
+           margin-bottom:8px}
+  h1{margin:0 0 10px;font-size:clamp(27px,4.6vw,40px);line-height:1.08;
+     letter-spacing:-.022em;font-weight:660;text-wrap:balance}
+  .standfirst{margin:0;max-width:60ch;color:var(--ink-soft);font-size:17px}
+  .urlbar{margin-top:16px;display:inline-block;font-family:ui-monospace,Menlo,monospace;
+          font-size:15px;padding:8px 14px;border-radius:6px;
+          background:var(--accent);color:var(--accent-ink);font-weight:600}
+
+  /* --- nav --- */
+  nav{font-size:14px}
+  @media(min-width:940px){nav{position:sticky;top:24px;align-self:start;max-height:calc(100vh - 48px);overflow-y:auto}}
+  nav .navtitle{font-size:11px;letter-spacing:.13em;text-transform:uppercase;
+                color:var(--ink-faint);font-weight:650;margin-bottom:10px}
+  nav ol{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:2px;
+         counter-reset:n}
+  nav a{display:block;padding:5px 8px;border-radius:4px;color:var(--ink-soft);
+        text-decoration:none;border-left:2px solid transparent;counter-increment:n}
+  nav a::before{content:counter(n,decimal-leading-zero) "  ";color:var(--ink-faint);
+                font-family:ui-monospace,Menlo,monospace;font-size:11px}
+  nav a:hover{color:var(--accent);border-left-color:var(--accent);background:var(--card)}
+
+  /* --- sections --- */
+  section{margin-bottom:44px;scroll-margin-top:20px}
+  h2{margin:0 0 6px;font-size:22px;letter-spacing:-.012em;font-weight:660;text-wrap:balance}
+  h2 .num{font-family:ui-monospace,Menlo,monospace;font-size:13px;color:var(--accent);
+          margin-right:9px;font-weight:600}
+  h3{margin:26px 0 8px;font-size:15.5px;font-weight:660}
+  h3 .conn{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;
+           font-weight:700;letter-spacing:.06em;padding:3px 9px;border-radius:4px;
+           background:var(--accent);color:var(--accent-ink);margin-right:9px}
+  p{margin:0 0 12px;max-width:68ch}
+  .lede{color:var(--ink-soft)}
+  ul,ol.steps{margin:0 0 12px;padding-left:22px;max-width:68ch}
+  li{margin-bottom:6px}
+  .sechr{height:1px;background:var(--rule);border:0;margin:0 0 20px}
+
+  .card{background:var(--card);border:1px solid var(--rule);border-radius:8px;
+        padding:18px 20px;margin:16px 0}
+  .note{border-left:3px solid var(--accent);border-radius:0 6px 6px 0;
+        background:var(--card);padding:14px 18px;margin:16px 0;font-size:15px}
+  .caution{border-left:3px solid var(--warn);background:var(--warn-bg);color:var(--warn);
+           border-radius:0 6px 6px 0;padding:14px 18px;margin:16px 0;font-size:15px;
+           font-weight:500}
+  .caution strong,.note strong{font-weight:700}
+
+  /* --- specimens --- */
+  .pill{display:inline-flex;align-items:center;gap:7px;padding:4px 11px;border-radius:999px;
+        font-size:12.5px;font-weight:650;white-space:nowrap;vertical-align:middle}
+  .pill .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+  .pill.good{color:var(--good);background:var(--good-bg)}
+  .pill.warn{color:var(--warn);background:var(--warn-bg)}
+  .pill.crit{color:var(--crit);background:var(--crit-bg)}
+  .pill.idle{color:var(--idle);background:var(--idle-bg)}
+  .btn{display:inline-block;font-size:13.5px;font-weight:650;padding:6px 13px;
+       border-radius:6px;border:1px solid var(--rule);background:var(--card);
+       color:var(--ink);vertical-align:middle}
+  .btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+  .btn.danger{border-color:var(--crit);color:var(--crit)}
+
+  /* --- tables --- */
+  .tw{overflow-x:auto;margin:16px 0}
+  table{border-collapse:collapse;width:100%;min-width:460px;font-size:14.5px;
+        font-variant-numeric:tabular-nums}
+  th,td{text-align:left;padding:9px 14px 9px 0;border-bottom:1px solid var(--rule);
+        vertical-align:top}
+  th{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint);
+     font-weight:650;border-bottom-color:var(--ink-soft)}
+  td.k{white-space:nowrap}
+
+  code{font-size:.9em;background:var(--field);border:1px solid var(--rule);
+       border-radius:3px;padding:1px 5px}
+  pre{background:var(--field);border:1px solid var(--rule);border-left:3px solid var(--accent);
+      border-radius:0 5px 5px 0;padding:13px 15px;overflow-x:auto;font-size:13px;
+      line-height:1.55;margin:14px 0}
+  pre code{background:none;border:none;padding:0}
+
+  footer{border-top:1px solid var(--rule);padding-top:18px;color:var(--ink-faint);
+         font-size:13px}
+  a{color:var(--accent)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <header class="masthead">
+    <div class="eyebrow">Operating manual &middot; Pfeiffer Vacuum TC 600</div>
+    <h1>TC 600 Control Panel</h1>
+    <p class="standfirst">
+      A browser interface to the turbopump drive unit, served by the lab PC that is
+      wired to it over RS-485. This manual covers every control on the page, the
+      procedures they belong to, and what to do when something does not respond.
+    </p>
+    <div class="urlbar">http://172.16.2.62:8600/</div>
+  </header>
+
+  <div class="layout">
+    <nav>
+      <div class="navtitle">Contents</div>
+      <ol>
+        <li><a href="#connect">Connecting</a></li>
+        <li><a href="#reading">Reading the panel</a></li>
+        <li><a href="#controls">Main controls</a></li>
+        <li><a href="#accessories">Accessory connectors</a></li>
+        <li><a href="#procedures">Procedures</a></li>
+        <li><a href="#safety">Safety model</a></li>
+        <li><a href="#trouble">Troubleshooting</a></li>
+        <li><a href="#server">Running the server</a></li>
+        <li><a href="#api">API reference</a></li>
+      </ol>
+    </nav>
+
+    <main>
+
+    <!-- 1 ------------------------------------------------------------------>
+    <section id="connect">
+      <h2><span class="num">01</span>Connecting</h2>
+      <hr class="sechr">
+      <p class="lede">
+        Open <code>http://172.16.2.62:8600/</code> from any machine on the lab
+        network. Phone, laptop, the lab PC itself &mdash; the layout adapts.
+      </p>
+
+      <h3>The controller address field</h3>
+      <p>
+        The <strong>Controller</strong> card at the top names the machine that is
+        physically wired to the pump. It exists because that machine's IP has
+        changed before and will again.
+      </p>
+      <ul>
+        <li>Type a host and press <span class="btn">Connect</span>, or just hit Enter.</li>
+        <li>A bare address gets <code>:8600</code> appended, so <code>172.16.2.62</code>
+            and <code>172.16.2.62:8600</code> are equivalent.</li>
+        <li>The value is saved in your browser and survives reloads.</li>
+        <li><span class="btn">Use this page's host</span> snaps back to whichever
+            machine served the page.</li>
+      </ul>
+      <div class="note">
+        <strong>Why this field exists at all.</strong> The page must reach a program
+        that can open <code>/dev/ttyS1</code>. That program is the controller. Pointing
+        the field elsewhere retargets the whole page &mdash; readings and controls
+        both &mdash; at a different controller.
+      </div>
+    </section>
+
+    <!-- 2 ------------------------------------------------------------------>
+    <section id="reading">
+      <h2><span class="num">02</span>Reading the panel</h2>
+      <hr class="sechr">
+
+      <h3>Connection state, top right</h3>
+      <p>One badge tells you what the whole system is doing:</p>
+      <div class="tw">
+        <table>
+          <thead><tr><th>Badge</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td class="k"><span class="pill idle"><i class="dot"></i>Stopped</span></td>
+                <td>Pumping station off, rotor at rest. The normal idle state.</td></tr>
+            <tr><td class="k"><span class="pill warn"><i class="dot"></i>Backing pump only</span></td>
+                <td>Station on but the turbopump motor is disabled &mdash; the roughing-down state.</td></tr>
+            <tr><td class="k"><span class="pill good"><i class="dot"></i>Station on</span></td>
+                <td>Station on, motor enabled, rotor not yet turning.</td></tr>
+            <tr><td class="k"><span class="pill good"><i class="dot"></i>Running</span></td>
+                <td>Rotor turning.</td></tr>
+            <tr><td class="k"><span class="pill crit"><i class="dot"></i>Fault 002</span></td>
+                <td>The drive reports an error code. See <a href="#trouble">Troubleshooting</a>.</td></tr>
+            <tr><td class="k"><span class="pill crit"><i class="dot"></i>Pump not responding</span></td>
+                <td>Controller is reachable, the pump is not. Usually powered off.</td></tr>
+            <tr><td class="k"><span class="pill crit"><i class="dot"></i>Controller unreachable</span></td>
+                <td>The address in the field is wrong, or the server is not running.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Rotation speed</h3>
+      <p>
+        The large figure is actual rotor speed in Hz, with a bar showing it against
+        this pump's nominal <strong>1500 Hz</strong>. Below it sit status chips:
+      </p>
+      <p>
+        <span class="pill warn"><i class="dot"></i>Turbopump motor DISABLED</span>
+        <span class="pill good"><i class="dot"></i>Station on</span>
+        <span class="pill crit"><i class="dot"></i>Pump over-temp</span>
+        <span class="pill warn"><i class="dot"></i>Accelerating</span>
+        <span class="pill good"><i class="dot"></i>Setpoint reached</span>
+      </p>
+      <p>
+        The motor chip matters most. If the rotor reads 0 Hz while the station is on,
+        that chip is the reason.
+      </p>
+
+      <h3>Readings</h3>
+      <div class="tw">
+        <table>
+          <thead><tr><th>Field</th><th>Parameter</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td class="k">Commanded speed</td><td class="k mono">P308</td>
+                <td>What the drive is commanding, in Hz. <em>Not</em> the percentage setpoint in Control.</td></tr>
+            <tr><td class="k">Drive current</td><td class="k mono">P310</td>
+                <td>Motor current. Near zero means the rotor is genuinely not being driven.</td></tr>
+            <tr><td class="k">Drive voltage</td><td class="k mono">P313</td>
+                <td>About 23 V at rest on this unit.</td></tr>
+            <tr><td class="k">Drive power</td><td class="k mono">P316</td><td>Motor power in W.</td></tr>
+            <tr><td class="k">Error code</td><td class="k mono">P303</td>
+                <td>Shows <code>none</code> when clear.</td></tr>
+            <tr><td class="k">Pump hours</td><td class="k mono">P311</td>
+                <td>Lifetime running hours.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="lede">
+        Live values refresh every 2.5 seconds. Polling pauses when the tab is hidden
+        and resumes the moment you come back.
+      </p>
+    </section>
+
+    <!-- 3 ------------------------------------------------------------------>
+    <section id="controls">
+      <h2><span class="num">03</span>Main controls</h2>
+      <hr class="sechr">
+      <p class="lede">Every button here confirms before acting. See <a href="#safety">Safety model</a>.</p>
+
+      <div class="tw">
+        <table>
+          <thead><tr><th>Control</th><th>Does</th></tr></thead>
+          <tbody>
+            <tr><td class="k"><span class="btn primary">Start pumping station</span></td>
+                <td>Sets <code>PumpgStatn</code>. Powers the backing pump through the relay box
+                    <strong>and</strong> spins up the turbopump, unless the motor is disabled.</td></tr>
+            <tr><td class="k"><span class="btn danger">Stop</span></td>
+                <td>Clears <code>PumpgStatn</code>. Station off, rotor coasts down.</td></tr>
+            <tr><td class="k"><span class="btn">Standby on</span> / <span class="btn">off</span></td>
+                <td>Runs at the standby setpoint instead of full speed (66 % on this unit).</td></tr>
+            <tr><td class="k"><span class="btn">Acknowledge fault</span></td>
+                <td>Clears a latched error. The only control that does not ask for confirmation,
+                    because it cannot move anything.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Speed setpoint</h3>
+      <p>
+        The number field and slider are linked; set either. Range is
+        <strong>20&ndash;100 %</strong>, and values outside it are rejected with a
+        message rather than silently clamped.
+      </p>
+      <div class="note">
+        Applying a setpoint also switches the drive into rotation-speed-setting mode
+        (<code>P26 = 1</code>). Until that mode is active the setpoint has no effect,
+        so the panel sets both for you.
+      </div>
+    </section>
+
+    <!-- 4 ------------------------------------------------------------------>
+    <section id="accessories">
+      <h2><span class="num">04</span>Accessory connectors</h2>
+      <hr class="sechr">
+      <p class="lede">
+        What is reachable over RS-485 was established by reading every parameter
+        number from 0 to 999 on this drive unit. It implements 64. Three of the four
+        connectors are controllable.
+      </p>
+
+      <h3><span class="conn">HEAT/TMS</span>Casing heating</h3>
+      <p>
+        This unit is a <strong>TMS installation</strong> (temperature management
+        system), not a plain casing heater &mdash; so it has a real temperature
+        setpoint rather than just on/off.
+      </p>
+      <ul>
+        <li><span class="btn">Heating on</span> / <span class="btn">off</span> &mdash; <code>P001</code>.</li>
+        <li><strong>TMS setpoint</strong>, 30&ndash;90 &deg;C &mdash; <code>P704</code>.</li>
+        <li>Readouts: actual temperature, max temperature, whether the regulator is
+            engaged, and whether the output is wired for heating or sealing gas.</li>
+      </ul>
+      <div class="caution">
+        The pump casing gets hot and <strong>stays hot after switching off</strong>.
+        The manual warns the high-vacuum flange must not exceed 120 &deg;C.
+      </div>
+
+      <h3><span class="conn">VENT</span>Venting valve</h3>
+      <ul>
+        <li><span class="btn">Enable venting</span> / <span class="btn">Block venting</span> &mdash; <code>P012</code>.</li>
+        <li><strong>Mode</strong> &mdash; <code>P030</code>: 0 controlled venting,
+            1 no venting, 2 venting on.</li>
+        <li><strong>Vent speed</strong> 40&ndash;98 % &mdash; <code>P720</code>, the speed below which venting starts.</li>
+        <li><strong>Vent time</strong> 6&ndash;3600 s &mdash; <code>P721</code>, how long the valve stays open.</li>
+      </ul>
+      <div class="caution">
+        Venting raises the pump to atmosphere. Do not vent a spinning rotor outside
+        the controlled-venting profile.
+      </div>
+
+      <h3><span class="conn">FV PUMP</span>Backing pump</h3>
+      <p>
+        <strong>There is no independent on/off.</strong> The backing pump is switched
+        through the relay box by the pumping station, so it starts and stops with
+        <span class="btn primary">Start pumping station</span>. What you can set is
+        how it behaves once running:
+      </p>
+      <ul>
+        <li><strong>Mode</strong> &mdash; <code>P025</code>: 0 continuous, 1 intermittent, 2 switch-on delayed.</li>
+        <li><strong>Switch-on / switch-off thresholds</strong> in W &mdash; <code>P711</code> / <code>P710</code>.</li>
+      </ul>
+      <div class="note">
+        <strong>No feedback.</strong> The drive unit has no parameter reporting whether
+        the backing pump is actually turning &mdash; only that the relay was commanded.
+        Confirm by ear.
+      </div>
+
+      <h3><span class="conn">FAN</span>Air cooling</h3>
+      <p>
+        <strong>Not controllable over RS-485, by design.</strong> The cooling unit plugs
+        into the drive unit's dedicated <code>FAN</code> connector and the TC 600 drives
+        it directly. The full 0&ndash;999 sweep found no fan parameter, and the accessory
+        configuration parameters other Pfeiffer units use for air cooling
+        (<code>P35</code>&ndash;<code>P38</code>) are not implemented on this firmware.
+        The panel says so rather than offering a button that does nothing.
+      </p>
+    </section>
+
+    <!-- 5 ------------------------------------------------------------------>
+    <section id="procedures">
+      <h2><span class="num">05</span>Procedures</h2>
+      <hr class="sechr">
+
+      <h3>Roughing down &mdash; backing pump only</h3>
+      <p>
+        The usual first step: evacuate the foreline without spinning the turbopump.
+        Because the backing pump has no separate switch, this takes two moves in order.
+      </p>
+      <ol class="steps">
+        <li>Disable the turbopump motor (<code>MotorPump = 0</code>).</li>
+        <li>Start the pumping station. The relay box powers the backing pump; the rotor stays at 0 Hz.</li>
+        <li>Confirm: badge reads <span class="pill warn"><i class="dot"></i>Backing pump only</span>,
+            speed 0 Hz, drive current near 0 A.</li>
+      </ol>
+      <p>From a terminal, if you prefer:</p>
+<pre><code>curl -X POST http://172.16.2.62:8600/api/command \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"motor_off","confirm":true}'
+
+curl -X POST http://172.16.2.62:8600/api/command \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"on","confirm":true}'</code></pre>
+
+      <h3>Starting the turbopump</h3>
+      <p>Once the foreline is down, re-enable the motor. The station is already on.</p>
+<pre><code>curl -X POST http://172.16.2.62:8600/api/command \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"motor_on","confirm":true}'</code></pre>
+      <div class="caution">
+        Run-up monitoring is active with a <strong>15-minute limit</strong>. If the
+        foreline is not low enough the drive will trip rather than grind away. Starting
+        a turbopump against atmosphere causes heating and is bad practice.
+      </div>
+
+      <h3>Shutting down</h3>
+      <ol class="steps">
+        <li>Press <span class="btn danger">Stop</span>. The rotor coasts down &mdash; this takes minutes from full speed.</li>
+        <li>If you disabled the motor for roughing, re-enable it so the rig is left in
+            its default state. Otherwise the next person's
+            <em>Start pumping station</em> will silently fail to spin the turbo.</li>
+      </ol>
+    </section>
+
+    <!-- 6 ------------------------------------------------------------------>
+    <section id="safety">
+      <h2><span class="num">06</span>Safety model</h2>
+      <hr class="sechr">
+      <p>Anything that physically moves the pump is guarded twice:</p>
+      <ol class="steps">
+        <li>The page asks you to confirm, naming the action.</li>
+        <li>The API rejects the request unless it carries an explicit
+            <code>confirm</code> flag. A stray link or a page refresh cannot start the pump.</li>
+      </ol>
+      <p>
+        Writes also go through an <strong>allowlist</strong> that is deliberately
+        narrower than "everything writable". The RS-485 address, parameter-set
+        selection and service line are <em>not</em> exposed &mdash; a mis-click on the
+        address would silently orphan the pump from the controller.
+      </p>
+      <div class="caution">
+        <strong>There is no authentication</strong> unless the server was started with
+        <code>--token</code>. Anyone who can reach port 8600 can start and stop the pump.
+        Acceptable on an isolated lab network; not on a shared one.
+      </div>
+    </section>
+
+    <!-- 7 ------------------------------------------------------------------>
+    <section id="trouble">
+      <h2><span class="num">07</span>Troubleshooting</h2>
+      <hr class="sechr">
+
+      <h3><span class="pill crit"><i class="dot"></i>Controller unreachable</span></h3>
+      <p>The browser cannot reach the address in the field.</p>
+      <ul>
+        <li>Check the address, and that the machine is on the network.</li>
+        <li>Check the server is running: <code>ssh esarodriguezm@172.16.2.62 'pgrep -af webserver.py'</code></li>
+        <li>If the lab PC's IP changed, put the new one in the field.</li>
+      </ul>
+
+      <h3><span class="pill crit"><i class="dot"></i>Pump not responding</span></h3>
+      <p>
+        The controller is fine; the RS-485 link is silent. In order of likelihood:
+      </p>
+      <ol class="steps">
+        <li><strong>The TC 600 is powered off.</strong> By far the most common cause.</li>
+        <li>The HXSP-485 converter came unplugged, or moved to a different serial port.</li>
+        <li>D+ and D&minus; swapped &mdash; the pump goes completely silent. Swapping them back is harmless to try.</li>
+      </ol>
+      <div class="note">
+        <strong>A quick way to tell these apart.</strong> On the lab PC run
+        <code>sudo cat /proc/tty/driver/serial</code> and look at the <code>ttyS1</code> line.
+        If <code>rx</code> is 0 with no framing errors, nothing is driving the receive line
+        &mdash; unpowered pump, or a wiring fault. If <code>rx</code> is climbing <em>with</em>
+        framing errors, something is talking but garbled: wrong baud, wrong polarity,
+        or another device on the bus.
+      </div>
+
+      <h3>A fault code is shown</h3>
+      <p>
+        Press <span class="btn">Acknowledge fault</span> to clear a latched error. If it
+        returns immediately, the underlying condition is still present. Error-code
+        meanings are in Pfeiffer document <strong>PM 0547 BE</strong>, which is not in
+        this repository &mdash; this unit's history holds one entry, <code>Err002</code>.
+      </p>
+
+      <h3>Readings time out intermittently</h3>
+      <p>
+        Only one program can sensibly own the serial port. If you run
+        <code>tc600ctl.py</code> on the lab PC while the web server is polling, they
+        contend and both see timeouts. Use the web API, or stop the server first.
+      </p>
+    </section>
+
+    <!-- 8 ------------------------------------------------------------------>
+    <section id="server">
+      <h2><span class="num">08</span>Running the server</h2>
+      <hr class="sechr">
+      <p>The panel is served by <code>webserver.py</code> on the machine wired to the pump.</p>
+<pre><code># start
+cd ~/tc600-control
+(setsid python3 webserver.py --serial /dev/ttyS1 --address 1 --port 8600 \
+    &gt; ~/tc600-web.log 2&gt;&amp;1 &amp; echo $! &gt; ~/tc600-web.pid)
+
+# stop
+kill $(cat ~/tc600-web.pid)
+
+# log
+tail -f ~/tc600-web.log</code></pre>
+      <div class="note">
+        Use the PID file rather than <code>pkill -f webserver.py</code>. That pattern also
+        matches the SSH command carrying it, so it kills your own session.
+      </div>
+      <p>Useful options:</p>
+      <div class="tw">
+        <table>
+          <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td class="k mono">--serial</td><td>Serial port. <code>/dev/ttyS1</code> here &mdash; onboard COM2.</td></tr>
+            <tr><td class="k mono">--address</td><td>RS-485 address, 1 on this pump.</td></tr>
+            <tr><td class="k mono">--port</td><td>HTTP port, default 8600.</td></tr>
+            <tr><td class="k mono">--token</td><td>Require <code>X-Token</code> on API calls. Strongly advised off an isolated network.</td></tr>
+            <tr><td class="k mono">--bind</td><td>Interface to listen on. Default all.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Editing <code>web/index.html</code> takes effect on the next page load &mdash; the
+        server reads it from disk per request, so no restart is needed for UI changes.
+        Changes to <code>webserver.py</code> or the <code>tc600</code> package do need one.
+      </p>
+      <p>
+        The server does not survive a reboot as run above.
+        <code>deploy/tc600-web.service</code> is a systemd unit for that, deliberately
+        not installed &mdash; enabling it starts unauthenticated pump control on every boot.
+      </p>
+    </section>
+
+    <!-- 9 ------------------------------------------------------------------>
+    <section id="api">
+      <h2><span class="num">09</span>API reference</h2>
+      <hr class="sechr">
+      <p class="lede">
+        Everything the page does is available for scripting. JSON in, JSON out, with
+        permissive CORS so a page on one host can drive a controller on another.
+      </p>
+
+      <div class="tw">
+        <table>
+          <thead><tr><th>Endpoint</th><th>Returns</th></tr></thead>
+          <tbody>
+            <tr><td class="k mono">GET /api/ping</td><td>Identifies the service, its serial port and address. Cheap; touches no hardware.</td></tr>
+            <tr><td class="k mono">GET /api/state</td><td>Identity, live status, units, and mode flags. Reports <code>connected: false</code> within about 1.3 s if the pump is silent.</td></tr>
+            <tr><td class="k mono">GET /api/accessories</td><td>The HEAT/TMS, VENT and FV PUMP parameter groups, plus the writable allowlist.</td></tr>
+            <tr><td class="k mono">POST /api/command</td><td>Executes an action. See below.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Actions</h3>
+      <div class="tw">
+        <table>
+          <thead><tr><th>Action</th><th>Payload</th><th>Confirm</th></tr></thead>
+          <tbody>
+            <tr><td class="k mono">on</td><td>&mdash;</td><td>required</td></tr>
+            <tr><td class="k mono">off</td><td>&mdash;</td><td>required</td></tr>
+            <tr><td class="k mono">motor_on</td><td>&mdash;</td><td>required</td></tr>
+            <tr><td class="k mono">motor_off</td><td>&mdash;</td><td>required</td></tr>
+            <tr><td class="k mono">standby_on</td><td>&mdash;</td><td>required</td></tr>
+            <tr><td class="k mono">standby_off</td><td>&mdash;</td><td>required</td></tr>
+            <tr><td class="k mono">speed</td><td><code>value</code>, 20&ndash;100</td><td>required</td></tr>
+            <tr><td class="k mono">param</td><td><code>name</code>, <code>value</code></td><td>required</td></tr>
+            <tr><td class="k mono">ack</td><td>&mdash;</td><td>not required</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Writable parameters</h3>
+      <p>
+        <code>param</code> accepts only these names:
+        <code>Heating</code>, <code>TMSHeatSVal</code>, <code>CfgOut4</code>,
+        <code>EnableVent</code>, <code>VentMode</code>, <code>VentSpd</code>,
+        <code>VentTime</code>, <code>OpModeBKP</code>, <code>SwOnBKP</code>,
+        <code>SwOffBKP</code>, <code>GasMode</code>, <code>RUTimeCtrl</code>,
+        <code>EnableBrake</code>.
+      </p>
+<pre><code># read everything
+curl -s http://172.16.2.62:8600/api/state | python3 -m json.tool
+
+# set the TMS setpoint to 55 C
+curl -X POST http://172.16.2.62:8600/api/command \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"param","name":"TMSHeatSVal","value":55,"confirm":true}'</code></pre>
+      <p>
+        Responses are <code>{"ok": true, ...}</code> or
+        <code>{"ok": false, "error": "..."}</code>. The <code>result</code> field carries
+        the value the pump echoed back, which is its own confirmation of what it accepted
+        &mdash; not just what you asked for.
+      </p>
+    </section>
+
+    <footer>
+      TC 600 &middot; firmware 017500 &middot; nominal 1500 Hz &middot; RS-485 address 1 &middot;
+      <code>/dev/ttyS1</code> on the lab PC. Parameter behaviour in this manual was
+      verified against that unit, not taken from datasheets.
+    </footer>
+
+    </main>
+  </div>
+</div>
+
+</body>
+</html>

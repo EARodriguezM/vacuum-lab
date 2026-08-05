@@ -1,0 +1,860 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turbopump Control</title>
+<style>
+  :root{
+    --paper:#eef1f2; --card:#f8fafa; --sunk:#e9eeef; --ink:#141b21;
+    --ink-soft:#4a565f; --ink-faint:#7d8a93; --rule:#ccd5d8;
+    --accent:#0d6d78; --accent-ink:#fff; --accent-soft:#dceef0;
+    --good:#2c7a5b; --good-bg:#e3f2ea; --warn:#a8791a; --warn-bg:#fdf3e0;
+    --crit:#b8372c; --crit-bg:#fbe9e7; --idle:#6f7a82; --idle-bg:#e8edee;
+    --field:#fff;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --paper:#0e1418; --card:#161f25; --sunk:#101a20; --ink:#e4ebee;
+      --ink-soft:#a7b4bc; --ink-faint:#77858e; --rule:#2a373f;
+      --accent:#46b3bd; --accent-ink:#06222a; --accent-soft:#12313a;
+      --good:#5fc194; --good-bg:#12291f; --warn:#d6a640; --warn-bg:#2b2210;
+      --crit:#e2695c; --crit-bg:#2d1613; --idle:#93a1aa; --idle-bg:#1c262c;
+      --field:#0d1418;
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#0e1418; --card:#161f25; --sunk:#101a20; --ink:#e4ebee;
+    --ink-soft:#a7b4bc; --ink-faint:#77858e; --rule:#2a373f;
+    --accent:#46b3bd; --accent-ink:#06222a; --accent-soft:#12313a;
+    --good:#5fc194; --good-bg:#12291f; --warn:#d6a640; --warn-bg:#2b2210;
+    --crit:#e2695c; --crit-bg:#2d1613; --idle:#93a1aa; --idle-bg:#1c262c;
+    --field:#0d1418;
+  }
+  :root[data-theme="light"]{
+    --paper:#eef1f2; --card:#f8fafa; --sunk:#e9eeef; --ink:#141b21;
+    --ink-soft:#4a565f; --ink-faint:#7d8a93; --rule:#ccd5d8;
+    --accent:#0d6d78; --accent-ink:#fff; --accent-soft:#dceef0;
+    --good:#2c7a5b; --good-bg:#e3f2ea; --warn:#a8791a; --warn-bg:#fdf3e0;
+    --crit:#b8372c; --crit-bg:#fbe9e7; --idle:#6f7a82; --idle-bg:#e8edee;
+    --field:#fff;
+  }
+
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{background:var(--paper);color:var(--ink);font-size:16px;line-height:1.55;
+       font-family:ui-sans-serif,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       -webkit-text-size-adjust:100%}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  .num{font-variant-numeric:tabular-nums}
+  .wrap{max-width:940px;margin:0 auto;padding:20px 16px 72px;
+        display:flex;flex-direction:column;gap:18px}
+
+  /* ---------- header + plain-language summary ---------- */
+  header{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;
+         align-items:baseline}
+  h1{margin:0;font-size:clamp(19px,3.2vw,25px);font-weight:660;letter-spacing:-.018em}
+  .sub{margin:2px 0 0;color:var(--ink-faint);font-size:12.5px}
+
+  .summary{border-radius:10px;padding:20px 22px;border:1px solid var(--rule);
+           background:var(--card);display:flex;flex-direction:column;gap:14px}
+  .summary.good{border-color:var(--good);background:var(--good-bg)}
+  .summary.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .summary.crit{border-color:var(--crit);background:var(--crit-bg)}
+  .headline{margin:0;font-size:clamp(17px,2.7vw,21px);font-weight:650;
+            line-height:1.35;text-wrap:balance}
+  .explain{margin:0;font-size:15px;color:var(--ink-soft);max-width:62ch}
+  .summary.good .headline{color:var(--good)}
+  .summary.warn .headline{color:var(--warn)}
+  .summary.crit .headline{color:var(--crit)}
+  .summary.good .explain,.summary.warn .explain,.summary.crit .explain{color:inherit;opacity:.88}
+
+  .bigrow{display:flex;flex-wrap:wrap;gap:22px;align-items:flex-end}
+  .big{display:flex;align-items:baseline;gap:7px}
+  .big b{font-size:clamp(34px,8vw,52px);line-height:1;font-weight:680;
+         letter-spacing:-.03em;font-family:ui-monospace,Menlo,Consolas,monospace}
+  .big span{font-size:15px;color:var(--ink-faint);font-weight:600}
+  .barwrap{flex:1 1 220px;min-width:160px}
+  .bar{height:9px;border-radius:99px;background:var(--sunk);overflow:hidden}
+  .bar>i{display:block;height:100%;width:0;background:var(--accent);
+         border-radius:99px;transition:width .5s ease}
+  .barlab{display:flex;justify-content:space-between;font-size:11.5px;
+          color:var(--ink-faint);margin-top:6px}
+
+  /* ---------- cards ---------- */
+  .card{background:var(--card);border:1px solid var(--rule);border-radius:10px;
+        padding:20px 22px}
+  h2{margin:0 0 4px;font-size:17px;font-weight:650;letter-spacing:-.01em}
+  .cardnote{margin:0 0 16px;font-size:14px;color:var(--ink-soft);max-width:64ch}
+
+  /* ---------- guided actions ---------- */
+  .procs{display:grid;gap:12px;grid-template-columns:1fr}
+  @media(min-width:700px){.procs{grid-template-columns:repeat(3,1fr)}}
+  .proc{border:1px solid var(--rule);border-radius:9px;padding:16px;
+        background:var(--paper);display:flex;flex-direction:column;gap:9px}
+  .proc h3{margin:0;font-size:15px;font-weight:660}
+  .proc p{margin:0;font-size:13.5px;color:var(--ink-soft);flex:1}
+  .proc ol{margin:0;padding-left:17px;font-size:12.5px;color:var(--ink-faint)}
+  .proc ol li{margin-bottom:2px}
+
+  button{font:inherit;font-weight:640;font-size:14px;padding:9px 15px;
+         border-radius:7px;border:1px solid var(--rule);background:var(--card);
+         color:var(--ink);cursor:pointer}
+  button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+  button.primary:hover:not(:disabled){filter:brightness(1.08);color:var(--accent-ink)}
+  button.danger{border-color:var(--crit);color:var(--crit)}
+  button.danger:hover:not(:disabled){background:var(--crit-bg);color:var(--crit)}
+  button.wide{width:100%}
+  button.sm{font-size:12.5px;padding:6px 12px}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+  /* ---------- readings ---------- */
+  .reads{display:grid;gap:11px;grid-template-columns:repeat(auto-fit,minmax(146px,1fr))}
+  .read{border:1px solid var(--rule);border-radius:8px;padding:12px 14px;
+        background:var(--paper)}
+  .read .k{font-size:11px;letter-spacing:.06em;text-transform:uppercase;
+           color:var(--ink-faint);font-weight:650}
+  .read .v{font-size:19px;font-weight:660;margin:3px 0 4px;
+           font-family:ui-monospace,Menlo,Consolas,monospace}
+  .read .why{font-size:12px;color:var(--ink-faint);line-height:1.4}
+
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+  .chip{display:inline-flex;align-items:center;gap:6px;padding:4px 11px;
+        border-radius:99px;font-size:12.5px;font-weight:640}
+  .chip i{width:7px;height:7px;border-radius:50%;background:currentColor}
+  .chip.good{color:var(--good);background:var(--good-bg)}
+  .chip.warn{color:var(--warn);background:var(--warn-bg)}
+  .chip.crit{color:var(--crit);background:var(--crit-bg)}
+  .chip.idle{color:var(--idle);background:var(--idle-bg)}
+
+  /* ---------- disclosure ---------- */
+  details{border:1px solid var(--rule);border-radius:9px;background:var(--card);
+          overflow:hidden}
+  details+details{margin-top:11px}
+  summary{cursor:pointer;padding:14px 20px;font-weight:640;font-size:15px;
+          list-style:none;display:flex;justify-content:space-between;gap:12px;
+          align-items:center}
+  summary::-webkit-details-marker{display:none}
+  summary::after{content:"+";font-family:ui-monospace,Menlo,monospace;
+                 color:var(--accent);font-size:17px;font-weight:700}
+  details[open] summary::after{content:"\2212"}
+  summary:hover{color:var(--accent)}
+  .dbody{padding:0 20px 20px;border-top:1px solid var(--rule);padding-top:16px}
+  .dhint{font-size:13px;color:var(--ink-faint);font-weight:500;margin-left:auto;
+         margin-right:10px}
+
+  /* ---------- controls ---------- */
+  .ctlgroup{padding:14px 0;border-top:1px solid var(--rule)}
+  .ctlgroup:first-child{border-top:none;padding-top:0}
+  .ctlgroup h4{margin:0 0 3px;font-size:14.5px;font-weight:650}
+  .ctlgroup .desc{margin:0 0 11px;font-size:13.5px;color:var(--ink-soft);max-width:62ch}
+  .btnrow{display:flex;flex-wrap:wrap;gap:9px;align-items:flex-end}
+  label{font-size:12.5px;color:var(--ink-soft);font-weight:640;display:block;
+        margin-bottom:4px}
+  input[type=text],input[type=number],select{
+    font:inherit;font-size:14px;padding:9px 11px;border:1px solid var(--rule);
+    border-radius:7px;background:var(--field);color:var(--ink);width:100%;min-width:0;
+    font-family:ui-monospace,Menlo,Consolas,monospace}
+  .fld{flex:0 0 auto}
+  .fld.grow{flex:1 1 190px}
+  input[type=range]{flex:1 1 170px;accent-color:var(--accent);min-width:110px}
+
+  .banner{border-radius:9px;padding:15px 18px;font-size:14.5px;
+          border:1px solid var(--crit);background:var(--crit-bg);color:var(--crit)}
+  .banner strong{font-weight:700}
+  .banner ul{margin:9px 0 0;padding-left:19px}
+  .banner li{margin-bottom:4px}
+  .caution{border-left:3px solid var(--warn);background:var(--warn-bg);color:var(--warn);
+           border-radius:0 7px 7px 0;padding:12px 15px;font-size:13.5px;margin:12px 0 0;
+           font-weight:520}
+  .info{border-left:3px solid var(--accent);background:var(--accent-soft);
+        border-radius:0 7px 7px 0;padding:12px 15px;font-size:13.5px;margin:12px 0 0;
+        color:var(--ink)}
+
+  #toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);
+         max-width:calc(100vw - 30px);padding:12px 18px;border-radius:9px;
+         font-size:14px;font-weight:640;opacity:0;pointer-events:none;
+         transition:opacity .25s;z-index:60;box-shadow:0 6px 18px rgba(0,0,0,.2)}
+  #toast.show{opacity:1}
+  #toast.ok{background:var(--good-bg);color:var(--good);border:1px solid var(--good)}
+  #toast.bad{background:var(--crit-bg);color:var(--crit);border:1px solid var(--crit)}
+  #toast.busy{background:var(--accent-soft);color:var(--accent);border:1px solid var(--accent)}
+
+  /* ---------- interlocks ---------- */
+  .lock{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;
+        border:1px solid var(--warn);background:var(--warn-bg);border-radius:8px;
+        color:var(--warn);font-size:13.5px}
+  .lock+.lock{margin-top:9px}
+  .lock .what{font-weight:700;white-space:nowrap}
+  .lock .why{font-weight:500;flex:1}
+  .lock .when{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:700;
+              white-space:nowrap}
+  button.locked{border-style:dashed;opacity:.55}
+
+  footer{color:var(--ink-faint);font-size:12px;text-align:center;padding-top:6px}
+  code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9em;
+       background:var(--sunk);border-radius:3px;padding:1px 5px}
+  @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div>
+      <h1>Turbopump Control</h1>
+      <p class="sub" id="devline">Connecting…</p>
+    </div>
+    <button class="sm" id="refresh">Refresh</button>
+  </header>
+
+  <!-- plain-language status -->
+  <div class="summary idle" id="summary">
+    <div>
+      <p class="headline" id="headline">Connecting to the pump…</p>
+      <p class="explain" id="explain">Reading the current state.</p>
+    </div>
+    <div class="bigrow">
+      <div class="big"><b class="num" id="spd">—</b><span>Hz</span></div>
+      <div class="barwrap">
+        <div class="bar"><i id="spdbar"></i></div>
+        <div class="barlab">
+          <span>stopped</span><span id="spdpct"></span><span id="spdnom">full speed</span>
+        </div>
+      </div>
+    </div>
+    <div class="chips" id="chips"></div>
+  </div>
+
+  <div id="errbanner" hidden></div>
+
+  <!-- interlocks -->
+  <div class="card" id="lockcard" hidden>
+    <h2>Held back for safety</h2>
+    <p class="cardnote">These steps are blocked right now to protect the pump.
+      Each one clears by itself once it is safe — you don't have to do anything.</p>
+    <div id="locklist"></div>
+  </div>
+
+  <!-- guided procedures -->
+  <div class="card">
+    <h2>Common jobs</h2>
+    <p class="cardnote">
+      Each button runs the whole sequence in the right order, so you don't have to
+      remember which switch comes first. You'll be asked to confirm before anything moves.
+    </p>
+    <div class="procs">
+      <div class="proc">
+        <h3>Rough down first</h3>
+        <p>Runs the backing pump on its own to empty the line, without spinning the
+           turbopump. This is normally the first thing you do.</p>
+        <ol><li>Turn the turbopump motor off</li><li>Switch the station on</li></ol>
+        <button class="primary" data-proc="rough">Start roughing down</button>
+      </div>
+      <div class="proc">
+        <h3>Spin up the turbopump</h3>
+        <p>Once the line is roughed down, this lets the turbopump start turning. It takes
+           several minutes to reach full speed.</p>
+        <ol><li>Switch the station on</li><li>Turn the turbopump motor on</li></ol>
+        <button class="primary" data-proc="spinup">Start the turbopump</button>
+      </div>
+      <div class="proc">
+        <h3>Shut everything down</h3>
+        <p>Stops the pumps and switches off every accessory output — heating, venting,
+           and the backing-pump relay.</p>
+        <ol><li>Motor off</li><li>Heating off</li><li>Venting blocked</li>
+            <li>Station off, once the rotor has stopped</li></ol>
+        <button class="danger" data-proc="shutdown">Shut everything down</button>
+      </div>
+    </div>
+    <div class="caution">
+      Never spin the turbopump up against atmosphere. Rough the line down first, or the
+      drive will overheat and trip on its 15-minute run-up limit.
+    </div>
+  </div>
+
+  <!-- readings -->
+  <div class="card">
+    <h2>What the pump is reporting</h2>
+    <p class="cardnote">Live values, refreshed every few seconds.</p>
+    <div class="reads" id="reads"></div>
+  </div>
+
+  <!-- individual controls -->
+  <details id="d-controls">
+    <summary>Individual controls <span class="dhint">one switch at a time</span></summary>
+    <div class="dbody">
+
+      <div class="ctlgroup">
+        <h4>Pumping station</h4>
+        <p class="desc">The master switch. Switching it on closes the relay that powers
+           the backing pump — <em>and</em> starts the turbopump, unless you have turned
+           the motor off separately.</p>
+        <div class="btnrow">
+          <button class="primary" data-act="on" data-label="switch the pumping station ON">Station on</button>
+          <button class="danger" data-act="off" data-label="switch the pumping station OFF">Station off</button>
+        </div>
+      </div>
+
+      <div class="ctlgroup">
+        <h4>Turbopump motor</h4>
+        <p class="desc">Whether the turbopump itself is allowed to turn. Turning it off
+           while the station is on is how you run the backing pump alone.</p>
+        <div class="btnrow">
+          <button data-act="motor_on" data-label="allow the turbopump to turn">Motor on</button>
+          <button data-act="motor_off" data-label="stop the turbopump from turning">Motor off</button>
+        </div>
+      </div>
+
+      <div class="ctlgroup">
+        <h4>Standby</h4>
+        <p class="desc">Runs the turbopump at a reduced speed instead of full speed. Useful
+           when you want vacuum held but don't need full performance.</p>
+        <div class="btnrow">
+          <button data-act="standby_on" data-label="put the pump into standby">Standby on</button>
+          <button data-act="standby_off" data-label="return to full speed">Standby off</button>
+        </div>
+      </div>
+
+      <div class="ctlgroup">
+        <h4>Speed setpoint</h4>
+        <p class="desc">Runs the turbopump at a chosen percentage of full speed rather
+           than flat out. Applying this also switches the drive into speed-setting mode.</p>
+        <div class="btnrow">
+          <div class="fld"><label for="spdval">Percent of full speed</label>
+            <input type="number" id="spdval" min="20" max="100" step="1" value="50" style="width:104px"></div>
+          <input type="range" id="spdrange" min="20" max="100" step="1" value="50"
+                 aria-label="Speed setpoint percent">
+          <button data-act="speed" data-label="change the speed setpoint">Apply</button>
+        </div>
+      </div>
+
+      <div class="ctlgroup">
+        <h4>Clear a fault</h4>
+        <p class="desc">If the pump has reported an error and refuses to run, this clears
+           it. If the error comes straight back, the underlying cause is still there.</p>
+        <div class="btnrow">
+          <button data-act="ack" data-label="clear the reported fault">Clear fault</button>
+        </div>
+      </div>
+
+    </div>
+  </details>
+
+  <!-- accessories -->
+  <details id="d-acc">
+    <summary>Accessories <span class="dhint" id="acchint">heating, venting, backing pump</span></summary>
+    <div class="dbody">
+      <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
+        <button class="sm" id="accrefresh">Re-read settings</button>
+      </div>
+
+      <div class="ctlgroup">
+        <h4>Casing heating (HEAT/TMS)</h4>
+        <p class="desc">Warms the pump body to stop residues condensing inside it. This
+           unit has a regulated system, so you set a target temperature rather than just
+           switching it on.</p>
+        <div class="reads" id="heatreads" style="margin-bottom:12px"></div>
+        <div class="btnrow">
+          <button data-param="Heating" data-value="1" data-label="switch the casing heating ON">Heating on</button>
+          <button data-param="Heating" data-value="0" data-label="switch the casing heating OFF">Heating off</button>
+          <div class="fld"><label for="tmsval">Target temperature (°C)</label>
+            <input type="number" id="tmsval" min="30" max="90" step="1" style="width:104px"></div>
+          <button data-param="TMSHeatSVal" data-from="tmsval"
+                  data-label="change the target temperature">Apply</button>
+        </div>
+        <div class="caution">The casing gets hot and stays hot after switching off. Let it
+          cool before touching it.</div>
+      </div>
+
+      <div class="ctlgroup">
+        <h4>Venting (VENT)</h4>
+        <p class="desc">Lets air back into the pump when it stops. "Blocked" keeps it
+           sealed; "released" allows it to vent according to the mode below.</p>
+        <div class="reads" id="ventreads" style="margin-bottom:12px"></div>
+        <div class="btnrow">
+          <button data-param="EnableVent" data-value="1" data-label="allow venting">Allow venting</button>
+          <button data-param="EnableVent" data-value="0" data-label="block venting">Block venting</button>
+        </div>
+        <div class="btnrow" style="margin-top:11px">
+          <div class="fld grow"><label for="ventmode">How it vents</label>
+            <select id="ventmode">
+              <option value="0">Controlled — vents gently as the rotor slows</option>
+              <option value="1">Never vent</option>
+              <option value="2">Vent now</option>
+            </select></div>
+          <button data-param="VentMode" data-from="ventmode" data-label="change the venting mode">Apply</button>
+        </div>
+        <div class="btnrow" style="margin-top:11px">
+          <div class="fld"><label for="ventspd">Vents below (% speed)</label>
+            <input type="number" id="ventspd" min="40" max="98" step="1" style="width:104px"></div>
+          <button data-param="VentSpd" data-from="ventspd" data-label="change the venting speed threshold">Apply</button>
+          <div class="fld"><label for="venttime">Valve open for (s)</label>
+            <input type="number" id="venttime" min="6" max="3600" step="1" style="width:112px"></div>
+          <button data-param="VentTime" data-from="venttime" data-label="change the venting time">Apply</button>
+        </div>
+        <div class="caution">Venting brings the pump back to atmospheric pressure. Don't
+          vent while the rotor is still spinning fast.</div>
+      </div>
+
+      <div class="ctlgroup">
+        <h4>Backing pump (FV PUMP)</h4>
+        <p class="desc">The roughing pump that works below the turbopump. It has no switch
+           of its own here — it is powered through a relay that the pumping station closes.
+           These settings only change how it behaves once running.</p>
+        <div class="reads" id="fvreads" style="margin-bottom:12px"></div>
+        <div class="btnrow">
+          <div class="fld grow"><label for="bkpmode">Running mode</label>
+            <select id="bkpmode">
+              <option value="0">Continuous — runs the whole time</option>
+              <option value="1">Intermittent — cycles on and off</option>
+              <option value="2">Delayed start</option>
+            </select></div>
+          <button data-param="OpModeBKP" data-from="bkpmode" data-label="change the backing pump mode">Apply</button>
+        </div>
+        <div class="btnrow" style="margin-top:11px">
+          <div class="fld"><label for="bkpon">Switch on above (W)</label>
+            <input type="number" id="bkpon" min="0" max="1000" step="1" style="width:112px"></div>
+          <button data-param="SwOnBKP" data-from="bkpon" data-label="change the switch-on threshold">Apply</button>
+          <div class="fld"><label for="bkpoff">Switch off below (W)</label>
+            <input type="number" id="bkpoff" min="0" max="1000" step="1" style="width:112px"></div>
+          <button data-param="SwOffBKP" data-from="bkpoff" data-label="change the switch-off threshold">Apply</button>
+        </div>
+      </div>
+
+      <div class="ctlgroup">
+        <h4>Cooling fan (FAN)</h4>
+        <p class="desc">There is no fan control here. The cooling unit plugs into its own
+           connector on the drive unit and the pump runs it automatically — no setting on
+           this bus reaches it.</p>
+        <div class="caution">
+          <strong>Known issue on this rig.</strong> During testing the fan switched on and off
+          with the pumping station while the backing-pump relay never clicked. That is what
+          you would see if the FAN and FV PUMP leads were swapped at the drive unit. Worth
+          checking the labels before trusting either output.
+        </div>
+      </div>
+
+    </div>
+  </details>
+
+  <!-- connection settings -->
+  <details id="d-conn">
+    <summary>Connection settings <span class="dhint" id="connhint"></span></summary>
+    <div class="dbody">
+      <p class="desc" style="margin-bottom:12px">
+        The address of the computer that is physically wired to the pump. You only need to
+        change this if that computer's network address changes.
+      </p>
+      <div class="btnrow">
+        <div class="fld grow"><label for="host">Computer address</label>
+          <input type="text" id="host" placeholder="172.16.2.62:8600" autocomplete="off" spellcheck="false"></div>
+        <button class="primary" id="apply">Connect</button>
+        <button id="useorigin">Use this page's address</button>
+      </div>
+      <div class="info">Saved in this browser, so you won't have to type it again.</div>
+    </div>
+  </details>
+
+  <footer id="foot">—</footer>
+</div>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(function () {
+  "use strict";
+  var KEY = "tc600.controller", POLL = 2500, timer = null, busy = false;
+  var $ = function (id) { return document.getElementById(id); };
+
+  /* ---------------- address ---------------- */
+  function defaultHost() {
+    if ((location.protocol === "http:" || location.protocol === "https:") && location.host)
+      return location.host;
+    return "172.16.2.62:8600";
+  }
+  function getHost() {
+    try { return localStorage.getItem(KEY) || defaultHost(); }
+    catch (e) { return defaultHost(); }
+  }
+  function setHost(v) { try { localStorage.setItem(KEY, v); } catch (e) {} }
+  function base() {
+    var h = $("host").value.trim().replace(/^https?:\/\//, "").replace(/\/+$/, "");
+    if (!h) h = defaultHost();
+    if (h.indexOf(":") === -1) h += ":8600";
+    return "http://" + h;
+  }
+
+  /* ---------------- helpers ---------------- */
+  function toast(msg, kind) {
+    var el = $("toast");
+    el.textContent = msg;
+    el.className = "show " + (kind || "ok");
+    clearTimeout(el._t);
+    if (kind !== "busy") el._t = setTimeout(function () { el.className = ""; }, 3800);
+  }
+  function chip(text, kind) {
+    return '<span class="chip ' + kind + '"><i></i>' + text + "</span>";
+  }
+  function read(k, v, why) {
+    return '<div class="read"><div class="k">' + k + '</div><div class="v">' + v +
+           '</div><div class="why">' + (why || "") + "</div></div>";
+  }
+  function setSummary(kind, headline, explain) {
+    $("summary").className = "summary " + kind;
+    $("headline").textContent = headline;
+    $("explain").textContent = explain;
+  }
+
+  /* ---------------- render ---------------- */
+  function render(d) {
+    var s = d.status || {}, m = d.setpoints || {}, id = d.identity || {};
+
+    if (!d.connected) {
+      setSummary("crit", "The pump isn't answering.",
+        "The controller computer is running, but the pump is not replying. The most " +
+        "likely reason is that the TC 600 is switched off at the mains.");
+      $("errbanner").hidden = false;
+      $("errbanner").className = "banner";
+      $("errbanner").innerHTML = "<strong>No reply from the pump.</strong><ul>" +
+        "<li>Check the TC 600 is powered on.</li>" +
+        "<li>Check the converter is plugged into the serial port.</li>" +
+        "<li>If it was recently rewired, the two data wires may be swapped.</li></ul>";
+      $("spd").textContent = "—";
+      $("spdbar").style.width = "0";
+      $("reads").innerHTML = "";
+      $("chips").innerHTML = "";
+      $("devline").textContent = "Pump not responding";
+      return;
+    }
+    $("errbanner").hidden = true;
+
+    var code = s.ErrorCode, faulted = code && code !== "000000";
+    var speed = typeof s.ActualSpd === "number" ? s.ActualSpd : 0;
+    var nominal = id.NominalSpd || 0;
+    var station = m.PumpgStatn === true, motor = m.MotorPump === true;
+
+    /* headline in plain words */
+    if (faulted) {
+      setSummary("crit", "The pump has reported a fault (" + code + ").",
+        "It will not run until this is cleared. Open Individual controls and press " +
+        "Clear fault. If it comes straight back, the cause is still present.");
+    } else if (speed > 0 && s.PumpAccel === true) {
+      setSummary("warn", "Starting up — now at " + speed + " Hz.",
+        "The turbopump is spinning up. Reaching full speed takes several minutes.");
+    } else if (speed > 0) {
+      setSummary("good", "Running normally at " + speed + " Hz.",
+        "The turbopump is at speed and the backing pump is running.");
+    } else if (station && !motor) {
+      setSummary("warn", "Backing pump only — the turbopump is held still.",
+        "The station is on, so the backing pump is running, but the turbopump motor is " +
+        "switched off on purpose. This is the roughing-down state.");
+    } else if (station) {
+      setSummary("good", "Station on, turbopump not yet turning.",
+        "The backing pump is running and the turbopump is free to start.");
+    } else {
+      setSummary("idle", "Everything is off.",
+        "The pumping station is switched off and the turbopump is at rest. No accessory " +
+        "outputs are powered.");
+    }
+
+    $("devline").textContent = (id.ElecName || "TC 600") +
+      (id.FwVersion ? " · firmware " + id.FwVersion : "") + " · " + d.port;
+
+    $("spd").textContent = speed;
+    var pct = nominal ? Math.min(100, (speed / nominal) * 100) : 0;
+    $("spdbar").style.width = pct + "%";
+    $("spdpct").textContent = nominal ? Math.round(pct) + "% of full speed" : "";
+    $("spdnom").textContent = nominal ? nominal + " Hz" : "";
+
+    /* chips */
+    var c = "";
+    c += chip(station ? "Station on" : "Station off", station ? "good" : "idle");
+    c += chip(motor ? "Turbopump allowed to turn" : "Turbopump motor off",
+              motor ? "good" : "warn");
+    if (s.OvTempElec === true) c += chip("Electronics too hot", "crit");
+    if (s.OvTempPump === true) c += chip("Pump too hot", "crit");
+    if (s.SetSpdAtt === true) c += chip("At target speed", "good");
+    $("chips").innerHTML = c;
+
+    /* readings, each with a plain explanation */
+    var r = "";
+    r += read("Speed", speed + " Hz",
+              nominal ? "Full speed is " + nominal + " Hz." : "");
+    r += read("Target speed", (s.SetRotSpd || 0) + " Hz",
+              "What the drive is aiming for.");
+    r += read("Motor current", (s.DrvCurrent != null ? s.DrvCurrent : "—") + " A",
+              "Near zero means the rotor is not being driven.");
+    r += read("Motor power", (s.DrvPower != null ? s.DrvPower : "—") + " W",
+              "Rises while spinning up, settles once at speed.");
+    r += read("Supply voltage", (s.DrvVoltage != null ? s.DrvVoltage : "—") + " V",
+              "About 23 V when idle.");
+    r += read("Fault", faulted ? code : "none",
+              faulted ? "See the message above." : "No problems reported.");
+    r += read("Total run time", (s.OpHrsPump || 0) + " h",
+              "Hours this pump has run in its life.");
+    $("reads").innerHTML = r;
+
+    if (typeof m.SpdSVal === "number" &&
+        document.activeElement !== $("spdval") && document.activeElement !== $("spdrange")) {
+      $("spdval").value = Math.round(m.SpdSVal);
+      $("spdrange").value = Math.round(m.SpdSVal);
+    }
+    applyLocks(d.interlocks || {});
+
+    $("foot").textContent = "Last updated " + new Date().toLocaleTimeString();
+    $("connhint").textContent = base().replace("http://", "");
+  }
+
+  /* ---------------- interlocks ---------------- */
+  var LOCKNAME = {
+    off: "Stop the station", motor_on: "Start the turbopump",
+    on: "Start the station", motor_off: "Stop the turbopump"
+  };
+  var lastLocks = {};
+
+  function applyLocks(locks) {
+    lastLocks = locks;
+    var html = "", any = false;
+
+    Object.keys(locks).forEach(function (a) {
+      var r = locks[a];
+      if (r.allowed) return;
+      any = true;
+      html += '<div class="lock"><span class="what">' +
+              (LOCKNAME[a] || a) + '</span><span class="why">' + r.reason +
+              '</span>' + (r.wait ? '<span class="when">' + r.wait + 's</span>' : "") +
+              "</div>";
+    });
+    $("locklist").innerHTML = html;
+    $("lockcard").hidden = !any;
+
+    // Buttons that map directly onto an interlocked action.
+    document.querySelectorAll("button[data-act]").forEach(function (b) {
+      var r = locks[b.dataset.act];
+      if (!r) return;
+      if (busy) return;
+      b.disabled = !r.allowed;
+      b.classList.toggle("locked", !r.allowed);
+      b.title = r.allowed ? "" :
+        r.reason + (r.wait ? "  (about " + r.wait + " s to go)" : "");
+    });
+  }
+
+  /* ---------------- accessories ---------------- */
+  var VENTM = ["Controlled", "Never vent", "Vent now"];
+  var BKPM = ["Continuous", "Intermittent", "Delayed start"];
+
+  function renderAcc(a) {
+    $("accrefresh").textContent = "Re-read settings";
+    if (!a.ok) return;
+    var v = a.values || {}, u = a.units || {};
+    var un = function (n) { return u[n] ? " " + u[n] : ""; };
+
+    $("heatreads").innerHTML =
+      read("Heating", v.Heating ? "on" : "off", v.Heating ? "Currently warming." : "Not warming.") +
+      read("Now at", (v.TMSActTemp != null ? v.TMSActTemp : "—") + un("TMSActTemp"), "Measured casing temperature.") +
+      read("Target", (v.TMSHeatSVal != null ? v.TMSHeatSVal : "—") + un("TMSHeatSVal"), "What it is aiming for.") +
+      read("Regulator", v.TMSSteady ? "holding" : "not holding", "Whether it has settled at the target.");
+
+    var mode = typeof v.VentMode === "number" ? v.VentMode : -1;
+    $("ventreads").innerHTML =
+      read("Venting", v.EnableVent ? "allowed" : "blocked",
+           v.EnableVent ? "Air can be let back in." : "Sealed shut.") +
+      read("Mode", VENTM[mode] || "—", "How it lets air back in.") +
+      read("Vents below", (v.VentSpd != null ? v.VentSpd : "—") + un("VentSpd"), "Speed at which venting starts.") +
+      read("Valve open", (v.VentTime != null ? v.VentTime : "—") + un("VentTime"), "How long it stays open.");
+
+    var bk = typeof v.OpModeBKP === "number" ? v.OpModeBKP : -1;
+    $("fvreads").innerHTML =
+      read("Mode", BKPM[bk] || "—", "How it runs once the station is on.") +
+      read("Switch on above", (v.SwOnBKP != null ? v.SwOnBKP : "—") + un("SwOnBKP"), "Only used in intermittent mode.") +
+      read("Switch off below", (v.SwOffBKP != null ? v.SwOffBKP : "—") + un("SwOffBKP"), "Only used in intermittent mode.");
+
+    $("acchint").textContent = (v.Heating ? "heating on" : "heating off") + " · " +
+      (v.EnableVent ? "venting allowed" : "venting blocked");
+
+    var ae = document.activeElement;
+    if (ae !== $("tmsval") && v.TMSHeatSVal != null) $("tmsval").value = v.TMSHeatSVal;
+    if (ae !== $("ventmode") && mode >= 0) $("ventmode").value = String(mode);
+    if (ae !== $("ventspd") && v.VentSpd != null) $("ventspd").value = v.VentSpd;
+    if (ae !== $("venttime") && v.VentTime != null) $("venttime").value = v.VentTime;
+    if (ae !== $("bkpmode") && bk >= 0) $("bkpmode").value = String(bk);
+    if (ae !== $("bkpon") && v.SwOnBKP != null) $("bkpon").value = v.SwOnBKP;
+    if (ae !== $("bkpoff") && v.SwOffBKP != null) $("bkpoff").value = v.SwOffBKP;
+  }
+
+  function loadAcc() {
+    $("accrefresh").textContent = "Reading…";
+    fetch(base() + "/api/accessories", { cache: "no-store" })
+      .then(function (r) { return r.json(); }).then(renderAcc)
+      .catch(function () { $("accrefresh").textContent = "Re-read settings"; });
+  }
+
+  /* ---------------- transport ---------------- */
+  function poll() {
+    if (busy) return;
+    fetch(base() + "/api/state", { cache: "no-store" })
+      .then(function (r) { return r.json(); }).then(render)
+      .catch(function () {
+        setSummary("crit", "Can't reach the controller computer.",
+          "Nothing is wrong with the pump necessarily — this page cannot reach the " +
+          "computer at " + base().replace("http://", "") + ".");
+        $("errbanner").hidden = false;
+        $("errbanner").className = "banner";
+        $("errbanner").innerHTML = "<strong>Controller unreachable.</strong><ul>" +
+          "<li>Check the address under Connection settings below.</li>" +
+          "<li>Check that computer is switched on and on the network.</li></ul>";
+        $("d-conn").open = true;
+      });
+  }
+
+  function lock(on) {
+    busy = on;
+    document.querySelectorAll("button[data-act],button[data-param],button[data-proc]")
+      .forEach(function (b) { b.disabled = on; });
+  }
+
+  function api(payload) {
+    return fetch(base() + "/api/command", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }).then(function (r) { return r.json(); });
+  }
+
+  function send(payload, label, after) {
+    if (!window.confirm("Confirm: " + label + ".\n\nThis acts on the real pump."))
+      return;
+    lock(true);
+    api(payload)
+      .then(function (res) {
+        toast(res.ok ? label + " — done" : (res.error || "failed"), res.ok ? "ok" : "bad");
+      })
+      .catch(function () { toast("Could not reach the controller", "bad"); })
+      .finally(function () { lock(false); poll(); if (after) after(); });
+  }
+
+  /* ---------------- guided procedures ---------------- */
+  var PROCS = {
+    rough: { label: "start roughing down (backing pump only)", steps: [
+      ["Turning the turbopump motor off", { action: "motor_off", confirm: true }],
+      ["Switching the station on", { action: "on", confirm: true }] ] },
+    spinup: { label: "start the turbopump", steps: [
+      ["Switching the station on", { action: "on", confirm: true }],
+      ["Allowing the turbopump to turn", { action: "motor_on", confirm: true }] ] },
+    // Order matters: the turbopump must stop being driven first, and the
+    // station may not stop until the rotor has actually wound down. That last
+    // step can wait many minutes while the rotor coasts -- which is correct.
+    shutdown: { label: "shut everything down", steps: [
+      ["Turning the turbopump motor off", { action: "motor_off", confirm: true }],
+      ["Switching the heating off", { action: "param", name: "Heating", value: 0, confirm: true }],
+      ["Blocking venting", { action: "param", name: "EnableVent", value: 0, confirm: true }],
+      ["Waiting for the rotor to stop, then stopping the station",
+       { action: "off", confirm: true }] ] }
+  };
+
+  // A procedure step may be refused by an interlock that will clear on its own
+  // (the backing pump lead-in, the settling dwell after the rotor stops). In
+  // that case waiting is the correct behaviour, not failing -- so the runner
+  // retries with a countdown until the interlock releases or the cap expires.
+  var WAIT_CAP_S = 20 * 60;
+  var cancelProc = false;
+
+  function runProc(key) {
+    var p = PROCS[key];
+    var list = p.steps.map(function (s, i) { return (i + 1) + ". " + s[0]; }).join("\n");
+    if (!window.confirm("About to " + p.label + ":\n\n" + list +
+                        "\n\nSome steps may wait for the pump to be ready.\n" +
+                        "This acts on the real pump. Continue?")) return;
+    lock(true);
+    cancelProc = false;
+    var i = 0, waited = 0;
+
+    function finish(msg, kind) {
+      lock(false); cancelProc = false;
+      toast(msg, kind); poll(); loadAcc();
+    }
+
+    function next() {
+      if (cancelProc) { finish("Cancelled — the pump was left as it is", "bad"); return; }
+      if (i >= p.steps.length) { finish("Done — " + p.label, "ok"); return; }
+
+      var step = p.steps[i];
+      toast("Step " + (i + 1) + " of " + p.steps.length + ": " + step[0] + "…", "busy");
+      api(step[1]).then(function (res) {
+        if (res.ok) { waited = 0; i++; setTimeout(next, 700); return; }
+
+        if (res.interlock) {
+          if (waited >= WAIT_CAP_S) {
+            finish("Gave up waiting: " + res.error, "bad"); return;
+          }
+          var left = res.wait || 5;
+          waited += Math.max(3, Math.min(left, 10));
+          toast("Waiting — " + res.error +
+                (res.wait ? " (" + res.wait + "s)" : ""), "busy");
+          setTimeout(next, Math.max(3000, Math.min(left * 1000, 10000)));
+          return;
+        }
+        finish("Stopped at step " + (i + 1) + ": " + (res.error || "failed"), "bad");
+      }).catch(function () {
+        finish("Lost contact during step " + (i + 1), "bad");
+      });
+    }
+    next();
+  }
+
+  /* ---------------- wiring ---------------- */
+  $("host").value = getHost();
+
+  $("apply").addEventListener("click", function () {
+    setHost($("host").value.trim());
+    toast("Now using " + $("host").value.trim(), "ok");
+    poll(); loadAcc();
+  });
+  $("useorigin").addEventListener("click", function () {
+    $("host").value = defaultHost(); setHost($("host").value); poll(); loadAcc();
+  });
+  $("host").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") $("apply").click();
+  });
+  $("refresh").addEventListener("click", function () { poll(); loadAcc(); });
+  $("accrefresh").addEventListener("click", loadAcc);
+
+  $("spdrange").addEventListener("input", function () { $("spdval").value = this.value; });
+  $("spdval").addEventListener("input", function () { $("spdrange").value = this.value; });
+
+  document.querySelectorAll("button[data-act]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var a = b.dataset.act;
+      var payload = { action: a, confirm: true };
+      if (a === "speed") payload.value = Number($("spdval").value);
+      send(payload, b.dataset.label);
+    });
+  });
+
+  document.querySelectorAll("button[data-param]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var from = b.dataset.from;
+      send({ action: "param", name: b.dataset.param,
+             value: from ? $(from).value : b.dataset.value, confirm: true },
+           b.dataset.label, loadAcc);
+    });
+  });
+
+  document.querySelectorAll("button[data-proc]").forEach(function (b) {
+    b.addEventListener("click", function () { runProc(b.dataset.proc); });
+  });
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) { clearInterval(timer); timer = null; }
+    else if (!timer) { poll(); timer = setInterval(poll, POLL); }
+  });
+
+  poll(); loadAcc();
+  timer = setInterval(poll, POLL);
+})();
+</script>
+</body>
+</html>

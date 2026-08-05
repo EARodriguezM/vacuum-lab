@@ -89,6 +89,9 @@ def main() -> int:
 
             print("\nControl")
             check("PumpgStatn write echoes True", pump.pumping_station(True) is True)
+            # The rotor turns only when the station AND the motor are on --
+            # station alone is the "backing pump only" state, at 0 Hz.
+            check("MotorPump write echoes True", pump.motor(True) is True)
             time.sleep(1.5)
             speed = pump.read("ActualSpd")
             check("rotor spins up", speed > 0, f"{speed} Hz")
