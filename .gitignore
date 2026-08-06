@@ -1,1 +1,7 @@
 **/__pycache__/
+
+# Run databases. The real one lives in ~/.local/share/vacuum-lab/, but a
+# --db path pointed inside the repo is the obvious thing to do while testing.
+*.db
+*.db-wal
+*.db-shm
