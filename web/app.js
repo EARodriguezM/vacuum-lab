@@ -15,6 +15,7 @@ import { render } from "preact";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { api, settings, updateSettings } from "./api.js";
 import { Banner, Confirm, Toasts, useToasts } from "./ui.js";
+import { DashboardView } from "./views/dashboard.js";
 import { Overview } from "./views/overview.js";
 import { PumpView } from "./views/pump.js";
 import { GaugeView } from "./views/gauge.js";
@@ -24,10 +25,11 @@ import { SettingsView } from "./views/settings.js";
 import * as fmt from "./format.js";
 
 const TABS = [
+  { key: "dashboard", label: "Dashboard" },
   { key: "overview", label: "Overview" },
   { key: "pump", label: "Pump" },
   { key: "gauge", label: "Gauge" },
-  { key: "tests", label: "Tests" },
+  { key: "tests", label: "Process" },
   { key: "history", label: "History" },
   { key: "settings", label: "Settings" },
 ];
@@ -40,7 +42,7 @@ function applyTheme(theme) {
 
 function App() {
   const [tab, setTab] = useState(
-    () => location.hash.replace("#", "") || "overview");
+    () => location.hash.replace("#", "") || "dashboard");
   const [state, setState] = useState(null);
   const [live, setLive] = useState(null);
   const [error, setError] = useState(null);
@@ -56,7 +58,7 @@ function App() {
   useEffect(() => { applyTheme(settings().theme); }, [tick]);
 
   useEffect(() => {
-    const onHash = () => setTab(location.hash.replace("#", "") || "overview");
+    const onHash = () => setTab(location.hash.replace("#", "") || "dashboard");
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
@@ -174,6 +176,19 @@ function App() {
     }
   };
 
+  const acknowledgeStep = async () => {
+    setBusy(true);
+    try {
+      const result = await api.acknowledgeStep();
+      if (result.ok) notify("Step confirmed — the run continues.", "ok");
+      else notify(result.error, "error");
+    } catch (problem) {
+      notify(problem.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const stopRun = async () => {
     setBusy(true);
     try {
@@ -213,6 +228,8 @@ function App() {
     if (!state) return html`<div class="boot">Connecting…</div>`;
 
     switch (tab) {
+      case "dashboard":
+        return html`<${DashboardView} state=${state} live=${live} />`;
       case "pump":
         return html`<${PumpView} state=${state} onCommand=${pumpCommand}
                                  onWriteParam=${writeParam} busy=${busy} />`;
@@ -221,7 +238,8 @@ function App() {
                                   busy=${busy} />`;
       case "tests":
         return html`<${TestsView} state=${state} live=${live} onStart=${startRun}
-                                  onStop=${stopRun} busy=${busy} />`;
+                                  onStop=${stopRun} busy=${busy}
+                                  onAcknowledge=${acknowledgeStep} />`;
       case "history":
         return html`<${HistoryView} notify=${notify} />`;
       case "settings":

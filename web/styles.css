@@ -253,6 +253,79 @@ dl.pairs dd { margin:0; text-align:right; }
 .toast.error { border-color:var(--crit); color:var(--crit); background:var(--crit-bg); }
 .toast.ok    { border-color:var(--good); color:var(--good); background:var(--good-bg); }
 
+/* ---------- dashboard ----------
+ * Deliberately larger than the rest of the panel: this view is read standing
+ * up, from a distance, possibly through reading glasses. Nothing here is
+ * below 14px and the headline figures are very large indeed.
+ *
+ * Every tint is paired with a word. The pressure panel is coloured by vacuum
+ * regime AND says "high vacuum" underneath, so nothing depends on telling one
+ * hue from another. */
+.dashboard { display:flex; flex-direction:column; gap:14px; font-size:15px; }
+
+.dash-headline { display:flex; flex-wrap:wrap; gap:16px; align-items:center;
+                 justify-content:space-between; background:var(--card);
+                 border:1px solid var(--rule); border-radius:12px;
+                 padding:18px 22px; box-shadow:var(--shadow); }
+.dash-headline.good { border-left:6px solid var(--good); }
+.dash-headline.warn { border-left:6px solid var(--warn); }
+.dash-headline.crit { border-left:6px solid var(--crit); }
+.dash-headline.idle { border-left:6px solid var(--idle); }
+.dash-state  { font-size:clamp(22px,3.4vw,30px); font-weight:680;
+               letter-spacing:-.02em; }
+.dash-detail { color:var(--ink-soft); font-size:15px; margin-top:3px; }
+.dash-run { text-align:right; display:flex; flex-direction:column;
+            gap:4px; align-items:flex-end; }
+.dash-run-name { font-weight:620; font-size:15px; }
+.dash-run-time { color:var(--ink-faint); font-size:13.5px; }
+
+.dash-prompt { background:var(--warn-bg); border:2px solid var(--warn);
+               color:var(--warn); border-radius:10px; padding:14px 18px;
+               font-size:17px; font-weight:560; }
+
+.dash-grid { display:grid; gap:14px;
+             grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); }
+.dash-grid.two-up { grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); }
+
+.panel { background:var(--card); border:1px solid var(--rule);
+         border-radius:12px; padding:14px 16px 12px; display:flex;
+         flex-direction:column; gap:8px; box-shadow:var(--shadow);
+         position:relative; overflow:hidden; }
+.panel > header { display:flex; justify-content:space-between;
+                  align-items:baseline; gap:10px; }
+.panel h3 { font-size:13px; text-transform:uppercase; letter-spacing:.06em;
+            color:var(--ink-faint); font-weight:680; }
+.panel-sub { font-size:12.5px; color:var(--ink-faint); }
+.panel.wide { grid-column:1 / -1; }
+.panel.tone-good   { border-top:3px solid var(--good); }
+.panel.tone-warn   { border-top:3px solid var(--warn); }
+.panel.tone-crit   { border-top:3px solid var(--crit); }
+.panel.tone-accent { border-top:3px solid var(--accent); }
+.panel.tone-idle   { border-top:3px solid var(--rule); }
+
+.stat-body { display:flex; align-items:flex-end; justify-content:space-between;
+             gap:10px; min-height:52px; }
+.stat-figure { display:flex; align-items:baseline; gap:6px; flex-wrap:wrap; }
+.stat-value { font-size:clamp(30px,5.2vw,44px); font-weight:640; line-height:1;
+              letter-spacing:-.02em; }
+.stat-figure.pressure .stat-value { font-size:clamp(26px,4.4vw,38px); }
+.stat-exp  { font-size:clamp(17px,2.6vw,22px); font-weight:560;
+             color:var(--ink-soft); }
+.stat-exp sup { font-size:.68em; }
+.stat-unit { font-size:15px; color:var(--ink-soft); font-weight:560; }
+.stat-foot { font-size:13.5px; color:var(--ink-faint); }
+.sparkline { width:96px; height:38px; flex:0 0 auto; opacity:.85; }
+
+.actuator-table td { padding:9px 8px; font-size:14.5px; }
+.actuator-table td:first-child { color:var(--ink-soft); }
+
+/* ---------- operator prompt ---------- */
+.prompt-card { border:2px solid var(--warn); background:var(--warn-bg); }
+.prompt-head { display:flex; justify-content:space-between; align-items:center; }
+.prompt-text { font-size:clamp(16px,2.6vw,20px); font-weight:600;
+               color:var(--ink); margin:0; line-height:1.4; }
+.tile.manual { border-style:dashed; }
+
 .empty { color:var(--ink-faint); font-size:13.5px; padding:22px 4px; text-align:center; }
 .sep { height:1px; background:var(--rule); }
 .muted { color:var(--ink-faint); }

@@ -68,7 +68,50 @@ function EventLog({ events }) {
     </div>`;
 }
 
-function LiveRun({ run, samples, events, onStop, busy }) {
+/** The manual step currently blocking the recipe. The loudest thing on screen. */
+function OperatorPrompt({ prompt, onAcknowledge, busy }) {
+  if (!prompt) return null;
+  const waiting = prompt.since ? (Date.now() / 1000) - prompt.since : 0;
+  return html`
+    <section class="card prompt-card">
+      <div class="prompt-head">
+        <span class="pill warn"><span class="dot" />Waiting for you</span>
+        <span class="small muted">${fmt.duration(waiting)}</span>
+      </div>
+      <p class="prompt-text">${prompt.instruction}</p>
+      ${prompt.note && html`<p class="hint">${prompt.note}</p>`}
+      <div class="row">
+        <button class="primary" disabled=${busy} onClick=${onAcknowledge}>
+          Done — continue the run
+        </button>
+        <span class="small muted">
+          ${prompt.label} → ${prompt.value}. The run keeps recording while you
+          do this; nothing is unmonitored.
+        </span>
+      </div>
+    </section>`;
+}
+
+/** What the process hardware is doing, and which of it is real. */
+function Actuators({ actuators }) {
+  if (!actuators?.length) return null;
+  return html`
+    <div class="tiles">
+      ${actuators.map((a) => html`
+        <div class=${`tile${a.available ? "" : " manual"}`} key=${a.key}>
+          <span class="label">${a.label}</span>
+          <span class="value num">${a.display}</span>
+          <span class="foot">
+            ${a.error ? a.error
+              : a.pending ? `asked for ${a.pending} — not confirmed`
+              : a.available ? "under software control"
+              : "manual — not wired yet"}
+          </span>
+        </div>`)}
+    </div>`;
+}
+
+function LiveRun({ run, samples, events, onStop, onAcknowledge, busy }) {
   const phases = run.phases || [];
   const index = phases.indexOf(run.phase);
   const share = phases.length > 1
@@ -77,8 +120,12 @@ function LiveRun({ run, samples, events, onStop, busy }) {
 
   return html`
     <div class="grid" style="gap:16px">
+      <${OperatorPrompt} prompt=${run.prompt} busy=${busy}
+                         onAcknowledge=${onAcknowledge} />
+
       <${Card} title=${run.run?.name || run.label}
-               hint=${`${run.label} · started ${fmt.dateTime(run.run?.started_at)}`}
+               hint=${`${run.label} · ${run.mode === "auto" ? "automatic" : "guided"}` +
+                      ` · started ${fmt.dateTime(run.run?.started_at)}`}
                actions=${html`
                  <button class="danger" disabled=${busy} onClick=${onStop}>
                    ${run.stopping ? "Stopping…" : "Stop run"}</button>`}>
@@ -90,10 +137,16 @@ function LiveRun({ run, samples, events, onStop, busy }) {
         </div>
         <div class="bar"><span style=${`width:${(share * 100).toFixed(0)}%`} /></div>
         <div class="spread small muted">
-          <span>Elapsed ${fmt.duration(run.elapsed_s)}</span>
+          <span>Elapsed ${fmt.duration(run.elapsed_s)}${" "}
+            · ${fmt.duration(run.in_phase_s)} in this phase</span>
           <span>${run.samples} samples · every ${fmt.number(run.interval_s, 0)}s</span>
         </div>
       <//>
+
+      ${run.actuators?.length > 0 && html`
+        <${Card} title="Process hardware">
+          <${Actuators} actuators=${run.actuators} />
+        <//>`}
 
       <${Card} title="Pressure">
         <${PressureChart} samples=${samples} height=${250} />
@@ -111,7 +164,7 @@ function LiveRun({ run, samples, events, onStop, busy }) {
     </div>`;
 }
 
-function Setup({ procedures, onStart, busy, blocked }) {
+function Setup({ procedures, onStart, busy, blocked, actuators = [] }) {
   const [name, setName] = useState("");
   const [chosen, setChosen] = useState(procedures[0]?.name || "");
   const [operator, setOperator] = useState(
@@ -120,6 +173,7 @@ function Setup({ procedures, onStart, busy, blocked }) {
   const [config, setConfig] = useState({});
 
   const procedure = procedures.find((p) => p.name === chosen) || procedures[0];
+  const manual = actuators.filter((a) => !a.available).map((a) => a.label);
 
   useEffect(() => {
     if (procedure) setConfig(defaultConfig(procedure.fields));
@@ -141,6 +195,13 @@ function Setup({ procedures, onStart, busy, blocked }) {
   return html`
     <div class="grid" style="gap:16px">
       ${blocked && html`<${Banner} tone="warn">${blocked}<//>`}
+
+      ${manual.length > 0 && html`
+        <${Banner} tone="warn">
+          <strong>Not wired up yet:</strong> ${manual.join(", ")}.
+          A guided run will stop and ask you to do each of these by hand.
+          Automatic mode stays unavailable until they are connected.
+        <//>`}
 
       <${Card} title="Choose a procedure">
         <div class="row">
@@ -199,7 +260,7 @@ function Setup({ procedures, onStart, busy, blocked }) {
     </div>`;
 }
 
-export function TestsView({ state, live, onStart, onStop, busy }) {
+export function TestsView({ state, live, onStart, onStop, onAcknowledge, busy }) {
   const [procedures, setProcedures] = useState([]);
   const [events, setEvents] = useState([]);
   const run = state?.run;
@@ -223,7 +284,8 @@ export function TestsView({ state, live, onStart, onStop, busy }) {
 
   if (run?.running) {
     return html`<${LiveRun} run=${run} samples=${live?.samples || []}
-                            events=${events} onStop=${onStop} busy=${busy} />`;
+                            events=${events} onStop=${onStop}
+                            onAcknowledge=${onAcknowledge} busy=${busy} />`;
   }
 
   const devices = state?.devices || {};
@@ -234,7 +296,8 @@ export function TestsView({ state, live, onStart, onStop, busy }) {
     : null;
 
   return html`<${Setup} procedures=${procedures} onStart=${onStart}
-                        busy=${busy} blocked=${blocked} />`;
+                        busy=${busy} blocked=${blocked}
+                        actuators=${state?.actuators || []} />`;
 }
 
 export { ResultSummary, EventLog };

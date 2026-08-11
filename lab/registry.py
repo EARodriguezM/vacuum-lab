@@ -106,6 +106,53 @@ class DeviceService:
     def note_success(self) -> None:
         self._failures = 0
 
+    def rebind(self, port: str, **options) -> dict:
+        """Move this instrument to a different serial port, live.
+
+        Which port an instrument is on is not a compile-time fact on this rig:
+        USB adapters renumber on replug, and the gauge had to be moved from a
+        USB adapter to an onboard UART before it would talk at all. Making
+        that a field in the UI rather than a command-line flag is the
+        difference between a two-second fix and an SSH session.
+
+        The old link is dropped first, so the previous port is released even
+        if the new one turns out to be wrong; the sampler thread then reopens
+        against whatever is configured and reports the outcome as usual.
+        """
+        port = (port or "").strip()
+        if not port:
+            return {"ok": False, "error": "no port given"}
+
+        previous = self.port
+        with self.lock:
+            self.drop()
+            self.port = port
+            for name, value in options.items():
+                if value is not None and hasattr(self, name):
+                    setattr(self, name, value)
+            self._failures = 0
+
+        # Let the sampler take one cycle against the new port so the caller
+        # learns whether it worked, rather than getting an optimistic "ok".
+        deadline = time.monotonic() + max(4.0, self.interval * 2 + 2)
+        while time.monotonic() < deadline:
+            snap = self.snapshot()
+            if snap.get("timestamp", 0) > 0 and snap.get("age", 99) < self.interval + 1:
+                if snap.get("connected"):
+                    return {"ok": True, "port": port, "previous": previous,
+                            "connected": True}
+            time.sleep(0.2)
+
+        snap = self.snapshot()
+        return {
+            "ok": bool(snap.get("connected")),
+            "port": port,
+            "previous": previous,
+            "connected": bool(snap.get("connected")),
+            "error": None if snap.get("connected") else
+            f"nothing answered on {port}: {snap.get('error')}",
+        }
+
     def close(self) -> None:
         self._stop.set()
         with self.lock:

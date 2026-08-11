@@ -126,14 +126,22 @@ export function TimeChart({
   const yTicks = log ? decadeTicks(yLow, yHigh) : niceTicks(yLow, yHigh, 4);
   const xTicks = niceTicks(xLow, xHigh, Math.max(2, Math.floor(plotWidth / 90)));
 
+  // A gap in the data breaks the line rather than being drawn across.
+  // A gauge that is underrange has not measured anything, and joining the
+  // last reading before the gap to the first one after it draws a smooth
+  // trend through a period where nothing was known -- on this rig that is
+  // the Pirani going underrange at high vacuum, which would otherwise appear
+  // as a slow real drift over several minutes.
   const path = (entries) => {
-    const usable = entries.filter(
-      ([, y]) => Number.isFinite(y) && (!log || y > 0)
-    );
-    if (!usable.length) return "";
-    return usable
-      .map(([x, y], index) => `${index ? "L" : "M"}${xScale(x).toFixed(1)},${yScale(y).toFixed(1)}`)
-      .join(" ");
+    const usable = (y) => Number.isFinite(y) && (!log || y > 0);
+    let out = "";
+    let pen = false;
+    for (const [x, y] of entries) {
+      if (!usable(y)) { pen = false; continue; }
+      out += `${pen ? "L" : "M"}${xScale(x).toFixed(1)},${yScale(y).toFixed(1)} `;
+      pen = true;
+    }
+    return out.trim();
   };
 
   // Hover resolves to the nearest sample of the first series that has one, so
@@ -145,20 +153,28 @@ export function TimeChart({
     let best = null;
     for (const entry of live) {
       for (const [px, py] of entry.points) {
+        if (!Number.isFinite(py)) continue;      // never snap to a gap
         const distance = Math.abs(px - value);
         if (!best || distance < best.distance) {
-          best = { distance, x: px, rows: [], py };
+          best = { distance, x: px, rows: [] };
         }
       }
     }
     if (!best) return;
     best.rows = live.map((entry) => {
-      const match = entry.points.reduce(
-        (closest, point) =>
-          Math.abs(point[0] - best.x) < Math.abs(closest[0] - best.x) ? point : closest,
-        entry.points[0]
-      );
-      return { label: entry.label, color: entry.color, value: match[1] };
+      const valid = entry.points.filter(([, y]) => Number.isFinite(y));
+      const match = valid.length
+        ? valid.reduce((closest, point) =>
+            Math.abs(point[0] - best.x) < Math.abs(closest[0] - best.x)
+              ? point : closest)
+        : null;
+      // Only report a value if this series actually measured near that time;
+      // otherwise the tooltip would quote a reading minutes away as current.
+      const near = match && Math.abs(match[0] - best.x) <= (xHigh - xLow) / 50;
+      return {
+        label: entry.label, color: entry.color,
+        value: near ? match[1] : null,
+      };
     });
     setHover(best);
   };
@@ -241,10 +257,47 @@ export function TimeChart({
               <span><span class="swatch" style=${
                 `display:inline-block;width:9px;height:9px;border-radius:2px;` +
                 `margin-right:5px;background:var(${row.color})`} />${row.label}</span>
-              <span class="num">${formatValue(row.value)}${unit ? ` ${unit}` : ""}</span>
+              <span class="num">${Number.isFinite(row.value)
+                ? `${formatValue(row.value)}${unit ? ` ${unit}` : ""}`
+                : "no reading"}</span>
             </div>`)}
         </div>`}
     </div>`;
+}
+
+/**
+ * A sparkline: shape only, no axes, no labels.
+ *
+ * It sits behind a stat panel's number to answer "and which way is it going?"
+ * — the one question a bare number cannot. It is never the only place a value
+ * appears, so it carries no ticks and needs none.
+ */
+export function Sparkline({ values, color = "--series-1", log = false,
+                            height = 40 }) {
+  const clean = values.filter(
+    (v) => Number.isFinite(v) && (!log || v > 0));
+  if (clean.length < 2) return null;
+
+  const scaled = log ? clean.map(log10) : clean;
+  const low = Math.min(...scaled);
+  const high = Math.max(...scaled);
+  const span = high - low || 1;
+  const width = 100;                       // viewBox units; CSS sizes it
+
+  const points = scaled.map((value, index) => {
+    const x = (index / (scaled.length - 1)) * width;
+    const y = height - ((value - low) / span) * (height - 4) - 2;
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  });
+
+  return html`
+    <svg class="sparkline" viewBox=${`0 0 ${width} ${height}`}
+         preserveAspectRatio="none" aria-hidden="true">
+      <polyline points=${points.join(" ")} fill="none"
+                stroke=${`var(${color})`} stroke-width="1.5"
+                vector-effect="non-scaling-stroke"
+                stroke-linejoin="round" stroke-linecap="round" />
+    </svg>`;
 }
 
 /** Legend. Present whenever two or more series share a chart, absent for one. */
@@ -265,14 +318,16 @@ export function Legend({ series }) {
  * Pressure against time, log scale. The rig's primary chart.
  */
 export function PressureChart({ samples, height = 220, xMax = null }) {
+  // Null rather than filtered out: the chart needs to see where a channel had
+  // no valid reading so it can break the line there instead of spanning it.
   const series = [
     {
       key: "p1", label: "Channel 1", color: "--series-1",
-      points: samples.filter((s) => s.p1 > 0).map((s) => [s.t, s.p1]),
+      points: samples.map((s) => [s.t, s.p1 > 0 ? s.p1 : null]),
     },
     {
       key: "p2", label: "Channel 2", color: "--series-2",
-      points: samples.filter((s) => s.p2 > 0).map((s) => [s.t, s.p2]),
+      points: samples.map((s) => [s.t, s.p2 > 0 ? s.p2 : null]),
     },
   ];
   return html`

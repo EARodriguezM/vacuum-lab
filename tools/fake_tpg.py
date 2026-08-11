@@ -49,11 +49,21 @@ class Chamber:
     OUTGAS_INITIAL = 5.0e-4
     OUTGAS_TAU = 400.0
 
+    #: One standard cubic centimetre per minute, in mbar litres per second.
+    #: 1 sccm = 1013.25 mbar x 0.001 L / 60 s.
+    SCCM = 1013.25 * 0.001 / 60.0
+
     def __init__(self):
         self.pressure = 1013.0          # mbar, atmosphere
         self.rotor_fraction = 0.0       # 0..1 of nominal turbopump speed
         self.station_on = False
         self.isolated = False           # valve shut: rate-of-rise tests
+        #: Process gas admitted, sccm. Argon during a deposition.
+        self.gas_sccm = 0.0
+        #: Gate valve between chamber and turbopump, percent open. Throttling
+        #: is how a turbopump at full speed holds a working pressure four
+        #: decades above its base instead of pumping the gas straight away.
+        self.gate_percent = 100.0
         self.started = time.monotonic()
 
     def outgassing(self) -> float:
@@ -67,14 +77,17 @@ class Chamber:
         speed = self.ROUGHING_SPEED if self.station_on else 0.0
         # A turbopump only pumps usefully once the foreline is roughed out;
         # below ~1 mbar it takes over, above that it contributes nothing.
+        # The gate valve throttles what reaches it.
         if self.rotor_fraction > 0 and self.pressure < 1.0:
-            speed += self.FULL_SPEED * self.rotor_fraction
+            speed += (self.FULL_SPEED * self.rotor_fraction
+                      * max(0.0, min(100.0, self.gate_percent)) / 100.0)
         return speed
 
     def advance(self, dt: float) -> None:
         if dt <= 0:
             return
-        throughput = self.LEAK + self.outgassing()
+        throughput = (self.LEAK + self.outgassing()
+                      + self.gas_sccm * self.SCCM)
         speed = self.speed()
         # Solved over the step rather than Euler-stepped: at 60 L/s in 20 L
         # the time constant is a third of a second, so a 1 s Euler step would

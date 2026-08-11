@@ -11,6 +11,7 @@ with both instruments attached.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import tempfile
@@ -207,11 +208,142 @@ def test_analysis() -> None:
     check("linear_fit reports R2 = 1", abs(fit["r_squared"] - 1.0) < 1e-9)
     check("linear_fit refuses too few points", runs.linear_fit([(0, 1)]) is None)
 
+    # Fractional rate: the base-pressure detector's whole basis. An
+    # exponential decay with time constant tau has a constant relative rate
+    # of -100/tau percent per second, whatever the absolute pressure.
+    decay = [(t, 1.0e-6 * math.exp(-t / 400.0)) for t in range(0, 300, 10)]
+    rate = runs.relative_rate(decay)
+    check("relative_rate reads a decade-independent rate",
+          abs(rate - (-60.0 * 100.0 / 400.0)) < 1e-6, f"{rate:.3f} %/min")
+    deep = [(t, 1.0e-9 * math.exp(-t / 400.0)) for t in range(0, 300, 10)]
+    check("the same shape three decades lower gives the same rate",
+          abs(runs.relative_rate(deep) - rate) < 1e-6)
+    check("a flat curve reads as zero rate",
+          abs(runs.relative_rate([(t, 1e-6) for t in range(0, 300, 10)])) < 1e-9)
+
     stats = runs.statistics([3.0, 1.0, 2.0])
     check("statistics min/max/mean",
           stats["min"] == 1.0 and stats["max"] == 3.0 and stats["mean"] == 2.0)
     check("statistics keeps order for first/last",
           stats["first"] == 3.0 and stats["last"] == 2.0)
+
+
+def test_process() -> None:
+    print("\nProcess hardware")
+    from lab import process
+
+    hardware = process.ProcessHardware()
+    check("nothing is wired by default", not hardware.automatic_ready,
+          f"missing: {len(hardware.missing())}")
+    check("every actuator reports itself manual",
+          all(not a.available for a in hardware))
+
+    try:
+        hardware.shutter.set(True)
+        check("an unwired actuator refuses to act", False)
+    except process.OperatorRequired as prompt:
+        check("an unwired actuator refuses to act", True,
+              prompt.instruction[:44])
+
+    check("the request is recorded even when nobody carried it out",
+          hardware.shutter.requested is True)
+    check("instructions name the direction",
+          "OPEN" in hardware.shutter.instruction(True)
+          and "CLOSE" in hardware.shutter.instruction(False))
+
+    # Attaching a driver is the whole upgrade path from manual to automatic.
+    from tools import fake_actuators, fake_tpg
+
+    chamber = fake_tpg.Chamber()
+    fake_actuators.attach(hardware, chamber)
+    check("attaching drivers makes it automatic-ready",
+          hardware.automatic_ready and not hardware.missing())
+    hardware.gas.set(15)
+    time.sleep(1.0)          # the simulated MFC ramps rather than stepping
+    hardware.gas.read()
+    check("a driven actuator moves the chamber", chamber.gas_sccm > 0,
+          f"{chamber.gas_sccm:.1f} sccm on the way to 15")
+
+    # The magnetron must refuse to strike where no discharge could exist.
+    chamber.pressure = 1.0e-8
+    try:
+        hardware.magnetron.set(100)
+        check("magnetron refuses to strike at base pressure", False)
+    except process.ActuatorError as exc:
+        check("magnetron refuses to strike at base pressure", True,
+              str(exc)[:44])
+
+    chamber.pressure = 5.0e-3
+    hardware.magnetron.set(100)
+    check("magnetron strikes in the working window",
+          hardware.magnetron.read() == 100)
+
+    hardware.safe_shutdown()
+    check("safe shutdown kills the plasma, the gas and the shutter",
+          hardware.magnetron.read() == 0
+          and hardware.gas.requested == 0
+          and hardware.shutter.read() is False)
+
+
+def test_deposition_engine() -> None:
+    print("\nDeposition engine")
+    from lab import process, registry as reg
+
+    with tempfile.TemporaryDirectory() as directory:
+        database = dbmod.Database(os.path.join(directory, "dep.db"))
+        hardware = process.ProcessHardware()
+        engine = runs.RunEngine(database, reg.Registry(), hardware=hardware)
+        engine._run = database.create_run("deposition", "prompt test", {})
+
+        # --- guided mode: a manual step raises a prompt, not an abort ------
+        engine.mode = runs.GUIDED
+        check("guided require() returns False on a manual step",
+              engine.require(hardware.shutter, False) is False)
+        check("a prompt is raised", engine.prompt() is not None,
+              (engine.prompt() or {}).get("instruction", "")[:40])
+        check("the same step does not re-prompt",
+              engine.require(hardware.shutter, False) is False
+              and engine.prompt() is not None)
+
+        engine.acknowledge()
+        check("acknowledging clears the prompt", engine.prompt() is None)
+        check("the step counts as done once acknowledged",
+              engine.require(hardware.shutter, False) is True)
+
+        # The bug the first simulated deposition found: after shutter False,
+        # then True, asking for False again must act rather than be treated
+        # as already satisfied -- otherwise the shutter is left open over the
+        # sample for the whole recovery.
+        engine.require(hardware.shutter, True)
+        engine.acknowledge()
+        check("re-requesting an earlier value asks again",
+              engine.require(hardware.shutter, False) is False,
+              "shutter close after open is not skipped")
+
+        # --- automatic mode: refuses rather than waits ---------------------
+        engine.mode = runs.AUTOMATIC
+        engine._satisfied = {}
+        try:
+            engine.require(hardware.gas, 20)
+            check("automatic mode refuses an unwired actuator", False)
+        except runs.Abort as abort:
+            check("automatic mode refuses an unwired actuator", True,
+                  abort.reason[:44])
+
+        check("automatic start is refused while anything is manual",
+              engine.start("deposition", {"mode": "auto"})["ok"] is False)
+
+        # --- the ceiling must not fire while roughing ----------------------
+        recipe = runs.Deposition({"max_inlet_mbar": 5e-2})
+        recipe.pressure_ceiling = 5e-2
+        recipe.phase = "rough"
+        check("no pressure ceiling while roughing at atmosphere",
+              recipe.current_pressure_ceiling({"speed": 0}) is None)
+        recipe.phase = "deposit"
+        check("the ceiling applies once the rotor is turning",
+              recipe.current_pressure_ceiling({"speed": 1000}) == 5e-2)
+
+        database.close()
 
 
 def test_database() -> None:
@@ -378,6 +510,8 @@ def main() -> int:
         test_pump(pump_port)
         test_gauge(gauge_port)
         test_analysis()
+        test_process()
+        test_deposition_engine()
         test_database()
         test_run_engine(pump_port, gauge_port)
     finally:

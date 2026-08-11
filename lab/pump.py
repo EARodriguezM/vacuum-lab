@@ -40,7 +40,10 @@ ALLOWED_WRITES = {
     "Heating", "TMSHeatSVal", "CfgOut4",
     "EnableVent", "VentMode", "VentSpd", "VentTime",
     "OpModeBKP", "SwOnBKP", "SwOffBKP",
-    "GasMode", "RUTimeCtrl", "EnableBrake",
+    # OpModeTMP selects final-rotation-speed operation (0) versus the speed
+    # setting mode (1). A deposition run writes 0 to hold the rotor flat out;
+    # GasMode 0 tells the drive unit it is pumping argon, a heavy gas.
+    "OpModeTMP", "GasMode", "RUTimeCtrl", "EnableBrake",
 }
 
 # --- interlock tuning -----------------------------------------------------
@@ -81,7 +84,20 @@ class PumpService(DeviceService):
         #: Interlock timers in time.monotonic() terms. None means "not yet".
         self._station_on_since: float | None = None
         self._rotor_zero_since: float | None = None
+        #: Set by the run engine while a recipe needs the rotor flat out.
+        #: Sputtering in argon throttles with the gate valve, not the rotor:
+        #: dropping the speed to hold pressure costs compression exactly when
+        #: the gas load is highest.
+        self._full_speed_reason: str | None = None
         super().__init__(key, port, address=address, **options)
+
+    # --- full-speed lock --------------------------------------------------
+
+    def lock_full_speed(self, reason: str) -> None:
+        self._full_speed_reason = reason
+
+    def unlock_full_speed(self) -> None:
+        self._full_speed_reason = None
 
     # --- link -------------------------------------------------------------
 
@@ -267,6 +283,17 @@ class PumpService(DeviceService):
         # safe direction, so they are never blocked.
         allow("on")
         allow("motor_off")
+
+        # --- speed policy during a deposition -----------------------------
+        if self._full_speed_reason:
+            for action in ("speed", "standby_on"):
+                block(action,
+                      f"the rotor is locked at full speed: "
+                      f"{self._full_speed_reason}. Throttle with the gate "
+                      f"valve instead. Stop the run to release this.")
+        else:
+            allow("speed")
+            allow("standby_on")
         return out
 
     def _check(self, action: str, snap: dict) -> None:

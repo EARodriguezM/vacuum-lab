@@ -38,6 +38,72 @@ CONFIRM_REQUIRED = GUARDED | {
 }
 
 
+#: How a serial port is classified for the port picker. A USB adapter has a
+#: vendor:product id in its hwid; an onboard UART does not. Worth
+#: distinguishing on this rig, where the gauge only works on an onboard port
+#: and two different USB adapters failed on it.
+def classify_port(port) -> str:
+    hwid = (getattr(port, "hwid", "") or "").upper()
+    device = getattr(port, "device", "") or ""
+    if "USB" in hwid or "USB" in device.upper():
+        return "usb"
+    if "/dev/ttyS" in device or "COM" in device.upper():
+        return "serial"
+    return "other"
+
+
+def uart_present(device: str) -> bool:
+    """Whether an onboard serial node is backed by a real UART.
+
+    Linux creates /dev/ttyS0 through ttyS31 whether or not the hardware is
+    there. The sysfs `type` attribute reads 0 (PORT_UNKNOWN) for the phantoms
+    and non-zero for a real chip, which is how the lab PC's two genuine
+    16550As were told apart from the thirty that do not exist. Listing all
+    thirty-two buries the ones that matter.
+
+    Anything without that attribute -- every USB adapter -- is assumed real.
+    """
+    name = os.path.basename(device)
+    try:
+        with open(f"/sys/class/tty/{name}/type") as handle:
+            return int(handle.read().strip()) != 0
+    except (OSError, ValueError):
+        return True
+
+
+def list_ports(kind: str = "all", include_phantom: bool = False) -> dict:
+    """Serial ports Linux can see, filtered by how they attach.
+
+    Returns the ports plus how many phantoms were hidden, so the UI can say
+    so rather than leaving somebody hunting for a port that was filtered out.
+    """
+    try:
+        from serial.tools import list_ports as tools
+    except ImportError:
+        return {"ports": [], "hidden": 0}
+
+    found, hidden = [], 0
+    for port in sorted(tools.comports(), key=lambda p: p.device):
+        category = classify_port(port)
+        if kind not in ("all", "", category):
+            continue
+        real = uart_present(port.device)
+        if not real and not include_phantom:
+            hidden += 1
+            continue
+        found.append({
+            "device": port.device,
+            "kind": category,
+            "usable": real,
+            "description": port.description or "",
+            "hwid": port.hwid or "",
+            "manufacturer": getattr(port, "manufacturer", "") or "",
+            "product": getattr(port, "product", "") or "",
+            "serial_number": getattr(port, "serial_number", "") or "",
+        })
+    return {"ports": found, "hidden": hidden}
+
+
 class Application:
     """Everything the request handler needs, assembled once at startup."""
 
@@ -59,6 +125,8 @@ class Application:
             "devices": self.registry.snapshot(),
             "order": self.registry.keys(),
             "run": self.engine.status(),
+            "actuators": self.engine.hardware.describe(),
+            "automatic_ready": self.engine.hardware.automatic_ready,
             "server_time": time.time(),
             "uptime_s": round(time.time() - self.started_at, 1),
         }
@@ -225,6 +293,17 @@ class Handler(BaseHTTPRequestHandler):
             "/api/events": lambda: self._json(
                 {"ok": True, "events": self.app.db.events(
                     limit=self._int("limit", 200))}),
+            "/api/ports": lambda: self._json(
+                {"ok": True,
+                 "kind": (self._query().get("kind") or ["all"])[0],
+                 **list_ports(
+                     (self._query().get("kind") or ["all"])[0],
+                     include_phantom=bool(self._query().get("all")))}),
+            "/api/actuators": lambda: self._json(
+                {"ok": True,
+                 "actuators": self.app.engine.hardware.describe(),
+                 "automatic_ready": self.app.engine.hardware.automatic_ready,
+                 "missing": self.app.engine.hardware.missing()}),
         }.get(route)
         if handler:
             handler()
@@ -265,6 +344,34 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/run/stop":
             self._json(self.app.engine.stop(
                 str(payload.get("reason", "stopped by the operator"))))
+            return
+        if route == "/api/run/acknowledge":
+            self._json(self.app.engine.acknowledge(
+                str(payload.get("note", ""))))
+            return
+        if route == "/api/device/port":
+            # Moving an instrument to a different port. Deliberately guarded:
+            # it drops the link and reopens it, which is not something to do
+            # by accident while a run is recording.
+            if not payload.get("confirm"):
+                self._json({"ok": False,
+                            "error": "changing a port needs confirm"}, 400)
+                return
+            if self.app.engine.status().get("running"):
+                self._json({"ok": False,
+                            "error": "a run is in progress; stop it before "
+                                     "moving an instrument to another port"},
+                           409)
+                return
+            key = str(payload.get("device", ""))
+            if key not in self.app.registry:
+                self._json({"ok": False,
+                            "error": f"no device named {key!r}"}, 404)
+                return
+            self._json(self.app.registry.get(key).rebind(
+                str(payload.get("port", "")),
+                baudrate=payload.get("baudrate"),
+                address=payload.get("address")))
             return
         if route.startswith("/api/runs/"):
             self._runs_post(route, payload)

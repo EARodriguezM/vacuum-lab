@@ -4,11 +4,17 @@
 #   sudo systemctl enable --now tc600-web
 #
 # Not installed by default. Read the security note in README.md first: with no
-# --token, anyone who can reach port 8600 can start and stop the pump, and a
-# service starts that exposure automatically on every boot.
+# --token, anyone who can reach port 8600 can start and stop the pump and the
+# magnetron, and a service starts that exposure automatically on every boot.
+#
+# Both ports are named explicitly rather than left to the defaults, so that a
+# change of default in webserver.py cannot silently move a running rig onto a
+# different instrument. /dev/ttyS1 is the TC 600 over RS-485; /dev/ttyS0 is
+# the TPG 252 A over direct RS-232 (USB adapters do not work on it -- see the
+# README).
 
 [Unit]
-Description=TC 600 turbopump control panel
+Description=Vacuum lab control panel (TC 600 turbopump + TPG 252 A gauge)
 After=network.target
 
 [Service]
@@ -17,7 +23,9 @@ User=esarodriguezm
 Group=dialout
 WorkingDirectory=/home/esarodriguezm/tc600-control
 ExecStart=/usr/bin/python3 /home/esarodriguezm/tc600-control/webserver.py \
-    --serial /dev/ttyS1 --address 1 --port 8600
+    --serial /dev/ttyS1 --address 1 \
+    --gauge /dev/ttyS0 --gauge-baud 9600 \
+    --port 8600
 Restart=on-failure
 RestartSec=5
 

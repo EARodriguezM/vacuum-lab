@@ -71,6 +71,14 @@ class GaugeService(DeviceService):
         self.baudrate = unit.baudrate
         return unit
 
+    def rebind(self, port: str, **options) -> dict:
+        # A different port may be a different unit, or the same unit set to a
+        # different rate. Forget the learned one unless the caller names it,
+        # so `_open` hunts again instead of insisting on the old answer.
+        if options.get("baudrate") is None:
+            self.baudrate = None
+        return super().rebind(port, **options)
+
     def offline(self, message: str) -> dict:
         snap = super().offline(message)
         snap.update({"readings": [], "sensors": [], "unit": None})

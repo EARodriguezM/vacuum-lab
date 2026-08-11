@@ -113,6 +113,13 @@ export const api = {
 
   startRun: (body) => post("/api/run/start", body),
   stopRun:  (reason) => post("/api/run/stop", { reason }),
+  acknowledgeStep: (note = "") => post("/api/run/acknowledge", { note }),
+
+  ports: (kind = "all", includePhantom = false) =>
+    get(`/api/ports?kind=${encodeURIComponent(kind)}${includePhantom ? "&all=1" : ""}`),
+  actuators: () => get("/api/actuators"),
+  setPort: (device, port, extra = {}) =>
+    post("/api/device/port", { device, port, confirm: true, ...extra }),
 
   runs: (query = {}) => {
     const params = new URLSearchParams(

@@ -26,12 +26,30 @@ from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lab import api, db as dbmod, gauge, pump, registry, runs  # noqa: E402
+from lab import api, db as dbmod, gauge, process, pump, registry, runs  # noqa: E402
 
 
 def build(args) -> api.Application:
-    """Assemble the registry, store and engine from the command line."""
+    """Assemble the registry, store, process hardware and engine."""
     devices = registry.Registry()
+
+    # Argon, gate valve, magnetron and shutter. None is wired yet, so all
+    # four start manual: recipes prompt the operator instead of driving them.
+    # Attach a driver here as each is connected -- nothing else changes.
+    hardware = process.ProcessHardware()
+
+    if args.simulate:
+        # Everything in this process, deliberately: the simulated actuators
+        # must move the same chamber object the gauge simulator reads from.
+        from tools import fake_actuators, fake_rig
+        rig = fake_rig.start_in_process(pressure=args.simulate_pressure)
+        fake_actuators.attach(hardware, rig["chamber"])
+        args.serial, args.gauge, args.gauge_baud = rig["pump"], rig["gauge"], 9600
+        print("SIMULATION — no hardware in use")
+        print(f"  simulated pump  on {rig['pump']}")
+        print(f"  simulated gauge on {rig['gauge']}")
+        print(f"  argon, gate valve, magnetron and shutter are simulated too,")
+        print(f"  so a whole deposition recipe runs end to end.")
 
     if not args.no_pump:
         devices.add(pump.PumpService("pump", args.serial, address=args.address))
@@ -41,7 +59,7 @@ def build(args) -> api.Application:
             channels=args.gauge_channels))
 
     database = dbmod.Database(args.db)
-    engine = runs.RunEngine(database, devices)
+    engine = runs.RunEngine(database, devices, hardware=hardware)
     return api.Application(devices, database, engine, token=args.token)
 
 
@@ -59,6 +77,13 @@ def main() -> int:
                         help="gauge baud rate; omit to detect it")
     parser.add_argument("--gauge-channels", type=int, default=2,
                         help="measurement channels on the gauge controller")
+    parser.add_argument("--simulate", action="store_true",
+                        help="run the whole rig simulated, including the "
+                             "argon, gate valve, magnetron and shutter, so a "
+                             "deposition recipe runs end to end with no "
+                             "hardware at all")
+    parser.add_argument("--simulate-pressure", type=float, default=1013.0,
+                        help="starting chamber pressure for --simulate, mbar")
     parser.add_argument("--no-pump", action="store_true",
                         help="run without the turbopump")
     parser.add_argument("--no-gauge", action="store_true",

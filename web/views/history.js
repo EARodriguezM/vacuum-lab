@@ -222,7 +222,7 @@ export function HistoryView({ notify }) {
         ${loading
           ? html`<${Empty}>Loading…<//>`
           : !runs.length
-          ? html`<${Empty}>No runs recorded yet. Start one from the Tests tab.<//>`
+          ? html`<${Empty}>No runs recorded yet. Start one from the Process tab.<//>`
           : html`
             <div class="scroll-x">
               <table>

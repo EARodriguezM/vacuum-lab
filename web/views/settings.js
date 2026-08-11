@@ -6,6 +6,125 @@ import { Banner, Card, Empty, Pairs, Pill } from "../ui.js";
 import { api, normaliseHost, settings, updateSettings } from "../api.js";
 import * as fmt from "../format.js";
 
+/** Pick which port an instrument is on: filter by attachment, then choose.
+ *
+ * Worth being a first-class control rather than a command-line flag on this
+ * rig: USB adapters renumber on replug, and the gauge had to be moved from a
+ * USB adapter to an onboard UART before it would talk at all.
+ */
+function PortPicker({ devices, notify, onChanged }) {
+  const [kind, setKind] = useState("all");
+  const [ports, setPorts] = useState([]);
+  const [hidden, setHidden] = useState(0);
+  const [showAll, setShowAll] = useState(false);
+  const [chosen, setChosen] = useState({});
+  const [loading, setLoading] = useState(false);
+  const [applying, setApplying] = useState("");
+
+  const scan = (which = kind, everything = showAll) => {
+    setLoading(true);
+    api.ports(which, everything)
+      .then((data) => { setPorts(data.ports || []); setHidden(data.hidden || 0); })
+      .catch((error) => notify(error.message, "error"))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { scan(kind, showAll); }, [kind, showAll]);
+
+  const apply = async (key) => {
+    const port = chosen[key];
+    if (!port) return;
+    setApplying(key);
+    try {
+      const result = await api.setPort(key, port);
+      if (result.ok) {
+        notify(`${key} is now on ${port}.`, "ok");
+      } else {
+        notify(result.error || `Nothing answered on ${port}.`, "error");
+      }
+      onChanged?.();
+    } catch (error) {
+      notify(error.message, "error");
+    } finally {
+      setApplying("");
+    }
+  };
+
+  const entries = Object.entries(devices);
+
+  return html`
+    <${Card} title="Instrument ports"
+             hint="Filter by how the adapter attaches, then pick a port. Changing one drops the link and reopens it, so it is refused while a run is recording."
+             actions=${html`
+               <button class="small" onClick=${() => scan()} disabled=${loading}>
+                 ${loading ? "Scanning…" : "Rescan"}</button>`}>
+      <div class="row">
+        ${[["all", "All ports"], ["usb", "USB adapters"],
+           ["serial", "Onboard serial"]].map(([value, label]) => html`
+          <button key=${value} class=${kind === value ? "primary" : ""}
+                  onClick=${() => setKind(value)}>${label}</button>`)}
+      </div>
+
+      ${(hidden > 0 || showAll) && html`
+        <label class="check">
+          <input type="checkbox" checked=${showAll}
+                 onChange=${(e) => setShowAll(e.target.checked)} />
+          <span>
+            Show ports with no hardware behind them
+            ${hidden > 0 ? ` (${hidden} hidden)` : ""}
+            <div class="help">Linux creates /dev/ttyS0–31 whether or not the
+              chips exist. The hidden ones report no UART in sysfs.</div>
+          </span>
+        </label>`}
+
+      ${!loading && !ports.length
+        ? html`<${Empty}>No ${kind === "all" ? "" : kind} ports found.<//>`
+        : html`
+          <div class="scroll-x">
+            <table>
+              <thead><tr><th>Port</th><th>Type</th><th>Description</th>
+                         <th>Hardware id</th></tr></thead>
+              <tbody>
+                ${ports.map((port) => html`
+                  <tr key=${port.device}>
+                    <td class="mono">${port.device}</td>
+                    <td><${Pill} tone=${port.kind === "usb" ? "accent" : "idle"}>
+                      ${port.kind}<//></td>
+                    <td class="wrap-cell">${port.description || "—"}</td>
+                    <td class="mono small muted">${port.hwid || "—"}</td>
+                  </tr>`)}
+              </tbody>
+            </table>
+          </div>`}
+
+      <div class="sep" />
+
+      ${entries.map(([key, device]) => html`
+        <div class="row" key=${key}>
+          <label class="field">
+            <span>${device.label}</span>
+            <select value=${chosen[key] ?? device.port}
+                    onChange=${(e) => setChosen({ ...chosen, [key]: e.target.value })}>
+              <option value=${device.port}>${device.port} (current)</option>
+              ${ports.filter((p) => p.device !== device.port).map((p) => html`
+                <option value=${p.device}>
+                  ${p.device} — ${p.description || p.kind}</option>`)}
+            </select>
+            <span class="help">
+              ${device.connected
+                ? `connected${device.baudrate ? ` at ${device.baudrate} baud` : ""}`
+                : device.error}
+            </span>
+          </label>
+          <button disabled=${applying === key
+                    || !chosen[key] || chosen[key] === device.port}
+                  onClick=${() => apply(key)}>
+            ${applying === key ? "Switching…" : "Move to this port"}
+          </button>
+        </div>`)}
+    <//>`;
+}
+
 export function SettingsView({ state, onSettingsChanged, notify }) {
   const current = settings();
   const [draft, setDraft] = useState({ ...current });
@@ -74,6 +193,9 @@ export function SettingsView({ state, onSettingsChanged, notify }) {
           <span class="small muted">Stored in this browser only.</span>
         </div>
       <//>
+
+      <${PortPicker} devices=${devices} notify=${notify}
+                     onChanged=${onSettingsChanged} />
 
       <${Card} title="Instruments"
                hint="Each instrument owns its serial port on the server and is polled on its own thread.">

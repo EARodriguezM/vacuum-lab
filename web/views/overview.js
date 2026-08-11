@@ -96,11 +96,11 @@ export function Overview({ state, live, onStop, onNavigate }) {
       <${Card} title="Pressure"
                hint=${run?.running
                  ? "Live, from the run in progress."
-                 : "Charts fill in while a test run is recording. Start one from the Tests tab."}>
+                 : "Charts fill in while a test run is recording. Start one from the Process tab."}>
         ${samples.length
           ? html`<${PressureChart} samples=${samples} height=${230} />`
           : html`<${Empty}>No run is recording. Live pressure is shown in the tiles above;
-                 start a test to record a curve.<//>`}
+                 start a run to record a curve.<//>`}
       <//>
 
       ${samples.length > 0 && html`

@@ -39,6 +39,43 @@ def link(stop: threading.Event, interval: float = 0.25) -> None:
         stop.wait(interval)
 
 
+def start_in_process(pressure: float = 1013.0, isolated: bool = False) -> dict:
+    """Run both simulators on ptys inside the calling process.
+
+    `webserver.py --simulate` uses this rather than spawning fake_rig.py as a
+    separate process, because the simulated actuators have to manipulate the
+    *same* chamber object the gauge simulator is reading. Across a process
+    boundary they would be two unrelated chambers and the argon would never
+    show up in the pressure.
+
+    Returns the two pty paths, the chamber, and the stop event. The slave file
+    descriptors are kept in the result: closing them would tear the ptys down.
+    """
+    fake_tpg.CHAMBER.pressure = pressure
+    fake_tpg.CHAMBER.isolated = isolated
+
+    pump_master, pump_slave = os.openpty()
+    gauge_master, gauge_slave = os.openpty()
+    stop = threading.Event()
+
+    for target, master, name in (
+        (fake_tc600.serve, pump_master, "sim-pump"),
+        (fake_tpg.serve, gauge_master, "sim-gauge"),
+    ):
+        threading.Thread(target=target, args=(master, stop.is_set),
+                         daemon=True, name=name).start()
+    threading.Thread(target=link, args=(stop,), daemon=True,
+                     name="sim-link").start()
+
+    return {
+        "pump": os.ttyname(pump_slave),
+        "gauge": os.ttyname(gauge_slave),
+        "chamber": fake_tpg.CHAMBER,
+        "stop": stop,
+        "_fds": (pump_slave, gauge_slave),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--pressure", type=float, default=1013.0,
