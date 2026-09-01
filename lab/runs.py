@@ -12,8 +12,9 @@ Two rules apply to every procedure:
   pump fault or a lost link ends the run regardless of what the procedure
   wanted to do next.
 * **Commands go through the same interlocks as the UI.** The engine holds no
-  override. A procedure that cannot start the turbopump because the backing
-  pump has not led it by a minute waits, exactly as an operator would have to.
+  override. A procedure that cannot start the turbopump because the chamber
+  is not roughed down to the crossover pressure yet keeps roughing and asks
+  again, exactly as an operator would have to.
 
 Adding a procedure means subclassing `Procedure` and adding it to `CATALOGUE`;
 the API publishes its `fields` and the UI builds the form from them.
@@ -28,6 +29,7 @@ from collections import deque
 
 from . import db as dbmod
 from . import process
+from .pump import TURBO_START_MAX_MBAR
 
 #: Payload of a TC 600 error-code parameter when nothing is wrong.
 NO_ERROR = ("000000", "000, 0", "", None)
@@ -130,11 +132,46 @@ class Procedure:
     #: Pressure above which the run aborts, or None for no ceiling.
     pressure_ceiling: float | None = None
 
+    #: Seconds between repeats of the same "waiting for the interlock" note.
+    HOLD_LOG_S = 60.0
+
     def __init__(self, config: dict):
         self.config = config
         self.phase = self.phases[0]
         self.started = time.monotonic()
         self.phase_started = self.started
+        self._hold_reason: str | None = None      # the condition's key
+        self._hold_message: str | None = None     # what it last said
+        self._hold_logged = 0.0
+        self._paused = 0.0                  # seconds this phase spent prompting
+        self._paused_since: float | None = None
+
+    def note_hold(self, engine: "RunEngine", reason: str | None,
+                  key: str) -> None:
+        """Log why a command is being refused, without flooding the log.
+
+        A procedure that re-asks every cycle is refused every cycle until the
+        condition clears. Silence there is what makes a run look stuck; a
+        line every two seconds is what makes the log unreadable.
+
+        The throttle is on `key`, not on the message, because the message
+        moves: "the chamber is at 4.31E-01 mbar" differs from the last one
+        every single sample, so comparing text logs the whole roughing curve
+        one refusal at a time. `key` names the *condition* -- one line when
+        it first bites, one a minute while it persists, and one more when it
+        changes to a different condition.
+        """
+        reason = (reason or "the interlock is holding it").strip()
+        self._hold_message = reason
+        now = time.monotonic()
+        if key == self._hold_reason and now - self._hold_logged < self.HOLD_LOG_S:
+            return
+        self._hold_reason, self._hold_logged = key, now
+        engine.log("info", f"Waiting: {reason}")
+
+    def last_hold(self) -> str:
+        """Whatever last refused this procedure, for an abort message."""
+        return self._hold_message or "the interlock is still holding it"
 
     # -- configuration helpers --------------------------------------------
 
@@ -153,6 +190,31 @@ class Procedure:
     def enter(self, phase: str) -> None:
         self.phase = phase
         self.phase_started = time.monotonic()
+        self._paused = 0.0
+        self._paused_since = None
+
+    def phase_age(self, engine: "RunEngine") -> float:
+        """Seconds in this phase, not counting time spent waiting on a human.
+
+        A guided run stops for as long as it takes somebody to walk to the
+        chamber and turn a valve, and that is the procedure working as
+        intended -- it must not spend the phase's patience. So the clock is
+        paused while a prompt is outstanding, which means a phase timeout
+        measures the *rig* failing to get somewhere, never the operator being
+        slow.
+
+        Call this once per sample in any phase that has a timeout: the pause
+        is accumulated as it is observed.
+        """
+        now = time.monotonic()
+        waiting = engine.prompt() is not None
+        if waiting and self._paused_since is None:
+            self._paused_since = now
+        elif not waiting and self._paused_since is not None:
+            self._paused += now - self._paused_since
+            self._paused_since = None
+        outstanding = now - self._paused_since if self._paused_since else 0.0
+        return max(0.0, now - self.phase_started - self._paused - outstanding)
 
     @property
     def in_phase(self) -> float:
@@ -207,8 +269,9 @@ class PumpDown(Procedure):
          "default": 2, "unit": "s", "min": 1, "max": 60},
         {"key": "auto_start", "label": "Start the pump automatically",
          "type": "boolean", "default": True,
-         "help": "Starts the station, then the turbopump once the interlock "
-                 "allows it. Leave off to drive the pump yourself."},
+         "help": "Starts the station, then the turbopump as soon as the "
+                 f"chamber is roughed below {TURBO_START_MAX_MBAR:.0E} mbar. "
+                 "Leave off to drive the pump yourself."},
     )
 
     def begin(self, engine: "RunEngine") -> None:
@@ -232,13 +295,16 @@ class PumpDown(Procedure):
 
         if self.phase == "roughing":
             if self.flag("auto_start", True) and not self.motor_requested:
-                # Ask every cycle until the backing-lead interlock clears; the
-                # engine holds no override, so this is simply waiting.
+                # Ask every cycle until the crossover interlock clears; the
+                # engine holds no override, so this is simply waiting for the
+                # chamber to be roughed out.
                 result = engine.pump_command("motor_on")
                 if result.get("ok"):
                     self.motor_requested = True
                     engine.log("action", "Started the turbopump")
                     self.enter("turbo")
+                else:
+                    self.note_hold(engine, result.get("error"), "motor_on")
             elif speed > 0:
                 self.enter("turbo")
 
@@ -552,9 +618,12 @@ class VacuumSequence(Procedure):
                  "shutter yet, so guided is the only mode that will run "
                  "today."},
         {"key": "crossover_mbar", "label": "Start the turbopump at",
-         "type": "exponent", "default": 5e-1, "unit": "mbar",
+         "type": "exponent", "default": TURBO_START_MAX_MBAR, "unit": "mbar",
          "help": "The forevacuum pump works alone until the chamber reaches "
-                 "this. Starting the turbopump any earlier overheats it."},
+                 f"this. {TURBO_START_MAX_MBAR:.0E} mbar is the highest the "
+                 "interlock will allow; asking for more is lowered to it, "
+                 "since a turbopump started against an un-roughed foreline "
+                 "cannot develop compression and trips."},
         {"key": "base_rate_pct", "label": "Call it base pressure below",
          "type": "number", "default": 2.0, "unit": "%/min", "min": 0.1,
          "max": 50,
@@ -564,6 +633,12 @@ class VacuumSequence(Procedure):
          "default": 3, "unit": "min", "min": 0.5, "max": 120},
         {"key": "base_timeout_min", "label": "Give up looking for base after",
          "type": "number", "default": 120, "unit": "min", "min": 1, "max": 1440},
+        {"key": "stage_timeout_min", "label": "Give up on any other stage after",
+         "type": "number", "default": 45, "unit": "min", "min": 1, "max": 1440,
+         "help": "Roughing, the turbopump start, spin-up and the argon "
+                 "backfill each get this long before the run gives up. Time "
+                 "spent waiting for you to do something by hand does not "
+                 "count against it."},
         {"key": "interval_s", "label": "Sample every", "type": "number",
          "default": 2, "unit": "s", "min": 1, "max": 60},
     )
@@ -573,10 +648,24 @@ class VacuumSequence(Procedure):
 
     def begin_vacuum(self, engine: "RunEngine") -> None:
         self.interval = max(1.0, self.number("interval_s", 2))
-        self.crossover = self.number("crossover_mbar", 5e-1)
+        # A recipe may cross over deeper than the interlock demands, never
+        # shallower: asking for 5e-1 mbar would leave the run stuck in the
+        # crossover phase asking for a start the pump service keeps refusing.
+        requested = self.number("crossover_mbar", TURBO_START_MAX_MBAR)
+        self.crossover = min(requested, TURBO_START_MAX_MBAR)
+        if self.crossover < requested:
+            engine.log("warning",
+                       f"Crossover lowered from {requested:.2E} to "
+                       f"{self.crossover:.2E} mbar: the turbopump may not be "
+                       f"started above {TURBO_START_MAX_MBAR:.0E} mbar.")
         self.base_rate_limit = self.number("base_rate_pct", 2.0)
         self.base_settle = self.number("base_settle_min", 3) * 60.0
         self.base_timeout = self.number("base_timeout_min", 120) * 60.0
+        # Every other phase needs a bound too. Without one, a chamber that
+        # never reaches crossover -- a shut roughing valve, a dead forepump,
+        # a gross leak -- roughs for ever, and a run that cannot finish still
+        # looks alive.
+        self.stage_timeout = self.number("stage_timeout_min", 45) * 60.0
 
         self.base_mbar: float | None = None
         self.base_reached_at: float | None = None
@@ -598,7 +687,22 @@ class VacuumSequence(Procedure):
 
     def phase_rough(self, engine: "RunEngine", sample: dict) -> str | None:
         pressure = sample.get("p_best")
+        if self.phase_age(engine) >= self.stage_timeout:
+            raise Abort(
+                f"roughing ran for {self.stage_timeout / 60:.0f} min without "
+                f"reaching the {self.crossover:.2E} mbar crossover"
+                + (f" (the chamber is at {pressure:.2E} mbar)"
+                   if isinstance(pressure, (int, float)) else
+                   " (and no gauge channel is reading)")
+                + ". Check the forevacuum pump, the roughing valve, and the "
+                  "chamber for a gross leak.")
         if pressure is None:
+            # Crossing over is a pressure decision, so no pressure means no
+            # crossover, however long the roughing runs. Do not let that look
+            # like a slow pump-down.
+            self.note_hold(engine, "no valid pressure reading, so the "
+                                   "crossover pressure cannot be recognised",
+                           "no_pressure")
             return None
         if pressure <= self.crossover:
             self.crossed_at = sample["t"]
@@ -609,20 +713,33 @@ class VacuumSequence(Procedure):
         return None
 
     def phase_crossover(self, engine: "RunEngine", sample: dict) -> str | None:
+        if self.phase_age(engine) >= self.stage_timeout:
+            raise Abort(
+                f"the turbopump could not be started within "
+                f"{self.stage_timeout / 60:.0f} min of reaching crossover: "
+                f"{self.last_hold()}")
         if not self.turbo_requested:
             result = engine.pump_command("motor_on")
             if result.get("ok"):
                 self.turbo_requested = True
                 engine.log("action", "Turbopump started")
             else:
-                # The backing-lead interlock may still be counting down; it is
-                # not an error, just a wait. Keep asking.
+                # Not an error: the chamber may have crept back above the
+                # crossover pressure, or the gauge may have blinked. Keep
+                # roughing and keep asking, saying why in the run log.
+                self.note_hold(engine, result.get("error"), "motor_on")
                 return None
         return "spinup"
 
     def phase_spinup(self, engine: "RunEngine", sample: dict) -> str | None:
         speed = sample.get("speed") or 0
         nominal = engine.nominal_speed() or 0
+        if self.phase_age(engine) >= self.stage_timeout:
+            raise Abort(
+                f"the rotor did not reach full speed within "
+                f"{self.stage_timeout / 60:.0f} min (it is at {speed:.0f} Hz "
+                f"of {nominal or '?'} Hz). Check the drive unit for a fault "
+                f"and the foreline for a leak.")
         if nominal and speed >= 0.95 * nominal:
             self.full_speed_at = sample["t"]
             engine.log("info", f"Turbopump at full speed ({speed:.0f} Hz)")
@@ -769,7 +886,13 @@ class Deposition(VacuumSequence):
                  "low and the plasma will not sustain; too high and the film "
                  "goes porous from gas scattering."},
         {"key": "argon_sccm", "label": "Argon flow", "type": "number",
-         "default": 20, "unit": "sccm", "min": 0, "max": 500},
+         "default": 20, "unit": "sccm", "min": 0, "max": 500,
+         "help": "The flow, the gate opening and the working pressure are "
+                 "one equation, not three settings: the chamber settles "
+                 "where the flow divided by the throttled pumping speed puts "
+                 "it. If it settles above the setpoint, cut the flow or open "
+                 "the gate; the run gives up rather than backfilling for "
+                 "ever."},
         {"key": "gate_percent", "label": "Gate valve opening", "type": "number",
          "default": 100, "unit": "%", "min": 0, "max": 100,
          "help": "Leave fully open unless the turbopump is too fast for your "
@@ -794,7 +917,7 @@ class Deposition(VacuumSequence):
     def begin(self, engine: "RunEngine") -> None:
         self.working = self.number("working_mbar", 5e-3)
         self.argon = self.number("argon_sccm", 20)
-        self.gate_open = self.number("gate_percent", 30)
+        self.gate_open = self.number("gate_percent", 100)
         self.power = self.number("magnetron_w", 100)
         self.presputter = self.number("presputter_min", 5) * 60.0
         self.deposit_time = self.number("deposit_min", 20) * 60.0
@@ -842,6 +965,20 @@ class Deposition(VacuumSequence):
 
     def phase_backfill(self, engine: "RunEngine", sample: dict) -> str | None:
         """Throttle the pump and let argon in until working pressure holds."""
+        # Bounded, because this phase has the gas on. A flow and a gate
+        # opening that cannot meet in the middle at the working pressure
+        # would otherwise sit here for ever with argon running into the
+        # chamber and nobody watching -- the abort path shuts the gas off.
+        if self.phase_age(engine) >= self.stage_timeout:
+            reading = sample.get("p_best")
+            raise Abort(
+                f"the chamber did not hold {self.working:.2E} mbar within "
+                f"{self.stage_timeout / 60:.0f} min of the argon going on"
+                + (f" (it settled at {reading:.2E} mbar)"
+                   if isinstance(reading, (int, float)) else "")
+                + f". {self.argon:g} sccm through a {self.gate_open:g}% gate "
+                  f"does not reach that pressure: change the flow or the "
+                  f"throttle and run it again.")
         if not engine.require(engine.hardware.shutter, False):
             return None
         if not engine.require(engine.hardware.gate, self.gate_open):

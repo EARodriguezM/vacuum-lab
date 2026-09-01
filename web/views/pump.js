@@ -39,6 +39,35 @@ function Guarded({ action, label, interlocks, onRun, tone = "", disabled }) {
     </button>`;
 }
 
+/** The card's standing advice, quoting the server's own crossover pressure. */
+function stationHint(interlocks) {
+  const limit = interlocks?.motor_on?.limit_mbar;
+  const crossover = limit == null
+    ? "the crossover pressure"
+    : `${fmt.pressure(limit, 0)} mbar`;
+  return `Order matters: rough with the backing pump alone until the chamber `
+    + `reaches ${crossover}, and only then start the turbopump. Never stop `
+    + `the station while the rotor is turning.`;
+}
+
+/** Positive confirmation that the chamber is roughed enough to cross over.
+ *
+ * Only rendered when the start is *allowed*: when it is held, the interlock
+ * banner already quotes the pressure and the limit, and saying it twice in
+ * two different wordings is how an operator ends up unsure which one is the
+ * rule.
+ */
+function CrossoverNote({ interlocks, running }) {
+  const rule = interlocks?.motor_on;
+  if (running || !rule?.allowed || rule.limit_mbar == null) return null;
+  const now = rule.pressure_mbar;
+  if (now == null) return null;
+  const text = `Chamber at ${fmt.pressure(now)} mbar, at or below the `
+    + `${fmt.pressure(rule.limit_mbar, 0)} mbar crossover — `
+    + `the turbopump may be started.`;
+  return html`<div class="small muted">${text}</div>`;
+}
+
 function InterlockNotes({ interlocks }) {
   const blocked = Object.entries(interlocks || {})
     .filter(([, rule]) => !rule.allowed && rule.reason);
@@ -196,8 +225,7 @@ export function PumpView({ state, onCommand, onWriteParam, busy }) {
           acknowledge it below.
         <//>`}
 
-      <${Card} title="Station and turbopump"
-               hint="Order matters: rough with the backing pump first, and never stop the station while the rotor is turning.">
+      <${Card} title="Station and turbopump" hint=${stationHint(interlocks)}>
         <div class="row">
           <${Guarded} action="on" label="Start pumping station" tone="primary"
                       interlocks=${interlocks} onRun=${onCommand} disabled=${busy} />
@@ -220,6 +248,8 @@ export function PumpView({ state, onCommand, onWriteParam, busy }) {
             Acknowledge fault
           </button>
         </div>
+        <${CrossoverNote} interlocks=${interlocks}
+                          running=${setpoints.MotorPump === true} />
         <${InterlockNotes} interlocks=${interlocks} />
       <//>
 

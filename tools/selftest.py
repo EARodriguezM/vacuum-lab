@@ -11,6 +11,7 @@ with both instruments attached.
 
 from __future__ import annotations
 
+import ast
 import math
 import os
 import sys
@@ -19,7 +20,8 @@ import threading
 import traceback
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
 import tpg  # noqa: E402
 from tc600 import TC600, protocol, scan  # noqa: E402
@@ -285,6 +287,42 @@ def test_process() -> None:
           and hardware.shutter.read() is False)
 
 
+def field_default_mismatches() -> dict[str, list[str]]:
+    """Every `self.number("k", d)` fallback against the field default for k.
+
+    Read out of the source rather than by running the recipes: the fallback
+    only shows itself when the key is *missing* from the config, which is the
+    one case a form-driven run never produces and an API caller or an old
+    stored config produces easily.
+    """
+    tree = ast.parse(open(os.path.join(ROOT, "lab", "runs.py")).read())
+    classes = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+    out: dict[str, list[str]] = {}
+
+    for procedure in runs.CATALOGUE.values():
+        published = {f["key"]: f.get("default") for f in procedure.fields}
+        found: list[str] = []
+        for call in ast.walk(classes[procedure.__name__]):
+            if not (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr in ("number", "flag")
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "self"
+                    and len(call.args) == 2
+                    and isinstance(call.args[0], ast.Constant)):
+                continue
+            key = call.args[0].value
+            try:
+                fallback = ast.literal_eval(call.args[1])
+            except ValueError:
+                continue                      # a named constant, not a literal
+            if key in published and published[key] != fallback:
+                found.append(f"{key}: form says {published[key]!r}, "
+                             f"line {call.lineno} says {fallback!r}")
+        out[procedure.name] = found
+    return out
+
+
 def test_deposition_engine() -> None:
     print("\nDeposition engine")
     from lab import process, registry as reg
@@ -332,6 +370,15 @@ def test_deposition_engine() -> None:
 
         check("automatic start is refused while anything is manual",
               engine.start("deposition", {"mode": "auto"})["ok"] is False)
+
+        # --- published defaults must match the code's own fallbacks --------
+        # A form default of 100 % with a fallback of 30 % is how a deposition
+        # came to throttle a chamber that the operator was shown as open, and
+        # then sit in backfill for ever because the flow could not reach the
+        # working pressure through it.
+        for name, disagreements in field_default_mismatches().items():
+            check(f"{name}: published defaults match the code's fallbacks",
+                  not disagreements, "; ".join(disagreements))
 
         # --- the ceiling must not fire while roughing ----------------------
         recipe = runs.Deposition({"max_inlet_mbar": 5e-2})
@@ -421,6 +468,169 @@ def test_database() -> None:
         database.close()
 
 
+def wait_for_gauge(service, accept, timeout: float = 6.0) -> float | None:
+    """Wait until the gauge sampler publishes a pressure `accept` likes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = service.best_pressure()
+        if accept(value):
+            return value
+        time.sleep(0.2)
+    return service.best_pressure()
+
+
+def check_crossover_interlock(devices) -> None:
+    """The turbopump start is gated on chamber pressure, not on a timer.
+
+    A turbopump started against a foreline that has not been roughed out
+    cannot develop compression: it draws its current limit and trips. How
+    long the backing pump has been running does not answer that question, so
+    the gate is the gauge reading and nothing else.
+    """
+    pump_service = devices.get("pump")
+    gauge_service = devices.get("gauge")
+    limit = pumpmod.TURBO_START_MAX_MBAR
+
+    check("turbopump start is held while the backing pump is off",
+          pump_service.interlocks()["motor_on"]["allowed"] is False,
+          pump_service.interlocks()["motor_on"]["reason"][:44])
+
+    # Everything below is about the *pressure* gate, so get past the backing
+    # pump one first: start the station and wait for the sampler to see it.
+    check("starting the station is always allowed",
+          pump_service.interlocks()["on"]["allowed"] is True)
+    pump_service.command("on")
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        if pump_service.snapshot()["setpoints"].get("PumpgStatn") is True:
+            break
+        time.sleep(0.2)
+
+    # With no gauge attached the pressure is unknown, and unknown is refused.
+    rule = pump_service.interlocks()["motor_on"]
+    check("turbopump start is refused with no gauge attached",
+          rule["allowed"] is False and "no gauge" in rule["reason"],
+          rule["reason"][:52])
+
+    pump_service.attach_pressure(gauge_service)
+
+    # At atmosphere the Pirani is over its range and the cold cathode is off,
+    # so neither channel is a pressure. That is not permission to start.
+    fake_tpg.CHAMBER.pressure = 1013.0
+    wait_for_gauge(gauge_service, lambda p: p is None)
+    rule = pump_service.interlocks()["motor_on"]
+    check("turbopump start is refused with no valid reading",
+          rule["allowed"] is False and "valid pressure" in rule["reason"],
+          rule["reason"][:52])
+
+    # Roughing: a real number, but well above the crossover.
+    fake_tpg.CHAMBER.pressure = 5.0
+    wait_for_gauge(gauge_service, lambda p: p is not None and p > limit)
+    rule = pump_service.interlocks()["motor_on"]
+    check("turbopump start is held above the crossover pressure",
+          rule["allowed"] is False and rule["pressure_mbar"] is not None,
+          rule["reason"][:52])
+    check("the refusal reports the pressure it is measuring",
+          rule["limit_mbar"] == limit and rule["pressure_mbar"] > limit,
+          f"{rule['pressure_mbar']:.2E} mbar vs {limit:.0E} mbar")
+    check("no start-delay countdown remains on the turbopump",
+          rule["wait"] == 0)
+
+    # Roughed out: the same command, now allowed, with no waiting at all.
+    fake_tpg.CHAMBER.pressure = limit / 2
+    wait_for_gauge(gauge_service, lambda p: p is not None and p <= limit)
+    check("turbopump start is allowed once the chamber is roughed out",
+          pump_service.interlocks()["motor_on"]["allowed"] is True,
+          f"{gauge_service.best_pressure():.2E} mbar")
+
+    # A stale reading is not evidence: an old number must not authorise it.
+    original = pumpmod.PRESSURE_MAX_AGE_S
+    try:
+        pumpmod.PRESSURE_MAX_AGE_S = -1.0
+        rule = pump_service.interlocks()["motor_on"]
+        check("a stale gauge reading does not authorise the start",
+              rule["allowed"] is False and "old" in rule["reason"],
+              rule["reason"][:52])
+    finally:
+        pumpmod.PRESSURE_MAX_AGE_S = original
+
+    # A recipe may not cross over above the interlock: it would stall asking
+    # for a start that is refused every cycle.
+    recipe = runs.BaseCalibration({"crossover_mbar": 5e-1})
+    recipe.begin_vacuum(_QuietEngine())
+    check("a recipe crossover above the limit is lowered to it",
+          recipe.crossover == limit, f"{recipe.crossover:.2E} mbar")
+    recipe = runs.BaseCalibration({"crossover_mbar": 1e-2})
+    recipe.begin_vacuum(_QuietEngine())
+    check("a deeper crossover is left alone", recipe.crossover == 1e-2)
+
+    fake_tpg.CHAMBER.pressure = 1013.0
+    pump_service.command("off", override=True)
+
+
+def check_phase_timeouts() -> None:
+    """Every waiting phase gives up eventually, and pauses for the operator."""
+    engine = _QuietEngine()
+    recipe = runs.Deposition({"stage_timeout_min": 1.0 / 60,
+                              "working_mbar": 5e-3, "argon_sccm": 20,
+                              "gate_percent": 30})
+    recipe.begin(engine)
+    check("a stage timeout is configured", recipe.stage_timeout == 1.0)
+
+    recipe.enter("rough")
+    recipe.phase_started -= 5.0
+    try:
+        recipe.phase_rough(engine, {"p_best": 8.0, "t": 5.0})
+        check("roughing gives up eventually", False)
+    except runs.Abort as abort:
+        check("roughing gives up eventually", True, abort.reason[:46])
+
+    recipe.enter("backfill")
+    recipe.phase_started -= 5.0
+    try:
+        recipe.phase_backfill(engine, {"p_best": 2.0e-2, "t": 5.0})
+        check("the argon backfill gives up eventually", False)
+    except runs.Abort as abort:
+        check("the argon backfill gives up eventually", True,
+              abort.reason[:46])
+
+    # A guided run waits on a person, and that must not spend the phase's
+    # patience: the clock stops while a prompt is outstanding.
+    class Prompting(_QuietEngine):
+        def prompt(self):
+            return {"instruction": "open the gate valve"}
+
+    prompting = Prompting()
+    recipe.enter("rough")
+    recipe.phase_age(prompting)                     # start the pause
+    time.sleep(0.3)
+    check("the phase clock pauses while the operator is prompted",
+          recipe.phase_age(prompting) < 0.1,
+          f"{recipe.phase_age(prompting):.3f} s counted of 0.3 s waited")
+    check("the clock runs again once the prompt is answered",
+          recipe.phase_age(engine) < 0.1 and recipe._paused >= 0.3,
+          f"{recipe._paused:.2f} s not counted")
+
+
+class _QuietEngine:
+    """Just enough engine for `begin_vacuum` to run with no rig behind it."""
+
+    def log(self, *args, **kwargs) -> None:
+        pass
+
+    def prompt(self):
+        return None
+
+    def require_argon_gas_mode(self) -> None:
+        pass
+
+    def enforce_full_speed(self, reason: str) -> None:
+        pass
+
+    def pump_command(self, action: str, value=None) -> dict:
+        return {"ok": True}
+
+
 def test_run_engine(pump_port: str, gauge_port: str) -> None:
     print("\nRun engine, both instruments attached")
     with tempfile.TemporaryDirectory() as directory:
@@ -445,12 +655,8 @@ def test_run_engine(pump_port: str, gauge_port: str) -> None:
             check("registry merges both devices into one row",
                   "speed" in row and "p1" in row, sorted(row))
 
-            interlocks = devices.get("pump").interlocks()
-            check("turbopump start is held without backing",
-                  interlocks["motor_on"]["allowed"] is False,
-                  interlocks["motor_on"]["reason"][:44])
-            check("starting the station is always allowed",
-                  interlocks["on"]["allowed"] is True)
+            check_crossover_interlock(devices)
+            check_phase_timeouts()
 
             check("unknown procedure refused",
                   engine.start("nonsense", {})["ok"] is False)

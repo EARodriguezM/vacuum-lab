@@ -15,6 +15,8 @@ from whenever a browser last polled.
 Either instrument can be left out (`--no-pump`, `--no-gauge`) and the panel
 still starts, reporting the missing one as offline. That matters during
 bring-up: a gauge that is not wired yet must not stop you driving the pump.
+Starting the turbopump is the exception -- that is gated on the chamber
+pressure, so with no gauge it is refused until an operator overrides it.
 """
 
 from __future__ import annotations
@@ -51,12 +53,21 @@ def build(args) -> api.Application:
         print(f"  argon, gate valve, magnetron and shutter are simulated too,")
         print(f"  so a whole deposition recipe runs end to end.")
 
+    pump_service = gauge_service = None
     if not args.no_pump:
-        devices.add(pump.PumpService("pump", args.serial, address=args.address))
+        pump_service = devices.add(
+            pump.PumpService("pump", args.serial, address=args.address))
     if not args.no_gauge:
-        devices.add(gauge.GaugeService(
+        gauge_service = devices.add(gauge.GaugeService(
             "gauge", args.gauge, baudrate=args.gauge_baud,
             channels=args.gauge_channels))
+
+    # The turbopump may not start above the crossover pressure, so the pump
+    # service needs somewhere to read that pressure from. Wired explicitly
+    # rather than discovered: with no gauge the interlock refuses the start
+    # instead of guessing, which is the safe direction.
+    if pump_service is not None and gauge_service is not None:
+        pump_service.attach_pressure(gauge_service)
 
     database = dbmod.Database(args.db)
     engine = runs.RunEngine(database, devices, hardware=hardware)
@@ -104,9 +115,12 @@ def main() -> int:
     for device in application.registry:
         print(f"  {device.label}: {device.port}")
     print(f"  database: {application.db.path}")
-    print(f"  interlocks: backing pump must lead the turbopump by "
-          f"{pump.BACKING_LEAD_SECONDS:.0f}s; station may not stop until "
-          f"{pump.STOP_DWELL_SECONDS:.0f}s after the rotor reaches 0 Hz")
+    print(f"  interlocks: the turbopump may not start above "
+          f"{pump.TURBO_START_MAX_MBAR:.0E} mbar; the station may not stop "
+          f"until {pump.STOP_DWELL_SECONDS:.0f}s after the rotor reads 0 Hz")
+    if args.no_gauge and not args.no_pump:
+        print("  NO GAUGE: the chamber pressure is unknown, so starting the")
+        print("  turbopump will be refused until you override it deliberately.")
     if not args.token:
         print("  NO TOKEN SET: anyone who can reach this port can start and")
         print("  stop the pump. Pass --token to require a shared secret.")

@@ -5,9 +5,24 @@ turbopump in a damaging order. They can be overridden deliberately with
 `override=True`, because a safety rule with no escape hatch is its own hazard
 once something has already gone wrong -- but every override is logged.
 
-Timers are measured from continuous observation by the sampler thread, not
-from whenever a browser last polled, which is the whole reason this service
-owns the port rather than opening it per request.
+The turbopump gate is a **pressure**, not a timer. A turbopump started
+against a chamber that has not been roughed out cannot develop compression:
+it draws its current limit and trips on over-temperature, and repeating that
+wears the bearings. How long the backing pump has been running does not
+answer the question -- a leaking chamber can be roughed for an hour and still
+sit at 10 mbar, while a clean small chamber is ready in seconds. The gauge
+answers it, so `TURBO_START_MAX_MBAR` is what this service enforces.
+
+That gate needs a pressure, so a gauge must be attached with
+`attach_pressure`. With no gauge, no *fresh* reading, or no valid channel,
+the turbopump start is refused rather than allowed: a start that might be
+into atmosphere is the case the rule exists for. The override is still there
+for an operator who can see the chamber is roughed.
+
+The stop dwell is still a timer, measured from continuous observation by the
+sampler thread rather than from whenever a browser last polled -- which is
+the whole reason this service owns the port instead of opening it per
+request.
 """
 
 from __future__ import annotations
@@ -48,9 +63,17 @@ ALLOWED_WRITES = {
 
 # --- interlock tuning -----------------------------------------------------
 
-#: The backing pump must have run this long before the turbopump may start.
-#: A turbopump spun up against an un-roughed foreline overheats and trips.
-BACKING_LEAD_SECONDS = 60.0
+#: The turbopump may not be started above this chamber pressure.
+#: Below roughly this pressure the foreline is in viscous-to-transitional
+#: flow and the turbopump can develop compression as it accelerates; above
+#: it, it cannot -- it draws its current limit, heats up and trips. 2e-1 mbar
+#: is the crossover this rig is operated at.
+TURBO_START_MAX_MBAR = 2.0e-1
+
+#: A pressure reading older than this is not evidence about the chamber.
+#: A sampler thread can wedge with a plausible number in its cache, and a
+#: stale 1e-3 mbar would authorise exactly the start the rule forbids.
+PRESSURE_MAX_AGE_S = 15.0
 
 #: After the rotor reaches zero, wait this long before the station may stop.
 #: A coasting rotor still needs backing, and "0 Hz" from the drive is also the
@@ -82,14 +105,58 @@ class PumpService(DeviceService):
         self.address = address
         self.timeout = timeout
         #: Interlock timers in time.monotonic() terms. None means "not yet".
-        self._station_on_since: float | None = None
         self._rotor_zero_since: float | None = None
+        #: Where the turbopump-start interlock reads chamber pressure from.
+        #: None until a gauge is attached, and then the start is refused.
+        self._pressure_source = None
         #: Set by the run engine while a recipe needs the rotor flat out.
         #: Sputtering in argon throttles with the gate valve, not the rotor:
         #: dropping the speed to hold pressure costs compression exactly when
         #: the gas load is highest.
         self._full_speed_reason: str | None = None
         super().__init__(key, port, address=address, **options)
+
+    # --- where the chamber pressure comes from -----------------------------
+
+    def attach_pressure(self, source) -> None:
+        """Give the interlock a gauge to read the chamber pressure from.
+
+        `source` is anything with `snapshot()` and `best_pressure(snap)` --
+        in practice the `GaugeService`, but duck-typed so a test or a second
+        gauge can stand in without this module importing that one.
+        """
+        self._pressure_source = source
+
+    def chamber_pressure(self) -> dict:
+        """What this service believes the chamber pressure is, in millibar.
+
+        Returns `{"mbar": float|None, "age": float|None, "reason": str|None}`.
+        `reason` is filled in only when there is no usable number, and says
+        why -- the interlock quotes it, because "the turbopump start is held"
+        is not actionable but "no contact with the gauge" is.
+        """
+        source = self._pressure_source
+        if source is None:
+            return {"mbar": None, "age": None,
+                    "reason": "no gauge is attached to this panel"}
+        try:
+            snap = source.snapshot()
+            if not snap.get("connected"):
+                return {"mbar": None, "age": None,
+                        "reason": f"no contact with the gauge "
+                                  f"({snap.get('error') or 'offline'})"}
+            age = snap.get("age")
+            if isinstance(age, (int, float)) and age > PRESSURE_MAX_AGE_S:
+                return {"mbar": None, "age": age,
+                        "reason": f"the gauge reading is {age:.0f} s old"}
+            value = source.best_pressure(snap)
+        except Exception as exc:                  # a wedged gauge is "unknown"
+            return {"mbar": None, "age": None,
+                    "reason": f"the gauge could not be read ({exc})"}
+        if not isinstance(value, (int, float)):
+            return {"mbar": None, "age": age,
+                    "reason": "no gauge channel is reading a valid pressure"}
+        return {"mbar": float(value), "age": age, "reason": None}
 
     # --- full-speed lock --------------------------------------------------
 
@@ -176,23 +243,15 @@ class PumpService(DeviceService):
                                units=units, setpoints=setpoints)
 
     def observe(self, snap: dict) -> None:
-        """Maintain the two dwell timers from continuous observation."""
+        """Maintain the stop dwell timer from continuous observation."""
         now = time.monotonic()
         if not snap.get("connected"):
-            # Contact lost: forget the timers rather than let a stale one
+            # Contact lost: forget the timer rather than let a stale one
             # authorise something once contact returns.
-            self._station_on_since = None
             self._rotor_zero_since = None
             return
 
-        station = snap["setpoints"].get("PumpgStatn") is True
         speed = snap["status"].get("ActualSpd")
-
-        if station:
-            if self._station_on_since is None:
-                self._station_on_since = now
-        else:
-            self._station_on_since = None
 
         if isinstance(speed, (int, float)):
             if speed > 0:
@@ -264,20 +323,37 @@ class PumpService(DeviceService):
             allow("off")
 
         # --- starting the turbopump ---------------------------------------
-        if not station:
+        # The gate is the chamber pressure, not a stopwatch: the turbopump
+        # needs a roughed foreline to develop compression against, and only
+        # the gauge knows whether it has one.
+        chamber = self.chamber_pressure()
+        limit = TURBO_START_MAX_MBAR
+        if motor or speed > 0:
+            # Already running. Re-sending "on" changes nothing, and refusing
+            # it would read as though the running pump were in breach.
+            allow("motor_on")
+        elif not station:
             block("motor_on", "the backing pump is not running. Start the "
-                              "pumping station first and let it rough down.")
-        elif self._station_on_since is None:
-            block("motor_on", "waiting to confirm how long the backing pump "
-                              "has been running.", BACKING_LEAD_SECONDS)
+                              "pumping station first and rough the chamber "
+                              f"down to {limit:.0E} mbar.")
+        elif chamber["mbar"] is None:
+            block("motor_on",
+                  f"the chamber pressure is unknown: {chamber['reason']}. The "
+                  f"turbopump must not be started above {limit:.0E} mbar, so "
+                  f"this cannot be allowed without a reading.")
+        elif chamber["mbar"] > limit:
+            block("motor_on",
+                  f"the chamber is at {chamber['mbar']:.2E} mbar. Keep "
+                  f"roughing until it reaches {limit:.0E} mbar -- a turbopump "
+                  f"started against an un-roughed foreline cannot develop "
+                  f"compression, draws its current limit and trips on "
+                  f"over-temperature.")
         else:
-            elapsed = now - self._station_on_since
-            if elapsed < BACKING_LEAD_SECONDS:
-                block("motor_on", "the backing pump needs to run for a minute "
-                                  "before the turbopump may start.",
-                      BACKING_LEAD_SECONDS - elapsed)
-            else:
-                allow("motor_on")
+            allow("motor_on")
+        # Whether or not it is blocked, say what the rule is measuring, so the
+        # panel can show the approach to crossover rather than just a refusal.
+        out["motor_on"].update({"pressure_mbar": chamber["mbar"],
+                                "limit_mbar": limit})
 
         # Starting the backing pump and stopping the turbopump are always the
         # safe direction, so they are never blocked.
@@ -402,14 +478,6 @@ class PumpService(DeviceService):
                 return {"ok": False, "error": str(exc)}
 
         self.note_success()
-        # A command that changes station state must move its timer at once;
-        # waiting for the next sample would leave a two-second hole in which
-        # the old timer still applies.
-        now = time.monotonic()
-        if action == "on":
-            self._station_on_since = self._station_on_since or now
-        elif action == "off":
-            self._station_on_since = None
         return {"ok": True, "action": action, "result": result,
                 "overridden": bool(override)}
 
