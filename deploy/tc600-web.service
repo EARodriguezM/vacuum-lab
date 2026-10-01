@@ -9,9 +9,21 @@
 #
 # Both ports are named explicitly rather than left to the defaults, so that a
 # change of default in webserver.py cannot silently move a running rig onto a
-# different instrument. /dev/ttyS1 is the TC 600 over RS-485; /dev/ttyS0 is
-# the TPG 252 A over direct RS-232 (USB adapters do not work on it -- see the
-# README).
+# different instrument.
+#
+# They are named /dev/tc600 and /dev/tpg252, which exist because of
+# deploy/99-vacuum-lab.rules. Install that first or this unit will not
+# start:
+#
+#   sudo cp deploy/99-vacuum-lab.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --subsystem-match=tty --action=add
+#
+# Not /dev/ttyUSBn, which is assigned in enumeration order and swaps on a
+# replug; not /dev/ttyS0 and /dev/ttyS1, which is what this unit used to say
+# and which stopped working when the onboard UARTs vanished on 2026-08-31 --
+# a unit naming a dead port starts cleanly and reports both instruments
+# offline, which reads as a dead rig rather than a stale config file.
 
 [Unit]
 Description=Vacuum lab control panel (TC 600 turbopump + TPG 252 A gauge)
@@ -22,9 +34,14 @@ Type=simple
 User=esarodriguezm
 Group=dialout
 WorkingDirectory=/home/esarodriguezm/tc600-control
+# Without this, Python block-buffers stdout when it is a journal socket rather
+# than a terminal, and the startup banner -- which ports were opened, what the
+# interlocks are set to, and whether the panel is running with no token --
+# never reaches `journalctl -u tc600-web`.
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /home/esarodriguezm/tc600-control/webserver.py \
-    --serial /dev/ttyS1 --address 1 \
-    --gauge /dev/ttyS0 --gauge-baud 9600 \
+    --serial /dev/tc600 --address 1 \
+    --gauge /dev/tpg252 --gauge-baud 9600 \
     --port 8600
 Restart=on-failure
 RestartSec=5

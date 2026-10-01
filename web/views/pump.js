@@ -183,7 +183,8 @@ function Accessories({ data, busy, onWrite, reload }) {
     </div>`;
 }
 
-export function PumpView({ state, onCommand, onWriteParam, busy }) {
+export function PumpView({ state, onCommand, onWriteParam, busy,
+                           onShutdown, shutdown }) {
   const pump = state?.devices?.pump;
   const [accessories, setAccessories] = useState(null);
   const [speed, setSpeed] = useState("");
@@ -247,6 +248,18 @@ export function PumpView({ state, onCommand, onWriteParam, busy }) {
                   onClick=${() => onCommand("ack", "Acknowledge fault")}>
             Acknowledge fault
           </button>
+          <button class="danger"
+                  disabled=${busy || !!shutdown?.active
+                             || setpoints.PumpgStatn !== true}
+                  onClick=${onShutdown}>
+            ${shutdown?.active ? "Powering down…" : "Power down the pump"}
+          </button>
+        </div>
+        <div class="small muted">
+          Power down runs the whole stop sequence in order — motor off, rotor
+          to rest with the backing pump still running, then the station. Use
+          it instead of the two buttons above when you are finished for the
+          day.
         </div>
         <${CrossoverNote} interlocks=${interlocks}
                           running=${setpoints.MotorPump === true} />

@@ -70,6 +70,42 @@ export function Confirm({ open, title, body, confirmLabel = "Confirm",
     </div>`;
 }
 
+/** A dialog that asks *which* action to take, not merely whether to proceed.
+ *
+ * Distinct from `Confirm` on purpose. When the choices differ in what they
+ * leave behind — a chamber still under vacuum, or a pump brought to rest —
+ * a single "are you sure?" hides the decision that actually matters, and the
+ * operator answers the wrong question.
+ */
+export function Choose({ open, title, body, options = [], onChoose, onCancel }) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event) => { if (event.key === "Escape") onCancel(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onCancel]);
+
+  if (!open) return null;
+  return html`
+    <div class="overlay" onClick=${(e) => e.target === e.currentTarget && onCancel()}>
+      <div class="dialog" role="dialog" aria-modal="true">
+        <h2>${title}</h2>
+        ${body && html`<div class="small">${body}</div>`}
+        <div class="choices">
+          ${options.map((option) => html`
+            <button key=${option.key} class=${`choice ${option.tone || ""}`}
+                    onClick=${() => onChoose(option.key)}>
+              <strong>${option.label}</strong>
+              <span class="help">${option.description}</span>
+            </button>`)}
+        </div>
+        <div class="actions">
+          <button onClick=${onCancel}>Cancel</button>
+        </div>
+      </div>
+    </div>`;
+}
+
 export function Toasts({ items, onDismiss }) {
   return html`
     <div class="toast-stack">

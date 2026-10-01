@@ -344,3 +344,14 @@ dl.pairs dd { margin:0; text-align:right; }
 @media (prefers-reduced-motion: no-preference) {
   .chart .series { transition: d .2s linear; }
 }
+
+/* Choice dialog: each option is a full-width button carrying its own
+   consequence, because "Stop" and "Stop and power down" leave the rig in
+   very different states and the difference must be readable before the
+   click, not after it. */
+.choices { display:grid; gap:8px; margin:14px 0 4px; }
+.choice { display:flex; flex-direction:column; align-items:flex-start;
+          gap:3px; text-align:left; width:100%; padding:11px 13px;
+          height:auto; line-height:1.35; white-space:normal; }
+.choice strong { font-size:13.5px; }
+.choice .help { margin:0; }

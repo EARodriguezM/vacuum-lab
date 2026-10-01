@@ -24,7 +24,7 @@ import threading
 import time
 import uuid
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 #: Statuses a run can be in. `running` is the only one the engine writes live;
 #: everything else is terminal.
@@ -61,6 +61,11 @@ CREATE TABLE IF NOT EXISTS samples (
     p1_status   INTEGER,
     p2          REAL,
     p2_status   INTEGER,
+    -- The pressure the run engine actually judged on: the lower of the valid
+    -- channels, in mbar, or NULL when no channel was reading one. Stored
+    -- rather than recomputed, because "which channel was trustworthy" is a
+    -- decision made at sampling time and a reader cannot reconstruct it.
+    p_best      REAL,
     speed       REAL,
     set_speed   REAL,
     current     REAL,
@@ -98,9 +103,17 @@ CREATE TABLE IF NOT EXISTS devices (
 #: Sample columns in the order they are written and exported. Kept in one
 #: place so the schema, the insert and the CSV header cannot drift apart.
 SAMPLE_COLUMNS = (
-    "t", "at", "phase", "p1", "p1_status", "p2", "p2_status",
+    "t", "at", "phase", "p1", "p1_status", "p2", "p2_status", "p_best",
     "speed", "set_speed", "current", "voltage", "power",
     "tms_temp", "error_code", "station", "motor",
+)
+
+#: Columns added after schema version 1. `CREATE TABLE IF NOT EXISTS` does
+#: nothing to a table that already exists, so an older database needs them
+#: named explicitly -- otherwise the first insert fails on a column the code
+#: believes is there.
+MIGRATIONS = (
+    ("samples", "p_best", "REAL"),
 )
 
 
@@ -125,11 +138,31 @@ class Database:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA foreign_keys=ON")
             self._db.executescript(SCHEMA)
+            self._migrate()
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._db.commit()
 
+    def _migrate(self) -> None:
+        """Add columns an older database is missing. Caller holds the lock."""
+        for table, column, kind in MIGRATIONS:
+            present = {row["name"] for row in
+                       self._db.execute(f"PRAGMA table_info({table})")}
+            if column not in present:
+                self._db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+
     def close(self) -> None:
         with self._lock:
+            # Fold the write-ahead log back into the database file before
+            # letting go. SQLite recovers from a live WAL perfectly well on
+            # the next open, so this is not about correctness -- it is about
+            # everything that copies the file. A plain `cp lab.db` of a
+            # database with a 4 MB WAL silently loses the most recent runs,
+            # which is exactly what happened taking a backup on 2026-09-02.
+            try:
+                self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
             self._db.close()
 
     # --- runs -------------------------------------------------------------

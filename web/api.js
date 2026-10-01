@@ -112,7 +112,12 @@ export const api = {
     post("/api/command", { device, action, value, confirm: true, ...extra }),
 
   startRun: (body) => post("/api/run/start", body),
-  stopRun:  (reason) => post("/api/run/stop", { reason }),
+  // `shutdown` asks for the pump to be brought to rest as well. Without it
+  // the run ends and the rig is left exactly as it is, still under vacuum.
+  stopRun:  (reason, shutdown = false) =>
+    post("/api/run/stop", { reason, shutdown }),
+  shutdownPump: (reason = "requested by the operator") =>
+    post("/api/pump/shutdown", { reason, confirm: true }),
   acknowledgeStep: (note = "") => post("/api/run/acknowledge", { note }),
 
   ports: (kind = "all", includePhantom = false) =>

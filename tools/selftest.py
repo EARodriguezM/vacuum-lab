@@ -288,38 +288,45 @@ def test_process() -> None:
 
 
 def field_default_mismatches() -> dict[str, list[str]]:
-    """Every `self.number("k", d)` fallback against the field default for k.
+    """Every published field default against the fallback the code uses.
 
-    Read out of the source rather than by running the recipes: the fallback
-    only shows itself when the key is *missing* from the config, which is the
-    one case a form-driven run never produces and an API caller or an old
-    stored config produces easily.
+    Done by *running* each procedure's `begin()` against a stub engine with
+    an empty config and recording what `number()` and `flag()` were asked
+    for. An earlier version read the syntax tree of each procedure class,
+    which silently skipped every fallback living on a base class -- and
+    `begin_vacuum`, shared by four procedures, is where the mismatch was.
+
+    The fallback only shows itself when the key is *missing* from the
+    config, which is the one case a form-driven run never produces and an
+    API caller or an old stored config produces easily.
     """
-    tree = ast.parse(open(os.path.join(ROOT, "lab", "runs.py")).read())
-    classes = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
     out: dict[str, list[str]] = {}
 
     for procedure in runs.CATALOGUE.values():
         published = {f["key"]: f.get("default") for f in procedure.fields}
-        found: list[str] = []
-        for call in ast.walk(classes[procedure.__name__]):
-            if not (isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Attribute)
-                    and call.func.attr in ("number", "flag")
-                    and isinstance(call.func.value, ast.Name)
-                    and call.func.value.id == "self"
-                    and len(call.args) == 2
-                    and isinstance(call.args[0], ast.Constant)):
-                continue
-            key = call.args[0].value
-            try:
-                fallback = ast.literal_eval(call.args[1])
-            except ValueError:
-                continue                      # a named constant, not a literal
-            if key in published and published[key] != fallback:
-                found.append(f"{key}: form says {published[key]!r}, "
-                             f"line {call.lineno} says {fallback!r}")
-        out[procedure.name] = found
+        seen: dict[str, object] = {}
+
+        class Recording(procedure):                  # noqa: B903
+            def number(self, key, default=0.0):
+                seen[key] = default
+                return super().number(key, default)
+
+            def flag(self, key, default=False):
+                seen[key] = default
+                return super().flag(key, default)
+
+        recipe = Recording({})
+        try:
+            recipe.begin(_QuietEngine())
+        except Exception:
+            pass          # only the reads matter, not whether it could start
+
+        out[procedure.name] = [
+            f"{key}: form says {published[key]!r}, code falls back to "
+            f"{fallback!r}"
+            for key, fallback in sorted(seen.items())
+            if key in published and published[key] != fallback
+        ]
     return out
 
 
@@ -409,9 +416,22 @@ def test_database() -> None:
             database.add_sample(run["id"], {
                 "t": index * 2.0, "at": time.time(), "phase": "pumping",
                 "p1": 1.0e-3 / (index + 1), "p1_status": 0,
+                "p_best": 1.0e-3 / (index + 1),
                 "speed": index * 100, "station": 1, "motor": 1,
             })
         check("samples stored", database.sample_count(run["id"]) == 10)
+
+        # p_best is the pressure the engine actually judged on -- which
+        # channel was trustworthy is decided at sampling time and cannot be
+        # reconstructed by a reader. It was computed but never stored until
+        # 2026-09-02, so every finished run read back with no pressure at all.
+        stored = database.samples(run["id"])
+        check("p_best is stored, not just computed",
+              stored[0].get("p_best") == 1.0e-3,
+              f"{stored[0].get('p_best')}")
+        check("p_best survives decimation",
+              all(s.get("p_best") is not None
+                  for s in database.samples(run["id"], every=3)))
         check("samples come back in order",
               [s["t"] for s in database.samples(run["id"])] ==
               [i * 2.0 for i in range(10)])
@@ -439,6 +459,12 @@ def test_database() -> None:
               name.endswith(".csv") and "pumpdown" in name, name)
         rows = [ln for ln in text.splitlines()
                 if ln and not ln.startswith("#")]
+        check("CSV header names p_best", "p_best_mbar" in text)
+        check("CSV header and rows have the same width",
+              len(text.strip().splitlines()[-1].split(",")) ==
+              len(export.SAMPLE_HEADER),
+              f"{len(text.strip().splitlines()[-1].split(','))} vs "
+              f"{len(export.SAMPLE_HEADER)}")
         check("CSV carries a row per sample", len(rows) == 11,   # header + 10
               f"{len(rows)} data rows, {len(text.splitlines())} lines total")
 
@@ -554,9 +580,33 @@ def check_crossover_interlock(devices) -> None:
     finally:
         pumpmod.PRESSURE_MAX_AGE_S = original
 
+    # The run-13 accident, 2026-09-02: starting the backing pump makes gas
+    # rush through the turbopump and windmill the rotor to a few Hz. An
+    # earlier version read "speed > 0" as "already running" and waved the
+    # start through while the gauge was overrange -- and the rotor spun up to
+    # 1444 Hz against atmosphere. A turning rotor is not evidence about the
+    # foreline.
+    fake_tpg.CHAMBER.pressure = 1013.0
+    wait_for_gauge(gauge_service, lambda p: p is None)
+    windmilling = dict(pump_service.snapshot())
+    windmilling["status"] = {**windmilling.get("status", {}), "ActualSpd": 4}
+    windmilling["setpoints"] = {**windmilling.get("setpoints", {}),
+                                "PumpgStatn": True, "MotorPump": False}
+    rule = pump_service.interlocks(windmilling)["motor_on"]
+    check("a windmilling rotor does not authorise the start",
+          rule["allowed"] is False, rule["reason"][-60:])
+    check("the refusal names the windmilling for what it is",
+          "gas flow" in rule["reason"])
+
+    # The one genuine no-op: the drive's own motor enable is already set.
+    already = dict(windmilling)
+    already["setpoints"] = {**already["setpoints"], "MotorPump": True}
+    check("re-sending the start to a running motor is a no-op, not a breach",
+          pump_service.interlocks(already)["motor_on"]["allowed"] is True)
+
     # A recipe may not cross over above the interlock: it would stall asking
     # for a start that is refused every cycle.
-    recipe = runs.BaseCalibration({"crossover_mbar": 5e-1})
+    recipe = runs.BaseCalibration({"crossover_mbar": limit * 10})
     recipe.begin_vacuum(_QuietEngine())
     check("a recipe crossover above the limit is lowered to it",
           recipe.crossover == limit, f"{recipe.crossover:.2E} mbar")
@@ -618,17 +668,157 @@ class _QuietEngine:
     def log(self, *args, **kwargs) -> None:
         pass
 
+    #: What `pump_status()` should report. Empty unless a test sets it.
+    status: dict = {}
+
     def prompt(self):
         return None
 
     def require_argon_gas_mode(self) -> None:
         pass
 
+    def pump_status(self) -> dict:
+        return self.status
+
+    def pump_param(self, name, value) -> dict:
+        return {"ok": True}
+
+    def nominal_speed(self):
+        return 1000.0
+
+    def last_base_pressure(self, exclude_run=None):
+        return None
+
+    def run_id(self):
+        return None
+
+    def require(self, actuator, value) -> bool:
+        return True
+
+    def stop_choice(self):
+        return None
+
+    def shutdown_pump(self, reason: str = "") -> dict:
+        return {"ok": True}
+
+    def shutdown_status(self):
+        return None
+
     def enforce_full_speed(self, reason: str) -> None:
         pass
 
     def pump_command(self, action: str, value=None) -> dict:
         return {"ok": True}
+
+
+def check_full_vacuum() -> None:
+    """The unlimited procedure: no deadline, and stopping is how it ends."""
+    engine = _QuietEngine()
+    recipe = runs.FullVacuum({"interval_s": 5})
+    recipe.begin(engine)
+
+    check("full vacuum has no deadline on reaching base pressure",
+          recipe.base_timeout == 0)
+    check("full vacuum still bounds roughing and spin-up",
+          recipe.stage_timeout > 0, f"{recipe.stage_timeout / 60:.0f} min")
+    check("base pressure leads to holding, not to done",
+          recipe.after_base_pressure() == "holding")
+    check("stopping a full vacuum run completes it rather than aborting it",
+          recipe.stop_is_completion is True)
+    check("every other procedure still treats a stop as an abort",
+          all(not p.stop_is_completion for p in runs.CATALOGUE.values()
+              if p.name != "full_vacuum"))
+
+    # The holding phase must never end the run on its own, however long it
+    # runs or whatever the pressure does.
+    recipe.enter("holding")
+    ended = [recipe.phase_holding(engine, {"t": t, "p_best": 5e-6})
+             for t in (0.0, 60.0, 3600.0, 86400.0)]
+    check("holding never ends by itself", all(n is None for n in ended))
+
+    # Over-temperature is watched in every phase, from the drive's own flags.
+    hot = _QuietEngine()
+    hot.status = {"OvTempPump": True}
+    try:
+        recipe.step(hot, {"t": 10.0, "p_best": 5e-6, "phase": "holding"})
+        check("an over-temperature flag aborts the run", False)
+    except runs.Abort as abort:
+        check("an over-temperature flag aborts the run", True,
+              abort.reason[:44])
+
+    warm = _QuietEngine()
+    try:
+        recipe.step(warm, {"t": 10.0, "p_best": 5e-6, "tms_temp": 95.0})
+        check("a temperature above the run's limit aborts it", False)
+    except runs.Abort as abort:
+        check("a temperature above the run's limit aborts it", True,
+              abort.reason[:44])
+
+
+def check_guided_shutdown(engine, devices) -> None:
+    """The power-down must not stop the station under a spinning rotor.
+
+    The order is the whole point: motor off, wait for the rotor to reach
+    rest with the backing pump still running, let the dwell pass, and only
+    then stop the station. The dwell is shortened here so the test costs
+    seconds rather than half a minute.
+    """
+    pump_service = devices.get("pump")
+    dwell = pumpmod.STOP_DWELL_SECONDS
+    poll = runs.RunEngine.SHUTDOWN_POLL_S
+    try:
+        pumpmod.STOP_DWELL_SECONDS = 1.0
+        runs.RunEngine.SHUTDOWN_POLL_S = 0.3
+
+        # Get the rig running: station on, rotor up to speed.
+        pump_service.command("on", override=True)
+        pump_service.command("motor_on", override=True)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            speed = pump_service.snapshot().get("status", {}).get("ActualSpd") or 0
+            if speed > 50:
+                break
+            time.sleep(0.3)
+        spinning = pump_service.snapshot().get("status", {}).get("ActualSpd") or 0
+        check("rotor is spinning before the power-down", spinning > 50,
+              f"{spinning} Hz")
+        check("the station may not stop while the rotor turns",
+              pump_service.interlocks()["off"]["allowed"] is False)
+
+        started = engine.shutdown_pump("selftest")
+        check("power-down starts", started.get("ok") is True)
+        check("a second power-down is refused while one runs",
+              engine.shutdown_pump("again").get("ok") is False)
+
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            state = engine.shutdown_status() or {}
+            if not state.get("active"):
+                break
+            time.sleep(0.3)
+
+        state = engine.shutdown_status() or {}
+        check("power-down finishes", state.get("active") is False,
+              f"{state.get('phase')}: {state.get('message')}")
+        check("power-down reports success", state.get("ok") is True)
+
+        # The pump service publishes a cached snapshot every couple of
+        # seconds, so give it a cycle to catch up with the last command
+        # rather than reading the state it held while the command was sent.
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            snap = pump_service.snapshot()
+            if snap.get("setpoints", {}).get("PumpgStatn") is False:
+                break
+            time.sleep(0.3)
+        check("rotor is at rest afterwards",
+              (snap.get("status", {}).get("ActualSpd") or 0) == 0)
+        check("the station is off afterwards",
+              snap.get("setpoints", {}).get("PumpgStatn") is False,
+              str(snap.get("setpoints", {}).get("PumpgStatn")))
+    finally:
+        pumpmod.STOP_DWELL_SECONDS = dwell
+        runs.RunEngine.SHUTDOWN_POLL_S = poll
 
 
 def test_run_engine(pump_port: str, gauge_port: str) -> None:
@@ -657,6 +847,8 @@ def test_run_engine(pump_port: str, gauge_port: str) -> None:
 
             check_crossover_interlock(devices)
             check_phase_timeouts()
+            check_full_vacuum()
+            check_guided_shutdown(engine, devices)
 
             check("unknown procedure refused",
                   engine.start("nonsense", {})["ok"] is False)

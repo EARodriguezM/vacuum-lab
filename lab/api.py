@@ -342,8 +342,24 @@ class Handler(BaseHTTPRequestHandler):
             ))
             return
         if route == "/api/run/stop":
+            # `shutdown` is a separate decision from stopping the run: it
+            # asks for the pump to be brought to rest as well, in the order
+            # the hardware needs. Without it the rig is left exactly as it
+            # is, still under vacuum.
             self._json(self.app.engine.stop(
-                str(payload.get("reason", "stopped by the operator"))))
+                str(payload.get("reason", "stopped by the operator")),
+                shutdown=bool(payload.get("shutdown"))))
+            return
+        if route == "/api/pump/shutdown":
+            # The same guided power-down, without a run to stop. Guarded like
+            # any other hardware action: a stray GET cannot stop a pump.
+            if not payload.get("confirm"):
+                self._json({"ok": False,
+                            "error": "shutting the pump down needs confirm"},
+                           400)
+                return
+            self._json(self.app.engine.shutdown_pump(
+                str(payload.get("reason", "requested by the operator"))))
             return
         if route == "/api/run/acknowledge":
             self._json(self.app.engine.acknowledge(

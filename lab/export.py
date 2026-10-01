@@ -25,7 +25,7 @@ from . import db as dbmod
 #: Columns of a per-run CSV, in order.
 SAMPLE_HEADER = (
     "t_s", "timestamp", "iso_time", "phase",
-    "p1_mbar", "p1_status", "p2_mbar", "p2_status",
+    "p1_mbar", "p1_status", "p2_mbar", "p2_status", "p_best_mbar",
     "speed_hz", "set_speed_hz", "current_a", "voltage_v", "power_w",
     "tms_temp_c", "error_code", "station", "motor",
 )
@@ -93,6 +93,7 @@ def run_csv(database: "dbmod.Database", run_id: int) -> tuple[str, str] | None:
             sample.get("phase") or "",
             sample.get("p1"), sample.get("p1_status"),
             sample.get("p2"), sample.get("p2_status"),
+            sample.get("p_best"),
             sample.get("speed"), sample.get("set_speed"),
             sample.get("current"), sample.get("voltage"), sample.get("power"),
             sample.get("tms_temp"), sample.get("error_code") or "",

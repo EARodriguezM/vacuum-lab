@@ -132,6 +132,13 @@ class Procedure:
     #: Pressure above which the run aborts, or None for no ceiling.
     pressure_ceiling: float | None = None
 
+    #: Whether the operator stopping this run counts as completing it. False
+    #: for procedures with an ending of their own -- stopping a deposition
+    #: half way through really is an abort. True only where there is no
+    #: natural end, so that stopping is the intended way to finish and
+    #: filing it under failures would be wrong.
+    stop_is_completion = False
+
     #: Seconds between repeats of the same "waiting for the interlock" note.
     HOLD_LOG_S = 60.0
 
@@ -305,7 +312,11 @@ class PumpDown(Procedure):
                     self.enter("turbo")
                 else:
                     self.note_hold(engine, result.get("error"), "motor_on")
-            elif speed > 0:
+            elif sample.get("motor"):
+                # The drive's own motor enable, not the rotor speed: gas
+                # rushing through the pump as roughing starts windmills the
+                # rotor to a few Hz with the motor off, and that is not the
+                # turbopump running.
                 self.enter("turbo")
 
         elif self.phase == "turbo":
@@ -606,6 +617,19 @@ class VacuumSequence(Procedure):
     calibration the professor asked for.
     """
 
+    #: Defaults for the shared route. Each is named once and referenced
+    #: twice -- by the published field descriptor and by the fallback in
+    #: `begin_vacuum` -- because those two disagreeing is how a deposition
+    #: came to throttle a valve the operator was shown as open. A subclass
+    #: that wants a different default overrides the attribute and points its
+    #: own field descriptor at it.
+    DEFAULT_INTERVAL_S = 2.0
+    DEFAULT_CROSSOVER_MBAR = TURBO_START_MAX_MBAR
+    DEFAULT_BASE_RATE_PCT = 2.0
+    DEFAULT_BASE_SETTLE_MIN = 3.0
+    DEFAULT_BASE_TIMEOUT_MIN = 120.0
+    DEFAULT_STAGE_TIMEOUT_MIN = 45.0
+
     #: Fields every recipe built on this sequence shares.
     VACUUM_FIELDS: tuple[dict, ...] = (
         {"key": "mode", "label": "Run mode", "type": "select",
@@ -618,54 +642,71 @@ class VacuumSequence(Procedure):
                  "shutter yet, so guided is the only mode that will run "
                  "today."},
         {"key": "crossover_mbar", "label": "Start the turbopump at",
-         "type": "exponent", "default": TURBO_START_MAX_MBAR, "unit": "mbar",
+         "type": "exponent", "default": DEFAULT_CROSSOVER_MBAR, "unit": "mbar",
          "help": "The forevacuum pump works alone until the chamber reaches "
                  f"this. {TURBO_START_MAX_MBAR:.0E} mbar is the highest the "
                  "interlock will allow; asking for more is lowered to it, "
                  "since a turbopump started against an un-roughed foreline "
                  "cannot develop compression and trips."},
         {"key": "base_rate_pct", "label": "Call it base pressure below",
-         "type": "number", "default": 2.0, "unit": "%/min", "min": 0.1,
-         "max": 50,
+         "type": "number", "default": DEFAULT_BASE_RATE_PCT, "unit": "%/min",
+         "min": 0.1, "max": 50,
          "help": "When the pressure is improving more slowly than this, the "
                  "chamber has stopped getting better."},
         {"key": "base_settle_min", "label": "…sustained for", "type": "number",
-         "default": 3, "unit": "min", "min": 0.5, "max": 120},
+         "default": DEFAULT_BASE_SETTLE_MIN, "unit": "min", "min": 0.5,
+         "max": 120},
         {"key": "base_timeout_min", "label": "Give up looking for base after",
-         "type": "number", "default": 120, "unit": "min", "min": 1, "max": 1440},
+         "type": "number", "default": DEFAULT_BASE_TIMEOUT_MIN, "unit": "min",
+         "min": 1, "max": 1440},
         {"key": "stage_timeout_min", "label": "Give up on any other stage after",
-         "type": "number", "default": 45, "unit": "min", "min": 1, "max": 1440,
+         "type": "number", "default": DEFAULT_STAGE_TIMEOUT_MIN, "unit": "min",
+         "min": 1, "max": 1440,
          "help": "Roughing, the turbopump start, spin-up and the argon "
                  "backfill each get this long before the run gives up. Time "
                  "spent waiting for you to do something by hand does not "
                  "count against it."},
         {"key": "interval_s", "label": "Sample every", "type": "number",
-         "default": 2, "unit": "s", "min": 1, "max": 60},
+         "default": DEFAULT_INTERVAL_S, "unit": "s", "min": 1, "max": 60},
     )
 
     #: Rolling window used to judge whether the pressure has flattened.
     RATE_WINDOW_S = 120.0
 
+    #: Why the rotor is held at its final rotation speed for this recipe.
+    #: Overridden where the reason is not the deposition one.
+    full_speed_reason = ("this rig sputters in argon, so the turbopump runs "
+                         "at its final rotation speed for the whole run")
+
     def begin_vacuum(self, engine: "RunEngine") -> None:
-        self.interval = max(1.0, self.number("interval_s", 2))
+        self.interval = max(1.0, self.number("interval_s",
+                                             self.DEFAULT_INTERVAL_S))
         # A recipe may cross over deeper than the interlock demands, never
-        # shallower: asking for 5e-1 mbar would leave the run stuck in the
-        # crossover phase asking for a start the pump service keeps refusing.
-        requested = self.number("crossover_mbar", TURBO_START_MAX_MBAR)
+        # shallower: asking for a value above TURBO_START_MAX_MBAR would leave
+        # the run stuck in the crossover phase asking for a start the pump
+        # service keeps refusing.
+        requested = self.number("crossover_mbar", self.DEFAULT_CROSSOVER_MBAR)
         self.crossover = min(requested, TURBO_START_MAX_MBAR)
         if self.crossover < requested:
             engine.log("warning",
                        f"Crossover lowered from {requested:.2E} to "
                        f"{self.crossover:.2E} mbar: the turbopump may not be "
                        f"started above {TURBO_START_MAX_MBAR:.0E} mbar.")
-        self.base_rate_limit = self.number("base_rate_pct", 2.0)
-        self.base_settle = self.number("base_settle_min", 3) * 60.0
-        self.base_timeout = self.number("base_timeout_min", 120) * 60.0
+        self.base_rate_limit = self.number("base_rate_pct",
+                                           self.DEFAULT_BASE_RATE_PCT)
+        self.base_settle = self.number("base_settle_min",
+                                       self.DEFAULT_BASE_SETTLE_MIN) * 60.0
+        # Both timeouts take 0 to mean "no limit". Every procedure built on
+        # this sequence wants a bound except `FullVacuum`, whose whole point
+        # is to keep pumping until a person says stop.
+        self.base_timeout = max(0.0, self.number(
+            "base_timeout_min", self.DEFAULT_BASE_TIMEOUT_MIN)) * 60.0
         # Every other phase needs a bound too. Without one, a chamber that
         # never reaches crossover -- a shut roughing valve, a dead forepump,
         # a gross leak -- roughs for ever, and a run that cannot finish still
         # looks alive.
-        self.stage_timeout = self.number("stage_timeout_min", 45) * 60.0
+        self.stage_timeout = max(0.0, self.number(
+            "stage_timeout_min", self.DEFAULT_STAGE_TIMEOUT_MIN)) * 60.0
 
         self.base_mbar: float | None = None
         self.base_reached_at: float | None = None
@@ -675,9 +716,7 @@ class VacuumSequence(Procedure):
         self._window: deque = deque()
         self.turbo_requested = False
 
-        engine.enforce_full_speed("this rig sputters in argon, so the "
-                                  "turbopump runs at its final rotation "
-                                  "speed for the whole run")
+        engine.enforce_full_speed(self.full_speed_reason)
         result = engine.pump_command("on")
         engine.log("action", "Forevacuum pump started" if result.get("ok")
                    else f"Could not start the forevacuum pump: "
@@ -687,7 +726,7 @@ class VacuumSequence(Procedure):
 
     def phase_rough(self, engine: "RunEngine", sample: dict) -> str | None:
         pressure = sample.get("p_best")
-        if self.phase_age(engine) >= self.stage_timeout:
+        if self.stage_timeout and self.phase_age(engine) >= self.stage_timeout:
             raise Abort(
                 f"roughing ran for {self.stage_timeout / 60:.0f} min without "
                 f"reaching the {self.crossover:.2E} mbar crossover"
@@ -713,7 +752,7 @@ class VacuumSequence(Procedure):
         return None
 
     def phase_crossover(self, engine: "RunEngine", sample: dict) -> str | None:
-        if self.phase_age(engine) >= self.stage_timeout:
+        if self.stage_timeout and self.phase_age(engine) >= self.stage_timeout:
             raise Abort(
                 f"the turbopump could not be started within "
                 f"{self.stage_timeout / 60:.0f} min of reaching crossover: "
@@ -734,7 +773,7 @@ class VacuumSequence(Procedure):
     def phase_spinup(self, engine: "RunEngine", sample: dict) -> str | None:
         speed = sample.get("speed") or 0
         nominal = engine.nominal_speed() or 0
-        if self.phase_age(engine) >= self.stage_timeout:
+        if self.stage_timeout and self.phase_age(engine) >= self.stage_timeout:
             raise Abort(
                 f"the rotor did not reach full speed within "
                 f"{self.stage_timeout / 60:.0f} min (it is at {speed:.0f} Hz "
@@ -744,7 +783,11 @@ class VacuumSequence(Procedure):
             self.full_speed_at = sample["t"]
             engine.log("info", f"Turbopump at full speed ({speed:.0f} Hz)")
             return "basepressure"
-        if not nominal and speed > 0:
+        if not nominal and speed > 0 and sample.get("motor"):
+            # With no nominal speed to compare against there is no way to
+            # know "full", so any rotation has to do -- but only while the
+            # motor is actually enabled. Windmilling would otherwise call a
+            # coasting rotor "up to speed".
             return "basepressure"
         return None
 
@@ -774,7 +817,7 @@ class VacuumSequence(Procedure):
         else:
             self._flat_since = None
 
-        if self.in_phase >= self.base_timeout:
+        if self.base_timeout and self.phase_age(engine) >= self.base_timeout:
             raise Abort(
                 f"gave up after {self.base_timeout / 60:.0f} min: the chamber "
                 f"is at {pressure:.2E} mbar and still improving by "
@@ -969,7 +1012,7 @@ class Deposition(VacuumSequence):
         # opening that cannot meet in the middle at the working pressure
         # would otherwise sit here for ever with argon running into the
         # chamber and nobody watching -- the abort path shuts the gas off.
-        if self.phase_age(engine) >= self.stage_timeout:
+        if self.stage_timeout and self.phase_age(engine) >= self.stage_timeout:
             reading = sample.get("p_best")
             raise Abort(
                 f"the chamber did not hold {self.working:.2E} mbar within "
@@ -1087,10 +1130,241 @@ class Deposition(VacuumSequence):
         return summary
 
 
+
+class FullVacuum(VacuumSequence):
+    """Pump the chamber out and hold it there until somebody says stop.
+
+    The rig's everyday state, and the only procedure with no ending of its
+    own. It follows the same route as every other recipe -- rough, cross over
+    on pressure, spin up, find base pressure -- and then simply keeps going,
+    recording the whole time, for as long as the chamber is wanted under
+    vacuum. Reaching base pressure is noted in the log and in the summary but
+    does not end anything.
+
+    Two consequences of "unlimited" are deliberate:
+
+    * **The base-pressure search has no deadline.** `base_timeout_min` is 0
+      here. A chamber that takes six hours to flatten is still doing the
+      right thing, and this run has nowhere to be.
+    * **The approach phases keep theirs.** Roughing, the turbopump start and
+      spin-up are bounded, because a rig that cannot get to vacuum at all is
+      failing rather than working slowly, and it should say so instead of
+      sitting at atmosphere overnight looking busy.
+
+    Stopping it powers the pump down by default, in the order the hardware
+    needs -- motor off, rotor to rest with the backing pump still running,
+    then the station. An operator who stops it and explicitly asks to keep
+    the vacuum is obeyed instead.
+    """
+
+    name = "full_vacuum"
+    label = "Full vacuum (hold until stopped)"
+
+    #: Stopping it is how this one ends. Every other procedure runs out of
+    #: its own accord, so a stop there is genuinely an abort.
+    stop_is_completion = True
+
+    #: This run may last for days, so it samples more slowly than a recipe
+    #: that lasts an hour, and gives the approach phases longer before it
+    #: calls them stalled. Both are referenced by the fields below, so the
+    #: form and the fallback cannot disagree.
+    DEFAULT_INTERVAL_S = 5.0
+    DEFAULT_STAGE_TIMEOUT_MIN = 60.0
+    description = ("Starts the forevacuum pump, crosses over to the "
+                   "turbopump at the crossover pressure, runs up to full "
+                   "speed and then holds the chamber under vacuum "
+                   "indefinitely, recording pressure, rotor speed, drive "
+                   "current, voltage, power and temperature throughout. "
+                   "Stopping it powers the pump down in the correct order.")
+    phases = ("rough", "crossover", "spinup", "basepressure", "holding",
+              "done")
+
+    #: The rotor is held at final rotation speed here for the ordinary
+    #: reason, not the sputtering one: a turbopump has one working speed.
+    full_speed_reason = ("a turbopump has one working speed, and this run "
+                         "holds the chamber under vacuum")
+
+    fields = (
+        {"key": "crossover_mbar", "label": "Start the turbopump at",
+         "type": "exponent", "default": VacuumSequence.DEFAULT_CROSSOVER_MBAR,
+         "unit": "mbar",
+         "help": "The forevacuum pump works alone until the chamber reaches "
+                 f"this. {TURBO_START_MAX_MBAR:.0E} mbar is the highest the "
+                 "interlock will allow; asking for more is lowered to it."},
+        {"key": "base_rate_pct", "label": "Call it base pressure below",
+         "type": "number", "default": VacuumSequence.DEFAULT_BASE_RATE_PCT,
+         "unit": "%/min", "min": 0.1, "max": 50,
+         "help": "Only a note in the log and the summary — this run does not "
+                 "end when the chamber stops improving, it keeps pumping."},
+        {"key": "base_settle_min", "label": "…sustained for", "type": "number",
+         "default": VacuumSequence.DEFAULT_BASE_SETTLE_MIN, "unit": "min",
+         "min": 0.5, "max": 120},
+        {"key": "stage_timeout_min",
+         "label": "Give up if roughing or spin-up stalls after",
+         "type": "number", "default": DEFAULT_STAGE_TIMEOUT_MIN, "unit": "min",
+         "min": 1, "max": 1440,
+         "help": "Bounds getting to vacuum, never the holding itself. A rig "
+                 "that cannot rough down or spin up is failing, not working "
+                 "slowly."},
+        {"key": "max_temp_c", "label": "Abort above a pump temperature of",
+         "type": "number", "default": 70, "unit": "°C", "min": 0, "max": 200,
+         "help": "0 turns this off. The drive's own over-temperature flags "
+                 "abort the run whatever this says."},
+        {"key": "interval_s", "label": "Sample every", "type": "number",
+         "default": DEFAULT_INTERVAL_S, "unit": "s", "min": 1, "max": 60,
+         "help": "5 s rather than 2 s: this run may last for days, and a "
+                 "day at 2 s is 43 000 rows."},
+        {"key": "shutdown_when_done", "label": "Power the pump down when "
+                                               "this run ends",
+         "type": "boolean", "default": True,
+         "help": "Motor off, rotor to rest with the backing pump still "
+                 "running, then the station. Stopping the run from the panel "
+                 "asks you again and your answer there wins."},
+    )
+
+    def begin(self, engine: "RunEngine") -> None:
+        self.shutdown_when_done = self.flag("shutdown_when_done", True)
+        self.max_temp = self.number("max_temp_c", 70)
+        self.holding_since: float | None = None
+        self.ultimate_mbar: float | None = None
+        self.peak_temp: float | None = None
+        self.peak_current: float | None = None
+        self._powered_down = False
+        self.begin_vacuum(engine)
+        # No deadline on the search for base pressure: this run has nowhere
+        # to be, and a slow chamber is not a failed one.
+        self.base_timeout = 0.0
+
+    def after_base_pressure(self) -> str:
+        return "holding"
+
+    # -- the unlimited phase ----------------------------------------------
+
+    def phase_holding(self, engine: "RunEngine", sample: dict) -> str | None:
+        """Keep pumping, keep recording. Nothing here ever ends the run."""
+        if self.holding_since is None:
+            self.holding_since = sample["t"]
+            engine.log("info",
+                       f"Holding under vacuum. The chamber stays here, and "
+                       f"the run keeps recording, until you stop it.")
+        # Keep quoting the rate so the panel shows whether it is still
+        # improving, drifting up, or genuinely flat.
+        now = sample["t"]
+        pressure = sample.get("p_best")
+        if isinstance(pressure, (int, float)) and pressure > 0:
+            self._window.append((now, pressure))
+            while self._window and now - self._window[0][0] > self.RATE_WINDOW_S:
+                self._window.popleft()
+        sample["rate_pct_min"] = relative_rate(list(self._window))
+        return None
+
+    # -- watching, in every phase -----------------------------------------
+
+    def step(self, engine: "RunEngine", sample: dict) -> bool:
+        self._watch_temperature(engine, sample)
+        return super().step(engine, sample)
+
+    def _watch_temperature(self, engine: "RunEngine", sample: dict) -> None:
+        """Abort on the drive's own over-temperature flags, or on a limit.
+
+        A run that lasts days is a run nobody is watching, so the conditions
+        an operator would notice have to be watched here. The flags come from
+        the drive rather than from a sample column: they are booleans no
+        chart wants, and `engine.pump_status()` is the way to reach them.
+        """
+        for value in (sample.get("p_best"),):
+            if isinstance(value, (int, float)):
+                if self.ultimate_mbar is None or value < self.ultimate_mbar:
+                    self.ultimate_mbar = value
+
+        temperature = sample.get("tms_temp")
+        if isinstance(temperature, (int, float)):
+            if self.peak_temp is None or temperature > self.peak_temp:
+                self.peak_temp = temperature
+        current = sample.get("current")
+        if isinstance(current, (int, float)):
+            if self.peak_current is None or current > self.peak_current:
+                self.peak_current = current
+
+        status = engine.pump_status()
+        if status.get("OvTempPump") is True or status.get("OvTempElec") is True:
+            which = "pump" if status.get("OvTempPump") is True else "electronics"
+            raise Abort(f"the drive unit reports the {which} over temperature. "
+                        f"The run has stopped and the pump is being powered "
+                        f"down.")
+        if self.max_temp and isinstance(temperature, (int, float)) \
+                and temperature > self.max_temp:
+            raise Abort(f"the pump reached {temperature:.0f} °C, above the "
+                        f"{self.max_temp:.0f} °C limit set for this run")
+
+    # -- ending ------------------------------------------------------------
+
+    def finish(self, engine: "RunEngine") -> None:
+        """Power the rig down, unless the operator asked to keep the vacuum.
+
+        Every ending comes through here -- the operator stopping it, an
+        over-temperature abort, a lost link -- and for this procedure every
+        ending means the chamber is no longer wanted under vacuum. The one
+        exception is an operator who stopped it and explicitly chose to leave
+        the vacuum alone; `engine.stop_choice()` reports that, and it wins.
+        """
+        if not self.shutdown_when_done or self._powered_down:
+            return
+        choice = engine.stop_choice()
+        if choice is False:
+            engine.log("info", "Run stopped with the vacuum left as it is, "
+                               "as asked. The pump is still running.")
+            return
+        result = engine.shutdown_pump("the full-vacuum run ended")
+        if not result.get("ok"):
+            # Already running is the normal case when the operator chose to
+            # power down from the stop dialog: the engine started it there.
+            engine.log("info", f"Power-down not started here: "
+                               f"{result.get('error')}")
+        # True when the rig is actually being brought to rest, whether this
+        # call started it or the stop dialog already had.
+        self._powered_down = bool(
+            result.get("ok") or (engine.shutdown_status() or {}).get("active"))
+
+    def summarise(self, engine: "RunEngine", samples: list[dict]) -> dict:
+        pressures = [s["p_best"] for s in samples
+                     if isinstance(s.get("p_best"), (int, float))]
+        summary = self.vacuum_summary()
+        held = None
+        if self.holding_since is not None and samples:
+            held = samples[-1]["t"] - self.holding_since
+        summary.update({
+            "ultimate_mbar": min(pressures) if pressures else None,
+            "final_mbar": pressures[-1] if pressures else None,
+            "held_s": held,
+            "duration_s": samples[-1]["t"] if samples else 0,
+            "peak_temperature_c": self.peak_temp,
+            "peak_current_a": self.peak_current,
+            "pressure": statistics(pressures),
+            "powered_down": self._powered_down,
+        })
+        # While holding, the pressure should be flat. A chamber that drifts
+        # up over hours is leaking or outgassing, and that is the whole
+        # reason to leave this running.
+        holding = [s["p_best"] for s in samples
+                   if s.get("phase") == "holding"
+                   and isinstance(s.get("p_best"), (int, float))]
+        if len(holding) >= 3 and holding[0] > 0:
+            drift = (holding[-1] - holding[0]) / holding[0]
+            summary["holding_drift_fraction"] = drift
+            if drift > 0.5:
+                summary["caveat"] = (
+                    f"The pressure rose {drift * 100:.0f}% while holding, "
+                    f"from {holding[0]:.2E} to {holding[-1]:.2E} mbar. That "
+                    f"is a leak or an outgassing load, not a settled "
+                    f"chamber — run a rate-of-rise test.")
+        return summary
+
+
 CATALOGUE: dict[str, type[Procedure]] = {
     procedure.name: procedure
-    for procedure in (Deposition, BaseCalibration, PumpDown, RateOfRise,
-                      Hold, Bakeout)
+    for procedure in (Deposition, BaseCalibration, FullVacuum, PumpDown,
+                      RateOfRise, Hold, Bakeout)
 }
 
 
@@ -1114,6 +1388,18 @@ class RunEngine:
     #: reconnect but short enough that nothing records a flat line for hours.
     MAX_SILENT_SAMPLES = 30
 
+    #: Give up on an unattended shutdown after this long. A rotor that will
+    #: not coast to rest, or a link that has gone away, must not leave a
+    #: thread waiting for ever -- but giving up leaves the backing pump
+    #: *running*, because the one thing worse than an unfinished shutdown is
+    #: a spinning rotor with no backing.
+    SHUTDOWN_TIMEOUT_S = 1800.0
+
+    #: How often the shutdown sequence re-asks whether it may take the next
+    #: step. The rotor coasts for minutes; there is nothing to gain from
+    #: asking faster than the pump's own sampler answers.
+    SHUTDOWN_POLL_S = 2.0
+
     def __init__(self, database: "dbmod.Database", registry,
                  hardware: "process.ProcessHardware | None" = None,
                  pump_key: str = "pump", gauge_key: str = "gauge"):
@@ -1130,6 +1416,16 @@ class RunEngine:
         self._run: dict | None = None
         self._samples: list[dict] = []
         self._silent = 0
+
+        #: Progress of a guided power-down, or None if none has been asked
+        #: for. Kept after it finishes so the panel can show the outcome.
+        self._shutdown: dict | None = None
+        self._shutdown_thread: threading.Thread | None = None
+        #: What the operator chose when they stopped the run: True to power
+        #: the pump down, False to leave the vacuum as it is, None if the run
+        #: ended on its own. A procedure that powers down when it finishes
+        #: must not override an operator who explicitly asked to keep it.
+        self._stop_shutdown: bool | None = None
 
         #: Run mode, and the manual step currently blocking progress.
         self.mode = GUIDED
@@ -1314,6 +1610,12 @@ class RunEngine:
                 return {"ok": False,
                         "error": f"unknown procedure {procedure_name!r}"}
 
+            self._stop_shutdown = None
+            # A finished power-down is kept only so the panel can report the
+            # outcome. Starting a new run makes it history: the rig is
+            # plainly running again, and a stale "rotor at rest, station off"
+            # is worse than no message at all.
+            self._shutdown = None
             procedure = CATALOGUE[procedure_name](config)
 
             # Refuse an automatic run before anything is created, rather than
@@ -1346,20 +1648,170 @@ class RunEngine:
             self._thread.start()
             return {"ok": True, "run": run}
 
-    def stop(self, reason: str = "stopped by the operator") -> dict:
+    def stop(self, reason: str = "stopped by the operator",
+             shutdown: bool = False) -> dict:
+        """End the run. With `shutdown`, also bring the pump to a full stop.
+
+        The two are separate decisions and the panel asks for both, because
+        they are genuinely different intentions: ending a deposition usually
+        means leaving the chamber under vacuum for the next run, while
+        finishing for the day means the rotor should be at rest and the
+        backing pump off. Stopping the *run* alone leaves the hardware
+        exactly as it is -- the TC 600 keeps doing what it was last told.
+        """
         with self._lock:
             if not (self._thread and self._thread.is_alive()):
                 return {"ok": False, "error": "no run is in progress"}
             self._stop_reason = reason
+            self._stop_shutdown = bool(shutdown)
             self._stop.set()
-            return {"ok": True, "stopping": True}
+            thread = self._thread
+        if shutdown:
+            self.shutdown_pump(f"after the run was stopped: {reason}",
+                               after=thread)
+        return {"ok": True, "stopping": True, "shutdown": bool(shutdown)}
+
+    # --- guided power-down ------------------------------------------------
+
+    def shutdown_pump(self, reason: str = "requested by the operator",
+                      after: threading.Thread | None = None) -> dict:
+        """Bring the pump to a full stop in the order the hardware needs.
+
+        A sequence, not a command. A turbopump rotor takes minutes to coast
+        down and has to be backed the whole way, so the only safe order is:
+        switch the motor off, wait for the rotor to reach rest, let the stop
+        dwell pass, and only then stop the station.
+
+        Every step goes through the same interlocks as the panel's buttons --
+        the engine holds no override. That is the point: rather than
+        re-implementing "may I stop the station yet?" here, where it could
+        drift out of step with `lab/pump.py`, this simply asks the pump
+        service and waits until it stops saying no.
+        """
+        with self._lock:
+            if self._shutdown_thread and self._shutdown_thread.is_alive():
+                return {"ok": False, "error": "a shutdown is already running"}
+            if self.pump() is None:
+                return {"ok": False, "error": "no pump is configured"}
+            self._shutdown = {
+                "active": True, "phase": "starting", "reason": reason,
+                "message": "starting the power-down sequence",
+                "rotor_hz": None, "started_at": time.time(), "ok": None,
+            }
+            self._shutdown_thread = threading.Thread(
+                target=self._drive_shutdown, args=(reason, after),
+                name="pump-shutdown", daemon=True)
+            self._shutdown_thread.start()
+        return {"ok": True, "shutdown": True}
+
+    def _note_shutdown(self, phase: str, message: str,
+                       rotor: float | None = None, ok: bool | None = None) -> None:
+        state = dict(self._shutdown or {})
+        state.update({"phase": phase, "message": message, "rotor_hz": rotor})
+        if ok is not None:
+            state["ok"] = ok
+            state["active"] = False
+            state["ended_at"] = time.time()
+        self._shutdown = state
+
+    def _drive_shutdown(self, reason: str, after: threading.Thread | None) -> None:
+        # Let the run finish first: its own `finish()` may still be switching
+        # a heater or the gas off, and two threads driving the same serial
+        # port through different intentions is how a shutdown ends up
+        # interleaved with a recipe's last actions.
+        if after is not None:
+            after.join(timeout=60)
+
+        pump = self.pump()
+        if pump is None:
+            self._note_shutdown("failed", "no pump is configured", ok=False)
+            return
+
+        self.log("action", f"Power-down started ({reason})")
+        deadline = time.monotonic() + self.SHUTDOWN_TIMEOUT_S
+
+        # 1. Stop driving the rotor. Everything else is waiting.
+        self._note_shutdown("motor_off", "switching the turbopump motor off")
+        result = self.pump_command("motor_off")
+        if not result.get("ok"):
+            self.log("error", f"Power-down: could not switch the turbopump "
+                              f"motor off: {result.get('error')}. The backing "
+                              f"pump has been left running.")
+            self._note_shutdown("failed", f"could not switch the motor off: "
+                                          f"{result.get('error')}", ok=False)
+            return
+        self.log("action", "Power-down: turbopump motor off, rotor coasting")
+
+        # 2. Wait until the pump service stops refusing to stop the station.
+        #    That single question covers all three rules -- rotor still
+        #    turning, motor still enabled, and the stop dwell after 0 Hz.
+        while time.monotonic() < deadline:
+            snap = pump.snapshot()
+            speed = snap.get("status", {}).get("ActualSpd")
+            speed = speed if isinstance(speed, (int, float)) else None
+            rule = pump.interlocks(snap).get("off", {})
+            if rule.get("allowed"):
+                break
+            self._note_shutdown(
+                "coasting",
+                f"{rule.get('reason') or 'waiting for the rotor to stop'} "
+                f"The backing pump keeps running until it has.",
+                rotor=speed)
+            time.sleep(self.SHUTDOWN_POLL_S)
+        else:
+            self.log("warning",
+                     f"Power-down gave up after "
+                     f"{self.SHUTDOWN_TIMEOUT_S / 60:.0f} min waiting for the "
+                     f"rotor to stop. The backing pump has been left running "
+                     f"on purpose -- a coasting rotor still needs backing.")
+            self._note_shutdown("failed", "the rotor did not come to rest in "
+                                          "time; the backing pump was left "
+                                          "running", ok=False)
+            return
+
+        # 3. Only now may the station stop.
+        self._note_shutdown("station_off", "stopping the pumping station")
+        result = self.pump_command("off")
+        if not result.get("ok"):
+            self.log("error", f"Power-down: could not stop the station: "
+                              f"{result.get('error')}")
+            self._note_shutdown("failed", f"could not stop the station: "
+                                          f"{result.get('error')}", ok=False)
+            return
+
+        self.log("action", "Power-down complete: rotor at rest, station off")
+        self._note_shutdown("done", "rotor at rest, pumping station off",
+                            rotor=0.0, ok=True)
+
+    def shutdown_status(self) -> dict | None:
+        return self._shutdown
+
+    def stop_choice(self) -> bool | None:
+        """What the operator asked for when stopping, or None if they did not.
+
+        A procedure that powers the rig down when it ends consults this so an
+        explicit "leave the vacuum alone" is honoured rather than undone two
+        seconds later.
+        """
+        return self._stop_shutdown
+
+    def pump_status(self) -> dict:
+        """The drive unit's decoded status, for conditions not in a sample.
+
+        The sample row carries what every run charts and stores; this is the
+        escape hatch for the rest -- the over-temperature flags, say, which
+        are booleans no chart wants but an unattended run must watch.
+        """
+        pump = self.pump()
+        return pump.snapshot().get("status", {}) if pump else {}
 
     def status(self) -> dict:
         run = self._run
         procedure = self._procedure
         running = bool(self._thread and self._thread.is_alive())
         if not running or run is None or procedure is None:
-            return {"running": False, "run": None}
+            return {"running": False, "run": None,
+                    "shutdown": self._shutdown}
         return {
             "running": True,
             "run": run,
@@ -1376,6 +1828,7 @@ class RunEngine:
             "mode": self.mode,
             "prompt": self._prompt,
             "actuators": self.hardware.describe(),
+            "shutdown": self._shutdown,
         }
 
     def recent_samples(self, limit: int = 600) -> list[dict]:
@@ -1449,7 +1902,8 @@ class RunEngine:
 
                 self._stop.wait(procedure.interval)
             else:
-                status = dbmod.ABORTED
+                status = (dbmod.COMPLETED if procedure.stop_is_completion
+                          else dbmod.ABORTED)
                 message = getattr(self, "_stop_reason", "stopped by the operator")
 
         except Abort as abort:

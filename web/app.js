@@ -14,7 +14,7 @@ import { html } from "./html.js";
 import { render } from "preact";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { api, settings, updateSettings } from "./api.js";
-import { Banner, Confirm, Toasts, useToasts } from "./ui.js";
+import { Banner, Choose, Confirm, Toasts, useToasts } from "./ui.js";
 import { DashboardView } from "./views/dashboard.js";
 import { Overview } from "./views/overview.js";
 import { PumpView } from "./views/pump.js";
@@ -48,6 +48,8 @@ function App() {
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState(null);
+  const [stopping, setStopping] = useState(false);
+  const [poweringDown, setPoweringDown] = useState(false);
   const [toasts, notify, dismiss] = useToasts();
   const [tick, setTick] = useState(0);
 
@@ -189,12 +191,46 @@ function App() {
     }
   };
 
-  const stopRun = async () => {
+  // A full-vacuum run has no ending of its own: stopping it *is* how it
+  // finishes, and powering down is the expected answer. Every other
+  // procedure runs to its own end, so stopping one early usually means
+  // "leave the chamber as it is and let me look at it".
+  const stopOptions = (procedure) => {
+    const keep = {
+      key: "keep", label: "Stop the run, keep the vacuum",
+      description: "The turbopump and the backing pump carry on exactly as "
+        + "they are. The chamber stays under vacuum, ready for the next run.",
+    };
+    const down = {
+      key: "shutdown", tone: "danger",
+      label: "Stop the run and power the pump down",
+      description: "Switches the turbopump motor off, waits for the rotor to "
+        + "coast to a stop with the backing pump still running, then stops "
+        + "the station. Takes several minutes; the chamber only comes back "
+        + "up to air pressure if you vent it.",
+    };
+    return procedure === "full_vacuum" ? [down, keep] : [keep, down];
+  };
+
+  // Stopping a run is two decisions, not one: end the recording, and decide
+  // what the hardware should be left doing. Ending a deposition usually
+  // means leaving the chamber under vacuum for the next run; finishing for
+  // the day means the rotor should be at rest and the backing pump off. The
+  // dialog asks, rather than picking one silently.
+  const stopRun = () => setStopping(true);
+
+  const finishStop = async (choice) => {
+    setStopping(false);
+    const shutdown = choice === "shutdown";
     setBusy(true);
     try {
-      const result = await api.stopRun("stopped by the operator");
-      if (result.ok) notify("Stopping the run…", "ok");
-      else notify(result.error, "error");
+      const result = await api.stopRun(
+        shutdown ? "stopped by the operator, powering the pump down"
+                 : "stopped by the operator, chamber left under vacuum",
+        shutdown);
+      if (!result.ok) notify(result.error, "error");
+      else if (shutdown) notify("Stopping the run, then powering down…", "ok");
+      else notify("Stopping the run. The pump keeps running.", "ok");
     } catch (problem) {
       notify(problem.message, "error");
     } finally {
@@ -212,7 +248,32 @@ function App() {
     setTick((t) => t + 1);
   };
 
+  // The guided power-down, reachable without a run to stop: switch the
+  // motor off, wait for the rotor to reach rest with the backing pump still
+  // running, then stop the station. The server owns the sequence.
+  const powerDown = async () => {
+    setPoweringDown(false);
+    setBusy(true);
+    try {
+      const result = await api.shutdownPump("requested from the pump page");
+      if (result.ok) notify("Powering the pump down…", "ok");
+      else notify(result.error, "error");
+    } catch (problem) {
+      notify(problem.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const run = state?.run;
+  // Reported whether or not a run is live: a power-down outlives the run
+  // that asked for it, and the rotor takes minutes to stop. A *finished*
+  // one is only worth showing while its outcome is still true -- once the
+  // station is running again, "rotor at rest, station off" is a lie sitting
+  // at the top of the page.
+  const shutdown = run?.shutdown;
+  const stationOn = state?.devices?.pump?.setpoints?.PumpgStatn === true;
+  const showShutdown = shutdown && (shutdown.active || !stationOn);
   const body = () => {
     if (!state && error) {
       return html`
@@ -232,7 +293,9 @@ function App() {
         return html`<${DashboardView} state=${state} live=${live} />`;
       case "pump":
         return html`<${PumpView} state=${state} onCommand=${pumpCommand}
-                                 onWriteParam=${writeParam} busy=${busy} />`;
+                                 onWriteParam=${writeParam} busy=${busy}
+                                 onShutdown=${() => setPoweringDown(true)}
+                                 shutdown=${shutdown} />`;
       case "gauge":
         return html`<${GaugeView} state=${state} onCommand=${gaugeCommand}
                                   busy=${busy} />`;
@@ -283,7 +346,33 @@ function App() {
       ${error && state && html`
         <${Banner} tone="warn">Lost contact with the server: ${error}<//>`}
 
+      ${showShutdown && html`
+        <${Banner} tone=${shutdown.active ? "warn"
+                          : shutdown.ok ? "good" : "crit"}>
+          <strong>${shutdown.active ? "Powering down:"
+                    : shutdown.ok ? "Power-down complete:"
+                    : "Power-down stopped:"}</strong> ${shutdown.message}
+          ${shutdown.active && shutdown.rotor_hz != null
+            ? ` Rotor at ${Math.round(shutdown.rotor_hz)} Hz.` : ""}
+        <//>`}
+
       ${body()}
+
+      <${Choose} open=${stopping}
+        title="Stop the run"
+        body=${html`<p>The recording ends either way and everything measured
+          so far is kept. What should the pump do?</p>`}
+        options=${stopOptions(run?.procedure)}
+        onChoose=${finishStop} onCancel=${() => setStopping(false)} />
+
+      <${Confirm} open=${poweringDown}
+        title="Power the pump down"
+        tone="danger" confirmLabel="Power down"
+        body=${html`<p>The turbopump motor goes off, the rotor coasts to a
+          stop with the backing pump still running, and the pumping station
+          stops only once it is at rest. This takes several minutes and the
+          chamber is left under whatever vacuum it holds.</p>`}
+        onCancel=${() => setPoweringDown(false)} onConfirm=${powerDown} />
 
       <${Confirm} open=${!!pending}
         title=${pending?.label || "Confirm"}

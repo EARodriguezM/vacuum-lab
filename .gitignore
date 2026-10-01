@@ -5,3 +5,9 @@
 *.db
 *.db-wal
 *.db-shm
+
+# Vendor installers and Pfeiffer's own Windows software. Half a gigabyte of
+# binaries that git can only store as opaque blobs; they stay on disk, not in
+# the repository.
+installer/
+pfeiffer_software/

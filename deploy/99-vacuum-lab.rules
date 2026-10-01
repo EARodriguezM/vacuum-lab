@@ -1,0 +1,34 @@
+# Stable, readable names for the two instruments on this rig.
+#
+#   sudo cp deploy/99-vacuum-lab.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --subsystem-match=tty --action=add
+#   ls -l /dev/tc600 /dev/tpg252
+#
+# Why this exists at all:
+#
+#   * /dev/ttyUSB1 and /dev/ttyUSB2 are handed out in the order the kernel
+#     enumerates the adapters, so a replug or a different boot order swaps
+#     them -- and the panel then speaks the TC 600's RS-485 telegrams at the
+#     gauge, which answers nothing, and the rig looks broken.
+#   * /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG03FP5F-if00-port0 is
+#     stable but unreadable. Nobody types it correctly under pressure, and a
+#     wrong character in a --serial flag looks exactly like a dead instrument.
+#
+# The match is on the adapter's own serial number, burned into the FTDI chip,
+# so the name follows the cable rather than the USB socket it happens to be
+# in. Both adapters are the same 0403:6001, so the serial is the only thing
+# that tells them apart.
+#
+# If an adapter is ever replaced, read the new serial out of
+#   udevadm info -a -n /dev/ttyUSB0 | grep ATTRS{serial}
+# and change it here. The name on the left of the arrow is what everything
+# else -- the systemd unit, tc600ctl.py, tpgctl.py -- should use.
+#
+#   /dev/tc600   <- FTDI FT232R, serial BG03FP5F, into the HXSP-485
+#                   converter, then RS-485 address 1 on the TC 600
+#   /dev/tpg252  <- FTDI US232R, serial FTYI6Y6H, direct RS-232 to the
+#                   TPG 252 A at 9600 8N1
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{serial}=="BG03FP5F", SYMLINK+="tc600", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{serial}=="FTYI6Y6H", SYMLINK+="tpg252", GROUP="dialout", MODE="0660"

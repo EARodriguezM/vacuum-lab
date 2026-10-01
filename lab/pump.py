@@ -66,9 +66,14 @@ ALLOWED_WRITES = {
 #: The turbopump may not be started above this chamber pressure.
 #: Below roughly this pressure the foreline is in viscous-to-transitional
 #: flow and the turbopump can develop compression as it accelerates; above
-#: it, it cannot -- it draws its current limit, heats up and trips. 2e-1 mbar
-#: is the crossover this rig is operated at.
-TURBO_START_MAX_MBAR = 2.0e-1
+#: it, it cannot -- it draws its current limit, heats up and trips.
+#:
+#: 8e-1 mbar is the crossover this rig is operated at, set 2026-09-03
+#: (previously 5e-1, set 2026-09-01). It is the one number to change if that
+#: operating decision changes: the recipes' crossover field defaults to it,
+#: no recipe may cross over above it, and the panel quotes it in every
+#: refusal, so nothing else needs editing.
+TURBO_START_MAX_MBAR = 8.0e-1
 
 #: A pressure reading older than this is not evidence about the chamber.
 #: A sampler thread can wedge with a plausible number in its cache, and a
@@ -328,19 +333,36 @@ class PumpService(DeviceService):
         # the gauge knows whether it has one.
         chamber = self.chamber_pressure()
         limit = TURBO_START_MAX_MBAR
-        if motor or speed > 0:
-            # Already running. Re-sending "on" changes nothing, and refusing
-            # it would read as though the running pump were in breach.
+        #
+        # There is deliberately no "but it is already spinning" shortcut here.
+        # An earlier version allowed the start whenever `speed > 0`, on the
+        # cosmetic grounds that a running pump should not be shown as being
+        # in breach of the rule. That is how run 13 (2026-09-02) came to spin
+        # the rotor up to 1444 Hz against atmosphere: starting the backing
+        # pump makes gas rush through the turbopump, which windmills the
+        # rotor to a few Hz, and the shortcut read that as "already running"
+        # and waved the command through while the gauge was overrange and the
+        # pressure therefore unknown. A turning rotor is not evidence about
+        # the foreline. Only the gauge is.
+        #
+        if motor:
+            # The motor enable is already set, so the command cannot change
+            # anything. This is the one genuine no-op, and it is keyed on the
+            # drive's own setpoint -- never on observed rotation.
             allow("motor_on")
         elif not station:
             block("motor_on", "the backing pump is not running. Start the "
                               "pumping station first and rough the chamber "
                               f"down to {limit:.0E} mbar.")
         elif chamber["mbar"] is None:
+            spinning = (f" The rotor is turning at {speed:.0f} Hz, but that is "
+                        f"gas flow through a pump that is not driven, not "
+                        f"evidence that it is safe to drive it."
+                        if speed > 0 else "")
             block("motor_on",
                   f"the chamber pressure is unknown: {chamber['reason']}. The "
                   f"turbopump must not be started above {limit:.0E} mbar, so "
-                  f"this cannot be allowed without a reading.")
+                  f"this cannot be allowed without a reading.{spinning}")
         elif chamber["mbar"] > limit:
             block("motor_on",
                   f"the chamber is at {chamber['mbar']:.2E} mbar. Keep "
