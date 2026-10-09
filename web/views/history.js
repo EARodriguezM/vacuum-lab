@@ -3,7 +3,7 @@
 import { html } from "../html.js";
 import { useEffect, useState } from "preact/hooks";
 import { Banner, Card, Confirm, Empty, Pairs, Pill } from "../ui.js";
-import { PressureChart, SpeedChart, TemperatureChart } from "../chart.js";
+import { CompareRuns, RunCharts, RunTrends } from "../runcharts.js";
 import { ResultSummary, EventLog } from "./tests.js";
 import { api, downloadUrl } from "../api.js";
 import * as fmt from "../format.js";
@@ -12,7 +12,7 @@ const STATUS_TONE = {
   completed: "good", running: "accent", aborted: "warn", failed: "crit",
 };
 
-function RunDetail({ run, onClose, onChanged, notify }) {
+function RunDetail({ run, onClose, onChanged, notify, devices, runs }) {
   const [samples, setSamples] = useState([]);
   const [events, setEvents] = useState([]);
   const [meta, setMeta] = useState({
@@ -62,8 +62,6 @@ function RunDetail({ run, onClose, onChanged, notify }) {
     }
   };
 
-  const hasTemperature = samples.some((s) => Number.isFinite(s.tms_temp));
-
   return html`
     <div class="grid" style="gap:16px">
       <${Card} title=${run.name}
@@ -93,18 +91,13 @@ function RunDetail({ run, onClose, onChanged, notify }) {
         <//>
       </div>
 
-      <${Card} title="Pressure">
-        ${loading
-          ? html`<${Empty}>Loading the curve…<//>`
-          : html`<${PressureChart} samples=${samples} height=${260} />`}
-      <//>
-
-      ${!loading && samples.length > 0 && html`
-        <${Card} title=${hasTemperature ? "TMS temperature" : "Rotor speed"}>
-          ${hasTemperature
-            ? html`<${TemperatureChart} samples=${samples} height=${170} />`
-            : html`<${SpeedChart} samples=${samples} height=${170} />`}
-        <//>`}
+      ${loading
+        ? html`<${Card}><${Empty}>Loading the curves…<//><//>`
+        : html`
+          <${RunCharts} run=${run} procedure=${run.procedure} config=${run.config || {}}
+                        samples=${samples} events=${events} startedAt=${run.started_at}
+                        pump=${devices?.pump} gauge=${devices?.gauge} />
+          <${CompareRuns} run=${run} samples=${samples} runs=${runs} />`}
 
       <div class="grid two">
         <${Card} title="Run log">
@@ -142,11 +135,31 @@ function RunDetail({ run, onClose, onChanged, notify }) {
     </div>`;
 }
 
-export function HistoryView({ notify }) {
+export function HistoryView({ notify, state }) {
   const [runs, setRuns] = useState([]);
   const [total, setTotal] = useState(0);
   const [stats, setStats] = useState(null);
-  const [selected, setSelected] = useState(null);
+  const [selected, setSelectedState] = useState(null);
+
+  // A selected run lives in the address too, as #history/<id>, so it can be
+  // bookmarked or sent to someone and opens straight on that run.
+  const setSelected = (run) => {
+    setSelectedState(run);
+    const want = run ? `#history/${run.id}` : "#history";
+    if (location.hash !== want) history.replaceState(null, "", want);
+  };
+  useEffect(() => {
+    const open = () => {
+      const id = Number(location.hash.split("/")[1]);
+      if (!id) { setSelectedState(null); return; }
+      api.run(id).then((data) => data.run && setSelectedState(
+        { ...data.run, sample_count: data.sample_count }))
+        .catch(() => notify(`No run ${id}.`, "error"));
+    };
+    open();
+    window.addEventListener("hashchange", open);
+    return () => window.removeEventListener("hashchange", open);
+  }, []);
   const [filters, setFilters] = useState({ procedure: "", status: "", search: "" });
   const [loading, setLoading] = useState(true);
 
@@ -164,7 +177,7 @@ export function HistoryView({ notify }) {
   if (selected) {
     return html`<${RunDetail} run=${selected} onClose=${() => setSelected(null)}
                               onChanged=${() => { load(); setSelected(null); }}
-                              notify=${notify} />`;
+                              notify=${notify} devices=${state?.devices} runs=${runs} />`;
   }
 
   const procedures = [...new Set(runs.map((r) => r.procedure))];
@@ -217,6 +230,8 @@ export function HistoryView({ notify }) {
         </div>
       <//>
 
+      <${RunTrends} pump=${state?.devices?.pump} />
+
       <${Card} title=${`Runs${total ? ` (${runs.length} of ${total})` : ""}`}
                actions=${html`<button class="small" onClick=${load}>Refresh</button>`}>
         ${loading
@@ -254,7 +269,7 @@ export function HistoryView({ notify }) {
 }
 
 /** The one number that matters for each procedure, for the table's Result column. */
-function headline(run) {
+export function headline(run) {
   const result = run.result || {};
   if (run.procedure === "pumpdown") {
     return result.ultimate_mbar ? `${fmt.pressure(result.ultimate_mbar, 1)} mbar` : "—";
@@ -268,6 +283,19 @@ function headline(run) {
   }
   if (run.procedure === "bakeout") {
     return result.peak_temperature_c ? `${fmt.integer(result.peak_temperature_c)} °C` : "—";
+  }
+  if (run.procedure === "base_calibration" || run.procedure === "full_vacuum") {
+    // Only a completed run's base pressure is quoted here. Run 26 aborted
+    // after recording "base 3.4e-2 mbar" with its rotor dragged down by gas
+    // load; its best pressure is the honest number for the table.
+    if (result.base_mbar && run.status === "completed") {
+      return `base ${fmt.pressure(result.base_mbar, 1)} mbar`;
+    }
+    return result.ultimate_mbar ? `best ${fmt.pressure(result.ultimate_mbar, 1)} mbar` : "—";
+  }
+  if (run.procedure === "deposition") {
+    if (result.deposition_s) return `${fmt.duration(result.deposition_s)} deposited`;
+    return result.base_mbar ? `base ${fmt.pressure(result.base_mbar, 1)} mbar` : "—";
   }
   return "—";
 }

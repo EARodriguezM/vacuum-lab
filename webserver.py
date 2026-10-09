@@ -28,7 +28,8 @@ from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lab import api, db as dbmod, gauge, process, pump, registry, runs  # noqa: E402
+from lab import (alarms, api, db as dbmod, discovery, gauge, history,  # noqa: E402
+                 process, pump, registry, runs)
 
 
 def build(args) -> api.Application:
@@ -53,14 +54,45 @@ def build(args) -> api.Application:
         print(f"  argon, gate valve, magnetron and shutter are simulated too,")
         print(f"  so a whole deposition recipe runs end to end.")
 
+    # Which port each instrument is on is found by asking, not assumed: a
+    # given port is tried first, and if nothing of the right kind answers
+    # there -- or the value is "auto" -- every free port is probed with
+    # read-only queries. Simulated ptys are given explicitly and not searched.
+    search = not args.no_port_search and not args.simulate
+    database_path = args.db or dbmod.default_path()
+    memory = discovery.PortMemory(
+        os.path.join(os.path.dirname(os.path.abspath(database_path)), "ports.json"))
+    if not args.simulate:
+        print("Looking for the instruments:")
+
     pump_service = gauge_service = None
+    pump_port = None
     if not args.no_pump:
+        if args.simulate:
+            pump_port = args.serial
+        else:
+            pump_port = discovery.startup("tc600", args.serial, args.address,
+                                          memory, search=search)["port"]
         pump_service = devices.add(
-            pump.PumpService("pump", args.serial, address=args.address))
+            pump.PumpService("pump", pump_port, address=args.address))
     if not args.no_gauge:
+        gauge_port, gauge_baud = args.gauge, args.gauge_baud
+        if not args.simulate:
+            found = discovery.startup("tpg", args.gauge, args.address, memory,
+                                      search=search,
+                                      exclude=[pump_port] if pump_port else [])
+            gauge_port = found["port"]
+            if found["found"]:
+                gauge_baud = found["found"].get("baudrate") or gauge_baud
         gauge_service = devices.add(gauge.GaugeService(
-            "gauge", args.gauge, baudrate=args.gauge_baud,
+            "gauge", gauge_port, baudrate=gauge_baud,
             channels=args.gauge_channels))
+
+    # The same search, later, for an instrument that goes quiet: a replugged
+    # adapter comes back as a different /dev/ttyUSBn.
+    finder = discovery.Finder(devices, memory, enabled=search)
+    for service in devices:
+        service.finder = finder
 
     # The turbopump may not start above the crossover pressure, so the pump
     # service needs somewhere to read that pressure from. Wired explicitly
@@ -71,19 +103,31 @@ def build(args) -> api.Application:
 
     database = dbmod.Database(args.db)
     engine = runs.RunEngine(database, devices, hardware=hardware)
-    return api.Application(devices, database, engine, token=args.token)
+    # The chart recorder for the pump and gauge pages: the last day of the
+    # whole rig, kept whether or not a run is recording. Memory only.
+    recorder = history.History(devices, hardware).start()
+    # Alarms, and the pump's safe state after a fault -- whether or not a run
+    # is recording. It never switches the forevacuum pump off.
+    supervisor = alarms.Supervisor(
+        devices, engine, database,
+        auto_recover=not args.no_auto_recovery).start()
+    return api.Application(devices, database, engine, token=args.token,
+                           history=recorder, supervisor=supervisor,
+                           finder=finder)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--serial", default="/dev/ttyS1",
-                        help="serial port of the TC 600 (via RS-485)")
+    parser.add_argument("--serial", default="auto",
+                        help="serial port of the TC 600 (via RS-485), or "
+                             "'auto' to find it by asking each port; a given "
+                             "port is tried first and searched from if "
+                             "nothing answers there")
     parser.add_argument("--address", type=int, default=1,
                         help="RS-485 address of the TC 600")
-    parser.add_argument("--gauge", default="/dev/ttyS0",
-                        help="serial port of the TPG gauge controller "
-                             "(onboard COM1 on the lab PC; USB adapters were "
-                             "tried and none worked)")
+    parser.add_argument("--gauge", default="auto",
+                        help="serial port of the TPG gauge controller, or "
+                             "'auto' to find it by asking each port")
     parser.add_argument("--gauge-baud", type=int, default=None,
                         help="gauge baud rate; omit to detect it")
     parser.add_argument("--gauge-channels", type=int, default=2,
@@ -105,6 +149,13 @@ def main() -> int:
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--token", default=None,
                         help="require this shared token on API calls")
+    parser.add_argument("--no-port-search", action="store_true",
+                        help="use exactly the ports given; never probe other "
+                             "ports for the instruments")
+    parser.add_argument("--no-auto-recovery", action="store_true",
+                        help="raise alarms on a drive fault but do not make "
+                             "the pump safe automatically (motor off, fault "
+                             "acknowledged, forevacuum pump kept on)")
     args = parser.parse_args()
 
     application = build(args)
@@ -130,6 +181,10 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nstopping...")
     finally:
+        if application.supervisor is not None:
+            application.supervisor.close()
+        if application.history is not None:
+            application.history.close()
         application.registry.close()
         application.db.close()
     return 0

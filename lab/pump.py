@@ -27,6 +27,7 @@ request.
 
 from __future__ import annotations
 
+import threading
 import time
 
 import serial
@@ -88,6 +89,110 @@ STOP_DWELL_SECONDS = 20.0
 #: Venting is refused above this fraction of nominal speed.
 VENT_SPEED_LIMIT = 0.20
 
+#: What the pump on this rig is rated for, so the panel can draw its limits
+#: beside what it measures. Not read from the drive -- the firmware has no
+#: parameter for any of these -- but from the operating instructions in this
+#: repository, `Documentation/pm0504be_m.pdf` (PM 0504 BE), for the
+#: TMH/TMU 071 P that the TC 600 drives:
+#:
+#:   * 24 VDC +-5 %                                  section 9, "Operating voltage"
+#:   * start-up time 2.5 min                         section 9
+#:   * switchpoint 80 % of nominal speed             section 4.4, "Switching outputs"
+#:   * gas-mode-0 power line, 60 W at 1500 Hz rising
+#:     to 80 W at 1300 Hz (vertices C and D)          section 9 and 4.4
+#:   * 4.1 A continuous, 4.6 A maximum               section 9
+#:   * 0.58 mbar l/s N2 throughput at nominal
+#:     speed, air-cooled                             section 9, note 3
+#:
+#: The power line is the one that explains the runs of 2026-10-08: above it
+#: the drive lowers the rotor speed until gas friction and its permitted
+#: power balance, and below the 80 % switchpoint it eventually trips with a
+#: run-up error (Err006) or over-temperature. Argon is a heavy gas, so on
+#: this rig it is the gas-mode-0 line that applies. If the pump is ever
+#: replaced, this is the table to re-read from that pump's manual.
+RATINGS = {
+    "model": "TMH/TMU 071 P",
+    "source": "PM 0504 BE, section 9",
+    "supply_v": 24.0,
+    "supply_tolerance": 0.05,
+    "startup_s": 150.0,
+    "switchpoint_fraction": 0.80,
+    "power_line_full_w": 60.0,
+    "power_line_reduced_w": 80.0,
+    "power_line_reduced_hz": 1300.0,
+    "current_continuous_a": 4.1,
+    "current_max_a": 4.6,
+    "throughput_air_mbar_l_s": 0.58,
+}
+
+
+#: Drive error codes: what each means, what usually causes it on a rig like
+#: this one, and what to do. Err006 is the one this rig has actually seen
+#: and is pinned down by this repository's own manual: PM 0504 BE gives the
+#: factory settings (run-up time 15 min, switchpoint 80 %) and lists "pump
+#: does not attain nominal speed within the run-up time / cuts out during
+#: operation" with these causes. The rest follow Pfeiffer's error list as
+#: published for its TC drives; the TC 600's own list is in PM 0547 BN, which
+#: is not in this repository -- check a rarely seen code there before acting
+#: on the wording below.
+ERROR_CODES = {
+    "Err001": ("Excess rotation speed",
+               "The rotor ran above its permitted speed.",
+               "Do not restart. Have the pump and drive checked by Pfeiffer service."),
+    "Err002": ("Overvoltage",
+               "The supply voltage to the drive was too high.",
+               "Check the 24 V power supply and its setting."),
+    "Err006": ("Run-up time error",
+               "The rotor was below the 80 % switchpoint (1200 Hz) once the run-up "
+               "time had run out -- 15 min from motor start, factory setting. On this "
+               "rig: too much gas, which drags the rotor down; also a backing "
+               "pressure too high, a leak, a sluggish bearing, or overheating.",
+               "Stop the gas or close the leak, check the backing pump, then "
+               "acknowledge and restart the turbopump through the crossover "
+               "interlock."),
+    "Err007": ("Operating fluid low",
+               "The oil-lubricated fore-vacuum bearing is short of lubricant.",
+               "Do not restart. Check the lubricant reservoir (PM 0504 BE, section 7)."),
+    "Err008": ("Pump connection faulty",
+               "The drive cannot see the pump: cable or plug between them.",
+               "Power off, check the TC 600 seated on the pump, power on."),
+    "Err021": ("Pump not recognised",
+               "The drive does not identify the pump connected to it.",
+               "Check the pump type and parameter 777 (nominal speed, 1500 Hz)."),
+    "Err044": ("Electronics over temperature",
+               "The drive electronics overheated.",
+               "Check the fan and the airflow round the TC 600, and the room "
+               "temperature (5-40 °C with air cooling)."),
+    "Err045": ("Motor over temperature",
+               "The pump motor overheated -- sustained high gas load or poor cooling.",
+               "Let it cool with the backing pump running; reduce the gas load; "
+               "check the fan."),
+}
+
+
+def describe_error(code) -> dict:
+    """What a drive error code means, for the panel and the run log."""
+    text = str(code or "").strip()
+    if text in ("", "000000", "000", "0"):
+        return {"code": None}
+    title, cause, remedy = ERROR_CODES.get(
+        text, ("Drive fault", "See the TC 600 error list (PM 0547 BN).",
+               "Clear the cause, then acknowledge the fault."))
+    return {"code": text, "title": title, "cause": cause, "remedy": remedy,
+            "known": text in ERROR_CODES}
+
+
+#: Parameters read on demand for diagnosis: the drive's own protective
+#: settings and its error history. Not in the fast poll -- they change
+#: rarely and cost a round trip each.
+DIAGNOSTIC_VIEW = (
+    "RUTimeCtrl", "RUTimeSVal", "SpdSwPt", "GasMode", "OpModeBKP",
+    "VentMode", "EnableVent", "VentSpd", "OpModeRemote", "CtrlViaInt",
+    "PwrSVal", "PumpCycles", "OpHrsElec",
+    "ErrHist1", "ErrHist2", "ErrHist3", "ErrHist4", "ErrHist5",
+    "ErrHist6", "ErrHist7", "ErrHist8", "ErrHist9", "ErrHist10",
+)
+
 
 class Interlock(Exception):
     """Raised when a command is refused because of process safety."""
@@ -104,6 +209,7 @@ class PumpService(DeviceService):
     kind = "tc600"
     label = "TC 600 turbopump"
     interval = 2.0
+    probe_kind = "tc600"
 
     def __init__(self, key: str, port: str, address: int = 1,
                  timeout: float = 0.6, **options):
@@ -119,6 +225,11 @@ class PumpService(DeviceService):
         #: dropping the speed to hold pressure costs compression exactly when
         #: the gas load is highest.
         self._full_speed_reason: str | None = None
+        #: When each action was last sent successfully, monotonic seconds. The
+        #: supervisor uses it to tell a station-off this panel asked for from
+        #: one that came from the drive, its front panel or its remote plug.
+        self.commanded: dict[str, float] = {}
+        self._secure_lock = threading.Lock()
         super().__init__(key, port, address=address, **options)
 
     # --- where the chamber pressure comes from -----------------------------
@@ -222,9 +333,12 @@ class PumpService(DeviceService):
                     self.drop()
                     return self.offline(str(exc))
 
+            # Standby (P2) is read too: the panel's standby button and the
+            # "held down by gas" warning both need to know whether a rotor
+            # below full speed was asked to be there.
             setpoints = {}
             for name in ("SpdSVal", "StdbySVal", "OpModeTMP",
-                         "PumpgStatn", "MotorPump"):
+                         "PumpgStatn", "MotorPump", "Standby"):
                 try:
                     setpoints[name] = pump.read(name)
                 except (protocol.ProtocolError, KeyError, ValueError):
@@ -271,6 +385,16 @@ class PumpService(DeviceService):
         def number(value):
             return value if isinstance(value, (int, float)) else None
 
+        def flag(name):
+            value = status.get(name)
+            return (1 if value else 0) if isinstance(value, bool) else None
+
+        # `tms_temp` is stored exactly as the drive reports it, including the
+        # 0 it reads while the TMS heater is off. That 0 is not a temperature
+        # -- firmware 017500 has no other sensor (P326, P330, P342 and P346
+        # all answer NO_DEF) -- but the record keeps the instrument's word,
+        # and the bake-out's cooling phase is written against it. The panel
+        # is what reads 0 as "not measured", and says so.
         return {
             "speed": number(status.get("ActualSpd")),
             "set_speed": number(status.get("SetRotSpd")),
@@ -281,6 +405,8 @@ class PumpService(DeviceService):
             "error_code": status.get("ErrorCode"),
             "station": 1 if setpoints.get("PumpgStatn") is True else 0,
             "motor": 1 if setpoints.get("MotorPump") is True else 0,
+            "ov_temp_pump": flag("OvTempPump"),
+            "ov_temp_elec": flag("OvTempElec"),
         }
 
     # --- interlocks -------------------------------------------------------
@@ -418,6 +544,10 @@ class PumpService(DeviceService):
     def snapshot(self) -> dict:
         snap = super().snapshot()
         snap["interlocks"] = self.interlocks(snap)
+        snap["ratings"] = RATINGS
+        # What the current error code means, so every page can say it in
+        # words rather than leave "Err006" to be looked up.
+        snap["fault"] = describe_error(snap.get("status", {}).get("ErrorCode"))
         return snap
 
     # --- accessories ------------------------------------------------------
@@ -500,8 +630,135 @@ class PumpService(DeviceService):
                 return {"ok": False, "error": str(exc)}
 
         self.note_success()
+        self.commanded[action] = time.monotonic()
         return {"ok": True, "action": action, "result": result,
                 "overridden": bool(override)}
+
+    # --- the safe state after a fault ---------------------------------------
+
+    def secure(self, reason: str, stop_motor: bool = True,
+               keep_backing: bool = True, settle_s: float = 8.0) -> dict:
+        """Put the pump in its safe state after a fault, without losing vacuum.
+
+        The safe state for a turbopump in trouble is: motor off, rotor
+        coasting with its backing pump still running, fault cleared. Three
+        steps, in this order on purpose:
+
+        1. **Motor off** -- first, so that clearing the fault cannot restart
+           the rotor into whatever tripped it. The drive's MotorPump setpoint
+           would otherwise still say "on", and acknowledging Err006 with the
+           gas still flowing just trips it again.
+        2. **Acknowledge the fault.** A latched fault holds the station in
+           its fault state; clearing it is what lets the forevacuum pump run.
+        3. **Station on.** The pumping station is what runs the forevacuum
+           pump on this rig. Switching it off is also what makes the TC 600
+           vent the chamber (PM 0504 BE: factory automatic venting below
+           50 % speed), so after a fault it is kept on, never switched off.
+
+        Every step is a "safe direction" command that the interlocks never
+        refuse. Returns what was done, so the caller can log it and the panel
+        can say it.
+        """
+        if not self._secure_lock.acquire(blocking=False):
+            return {"ok": False, "error": "already securing the pump",
+                    "actions": []}
+        try:
+            actions: list[dict] = []
+            snap = self.snapshot()
+            if not snap.get("connected"):
+                return {"ok": False, "actions": actions,
+                        "error": "no contact with the pump, so nothing can be "
+                                 "done over RS-485; the drive keeps doing "
+                                 "what it was last told"}
+            setpoints = snap.get("setpoints", {})
+            code = str(snap.get("status", {}).get("ErrorCode") or "").strip()
+            faulted = code not in ("", "000000", "000", "0")
+
+            def step(label, action):
+                result = self.command(action)
+                actions.append({"step": label, "ok": bool(result.get("ok")),
+                                "error": result.get("error")})
+                return result.get("ok")
+
+            if stop_motor and setpoints.get("MotorPump") is True:
+                step("turbopump motor switched off", "motor_off")
+            if faulted:
+                step(f"fault {code} acknowledged", "ack")
+            if keep_backing and setpoints.get("PumpgStatn") is not True:
+                step("pumping station (forevacuum pump) switched on", "on")
+
+            # Check it took: the cached snapshot lags a poll behind.
+            deadline = time.monotonic() + settle_s
+            state = {}
+            while time.monotonic() < deadline:
+                time.sleep(0.5)
+                latest = self.snapshot()
+                if not latest.get("connected"):
+                    continue
+                now_code = str(latest["status"].get("ErrorCode") or "").strip()
+                state = {
+                    "fault": None if now_code in ("", "000000", "000", "0")
+                    else now_code,
+                    "station": latest["setpoints"].get("PumpgStatn") is True,
+                    "motor": latest["setpoints"].get("MotorPump") is True,
+                    "speed": latest["status"].get("ActualSpd"),
+                }
+                if (not state["fault"] and (state["station"] or not keep_backing)
+                        and (not state["motor"] or not stop_motor)):
+                    break
+            # Say so even when nothing needed switching: "the forevacuum
+            # pump is running" is the line an operator looks for after a fault.
+            if keep_backing and state and not any(
+                    a["step"].startswith("pumping station") for a in actions):
+                actions.append({"step": "forevacuum pump confirmed running"
+                                if state.get("station") else
+                                "forevacuum pump NOT running",
+                                "ok": bool(state.get("station")), "error": None})
+            secured = bool(state) and not state.get("fault") and \
+                (state.get("station") or not keep_backing)
+            return {"ok": secured, "actions": actions, "state": state,
+                    "reason": reason,
+                    "error": None if secured else
+                    ("the fault is still latched" if state.get("fault")
+                     else "the station did not come back on" if state
+                     else "no fresh reading from the pump to confirm it")}
+        finally:
+            self._secure_lock.release()
+
+    def diagnostics(self) -> dict:
+        """The drive's protective settings and its fault history, on demand.
+
+        Run-up time monitoring (P4) and its limit (P700) are what decide
+        when a dragged rotor becomes Err006; the error history (P360-P369)
+        says what happened before anybody looked. Anything this firmware
+        does not implement answers NO_DEF and is listed as missing rather
+        than guessed.
+        """
+        with self.lock:
+            try:
+                pump = self.driver()
+            except (serial.SerialException, OSError) as exc:
+                self.drop()
+                return {"ok": False, "error": f"cannot open {self.port}: {exc}"}
+            values, units, missing = {}, {}, []
+            for name in DIAGNOSTIC_VIEW:
+                parameter = params.BY_NAME[name.lower()]
+                try:
+                    values[name] = parameter.decode(pump.read_raw(parameter.number))
+                    units[name] = parameter.unit
+                except protocol.ProtocolError:
+                    missing.append(name)
+                except (serial.SerialException, OSError) as exc:
+                    self.drop()
+                    return {"ok": False, "error": str(exc)}
+        history = []
+        for index in range(1, 11):
+            code = values.get(f"ErrHist{index}")
+            if code is not None and str(code).strip() not in ("", "000000", "000"):
+                history.append({"position": index, **describe_error(code)})
+        return {"ok": True, "values": values, "units": units,
+                "missing": missing, "history": history,
+                "codes": {code: describe_error(code) for code in ERROR_CODES}}
 
     def write_param(self, name: str, value, override: bool = False) -> dict:
         if name not in ALLOWED_WRITES:

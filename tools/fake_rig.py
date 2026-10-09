@@ -31,11 +31,18 @@ from tools import fake_tc600, fake_tpg  # noqa: E402
 
 
 def link(stop: threading.Event, interval: float = 0.25) -> None:
-    """Feed the simulated rotor speed into the simulated chamber."""
+    """Couple the two simulators both ways, as one rig.
+
+    The rotor speed sets how hard the chamber is pumped, and the gas the
+    chamber holds sets how hard the rotor has to work. The second direction
+    is what makes the drive current, the power and the rotor speed respond
+    to argon being let in, the way the real pump's did.
+    """
     while not stop.is_set():
         nominal = max(1, fake_tc600.STATE.get(315) or 1)
         speed = fake_tc600.STATE.get(309) or 0
         fake_tpg.set_pumping(speed / nominal, bool(fake_tc600.STATE.get(10)))
+        fake_tc600.GAS_LOAD = fake_tpg.CHAMBER.turbo_load()
         stop.wait(interval)
 
 

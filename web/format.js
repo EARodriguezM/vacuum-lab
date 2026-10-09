@@ -85,3 +85,18 @@ export function parseExponent(text) {
   const value = Number(String(text).trim().replace(",", "."));
   return Number.isFinite(value) ? value : null;
 }
+
+/** What each run phase is called on screen. */
+const PHASE_NAMES = {
+  rough: "Roughing", crossover: "Crossover", spinup: "Spin-up",
+  basepressure: "Base pressure", backfill: "Argon backfill",
+  presputter: "Pre-sputter", deposit: "Deposition", recover: "Recovery",
+  holding: "Holding", roughing: "Roughing", turbo: "Turbopump start",
+  pumping: "Pumping", settle: "Settling", measuring: "Measuring",
+  heating: "Heating", soak: "Soak", cooling: "Cooling", done: "Done",
+  after: "After the run",
+};
+
+export function phaseLabel(phase) {
+  return PHASE_NAMES[phase] || titleCase(phase);
+}

@@ -28,10 +28,13 @@ export function pumpSummary(pump) {
   const fault = status.ErrorCode && !NO_ERROR.has(String(status.ErrorCode).trim());
 
   if (fault) {
+    const meaning = pump.fault?.title ? ` — ${pump.fault.title.toLowerCase()}` : "";
     return {
       tone: "crit",
-      headline: `The pump has stopped with fault ${status.ErrorCode}`,
-      detail: "Clear the cause, then acknowledge the fault to restart.",
+      headline: `The pump has stopped with fault ${status.ErrorCode}${meaning}`,
+      detail: pump.fault?.cause
+        ? `${pump.fault.cause} ${pump.fault.remedy || ""}`
+        : "Clear the cause, then acknowledge the fault to restart.",
     };
   }
   if (status.OvTempPump || status.OvTempElec) {
@@ -42,6 +45,25 @@ export function pumpSummary(pump) {
         ? "The pump body is too hot. Check the cooling."
         : "The drive electronics are too hot. Check the fan and the airflow.",
     };
+  }
+  // Motor off with the rotor still turning is a coast-down -- after a stop,
+  // or after the panel made the pump safe. It must never read as a run-up,
+  // and with the station off it is the one state that must never read as
+  // "everything is off": a coasting rotor needs its backing pump.
+  if (!motor && speed > 0) {
+    return station
+      ? {
+        tone: "warn",
+        headline: `Coasting down — ${fmt.integer(speed)} Hz`,
+        detail: "The turbopump motor is off and the rotor is slowing, backed by the "
+          + "forevacuum pump. Leave the station on until it is at rest.",
+      }
+      : {
+        tone: "crit",
+        headline: `Coasting without backing — ${fmt.integer(speed)} Hz`,
+        detail: "The pumping station — the forevacuum pump — is off while the rotor "
+          + "still turns. A coasting rotor needs backing: switch the station on.",
+      };
   }
   if (!station) {
     return {
@@ -57,7 +79,31 @@ export function pumpSummary(pump) {
       detail: "The station is roughing. The turbopump motor is off.",
     };
   }
-  if (status.PumpAccel || (target && speed < target * 0.95)) {
+  // Below full speed with the motor on means one of two very different
+  // things. Accelerating (the drive's own P307 flag) is a run-up. Not
+  // accelerating is a rotor held down: the gas load needs more power than
+  // the drive may give, and it is minutes or seconds from tripping. Calling
+  // that "spinning up" is how an overload reads as progress.
+  const switchpoint = nominal ? Math.round(nominal * 0.8) : null;
+  // The speed the drive was actually asked for: standby and the speed
+  // setting mode both put a healthy rotor below nominal on purpose.
+  let expected = target;
+  if (nominal && setpoints.Standby === true) {
+    expected = nominal * (Number(setpoints.StdbySVal) || 66) / 100;
+  } else if (nominal && Number(setpoints.OpModeTMP) === 1) {
+    expected = nominal * (Number(setpoints.SpdSVal) || 100) / 100;
+  }
+  if (motor && expected && speed > 0 && speed < expected * 0.95 && !status.PumpAccel) {
+    return {
+      tone: "crit",
+      headline: `Held down by gas load — ${fmt.integer(speed)} Hz`,
+      detail: `The rotor is below full speed and not accelerating: there is more gas than `
+        + `the drive may carry. Cut the gas flow or throttle the gate valve now`
+        + (switchpoint ? ` — below ${switchpoint} Hz the drive trips (Err006).` : "."),
+      dragged: true,
+    };
+  }
+  if (motor && (status.PumpAccel || (target && speed < target * 0.95))) {
     const share = nominal ? Math.round((speed / nominal) * 100) : null;
     return {
       tone: "warn",

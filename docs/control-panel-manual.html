@@ -144,7 +144,7 @@
       wired to it over RS-485. This manual covers every control on the page, the
       procedures they belong to, and what to do when something does not respond.
     </p>
-    <div class="urlbar">http://172.16.2.62:8600/</div>
+    <div class="urlbar">http://172.16.2.69:8600/</div>
   </header>
 
   <div class="layout">
@@ -170,7 +170,7 @@
       <h2><span class="num">01</span>Connecting</h2>
       <hr class="sechr">
       <p class="lede">
-        Open <code>http://172.16.2.62:8600/</code> from any machine on the lab
+        Open <code>http://172.16.2.69:8600/</code> from any machine on the lab
         network. Phone, laptop, the lab PC itself &mdash; the layout adapts.
       </p>
 
@@ -182,8 +182,8 @@
       </p>
       <ul>
         <li>Type a host and press <span class="btn">Connect</span>, or just hit Enter.</li>
-        <li>A bare address gets <code>:8600</code> appended, so <code>172.16.2.62</code>
-            and <code>172.16.2.62:8600</code> are equivalent.</li>
+        <li>A bare address gets <code>:8600</code> appended, so <code>172.16.2.69</code>
+            and <code>172.16.2.69:8600</code> are equivalent.</li>
         <li>The value is saved in your browser and survives reloads.</li>
         <li><span class="btn">Use this page's host</span> snaps back to whichever
             machine served the page.</li>
@@ -389,17 +389,17 @@
             speed 0 Hz, drive current near 0 A.</li>
       </ol>
       <p>From a terminal, if you prefer:</p>
-<pre><code>curl -X POST http://172.16.2.62:8600/api/command \
+<pre><code>curl -X POST http://172.16.2.69:8600/api/command \
   -H 'Content-Type: application/json' \
   -d '{"action":"motor_off","confirm":true}'
 
-curl -X POST http://172.16.2.62:8600/api/command \
+curl -X POST http://172.16.2.69:8600/api/command \
   -H 'Content-Type: application/json' \
   -d '{"action":"on","confirm":true}'</code></pre>
 
       <h3>Starting the turbopump</h3>
       <p>Once the foreline is down, re-enable the motor. The station is already on.</p>
-<pre><code>curl -X POST http://172.16.2.62:8600/api/command \
+<pre><code>curl -X POST http://172.16.2.69:8600/api/command \
   -H 'Content-Type: application/json' \
   -d '{"action":"motor_on","confirm":true}'</code></pre>
       <div class="caution">
@@ -440,6 +440,47 @@ curl -X POST http://172.16.2.62:8600/api/command \
       </div>
     </section>
 
+    <!-- 6b ----------------------------------------------------------------->
+    <section id="charts">
+      <h2><span class="num">06b</span>Reading the charts</h2>
+      <hr class="sechr">
+      <p>
+        The <strong>Pump</strong> and <strong>Gauge</strong> tabs keep the last 24 hours,
+        recorded every 2 s whether or not a run is going; the <strong>Process</strong> and
+        <strong>History</strong> tabs chart each run. Charts that belong together share one
+        time axis and one crosshair &mdash; hover any of them, or focus one and use the
+        arrow keys, to read all of them at the same instant. Every chart has a
+        <strong>Table</strong> button with the same numbers.
+      </p>
+      <p>A dashed line is always a limit somebody wrote down, never a grid line:</p>
+      <ul>
+        <li><strong>80&nbsp;% switchpoint, 1200&nbsp;Hz</strong> on the rotor speed &mdash; a
+            rotor held below it by gas load trips the drive with Err006.</li>
+        <li><strong>60&nbsp;W / 80&nbsp;W</strong> on the drive power &mdash; the TC&nbsp;600's
+            power line for argon (gas mode 0). Past it the rotor slows until gas friction and
+            permitted power balance.</li>
+        <li><strong>24&nbsp;V &plusmn;&nbsp;5&nbsp;%</strong> on the supply voltage &mdash; the
+            rated band from the pump manual (PM&nbsp;0504&nbsp;BE).</li>
+        <li><strong>Crossover, working pressure, abort ceiling</strong> on the pressure
+            charts of a run, from that run's own settings.</li>
+      </ul>
+      <p>
+        The <strong>load curve</strong> (drive current or power against chamber pressure)
+        shows how much gas the pump can carry: points turn orange where the gas held the
+        rotor below full speed. With the gate open this pump reaches that point at about
+        <code>1e-2</code>&nbsp;mbar. The <strong>log-log pump-down</strong> gives the slope
+        <em>n</em> of p&nbsp;&prop;&nbsp;t<sup>&minus;n</sup>: n&nbsp;&asymp;&nbsp;1 is water
+        (bake the chamber), n&nbsp;&asymp;&nbsp;0.5 is gas diffusing out of seals,
+        n&nbsp;&rarr;&nbsp;0 is a leak or the pump's own limit.
+      </p>
+      <div class="caution">
+        <strong>No pump temperature is measured on this rig.</strong> Firmware 017500 has no
+        temperature sensor, and the TMS reads 0 with its heater off; the panel says
+        &ldquo;not measured&rdquo; rather than showing 0&nbsp;&deg;C. The heat going into the
+        pump is the drive power, and the drive's over-temperature flag is marked on that chart.
+      </div>
+    </section>
+
     <!-- 7 ------------------------------------------------------------------>
     <section id="trouble">
       <h2><span class="num">07</span>Troubleshooting</h2>
@@ -449,7 +490,7 @@ curl -X POST http://172.16.2.62:8600/api/command \
       <p>The browser cannot reach the address in the field.</p>
       <ul>
         <li>Check the address, and that the machine is on the network.</li>
-        <li>Check the server is running: <code>ssh esarodriguezm@172.16.2.62 'pgrep -af webserver.py'</code></li>
+        <li>Check the server is running: <code>ssh esarodriguezm@172.16.2.69 'pgrep -af webserver.py'</code></li>
         <li>If the lab PC's IP changed, put the new one in the field.</li>
       </ul>
 
@@ -580,10 +621,10 @@ tail -f ~/tc600-web.log</code></pre>
         <code>EnableBrake</code>.
       </p>
 <pre><code># read everything
-curl -s http://172.16.2.62:8600/api/state | python3 -m json.tool
+curl -s http://172.16.2.69:8600/api/state | python3 -m json.tool
 
 # set the TMS setpoint to 55 C
-curl -X POST http://172.16.2.62:8600/api/command \
+curl -X POST http://172.16.2.69:8600/api/command \
   -H 'Content-Type: application/json' \
   -d '{"action":"param","name":"TMSHeatSVal","value":55,"confirm":true}'</code></pre>
       <p>

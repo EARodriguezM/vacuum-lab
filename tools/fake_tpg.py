@@ -83,6 +83,19 @@ class Chamber:
                       * max(0.0, min(100.0, self.gate_percent)) / 100.0)
         return speed
 
+    def turbo_load(self) -> float:
+        """Gas throughput the turbopump would carry at nominal speed, mbar l/s.
+
+        What loads the rotor: the pressure at its inlet times the pumping
+        speed it would have flat out, through whatever the gate lets by. Fed
+        to the pump simulator, it is what drags a rotor down when too much
+        gas is admitted -- the failure the real rig showed on 2026-10-08.
+        """
+        if self.isolated:
+            return 0.0
+        return (self.pressure * self.FULL_SPEED
+                * max(0.0, min(100.0, self.gate_percent)) / 100.0)
+
     def advance(self, dt: float) -> None:
         if dt <= 0:
             return

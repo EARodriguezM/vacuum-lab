@@ -12,6 +12,7 @@ const DEFAULTS = {
   token: "",
   pollMs: 2000,
   theme: "auto",
+  alarmSound: true,
 };
 
 export function loadSettings() {
@@ -100,8 +101,17 @@ export const api = {
   ping:       () => get("/api/ping"),
   state:      () => get("/api/state"),
   live:       (limit = 600) => get(`/api/live?limit=${limit}`),
+  // The whole run in progress, decimated to about `points` rows, keeping
+  // every extreme -- the live charts want the run from its first sample.
+  liveRun:    (points = 1500) => get(`/api/live?points=${points}`),
+  // The rolling record of the rig, kept whether or not a run is going.
+  // With `since`, only the rows newer than that (undecimated).
+  history: (seconds, points = 1500, since = null) => get(
+    `/api/history?${since != null ? `since=${since}` : `seconds=${seconds}`}` +
+    `&points=${points}`),
   procedures: () => get("/api/procedures"),
   stats:      () => get("/api/stats"),
+  trends:     () => get("/api/trends"),
   events:     (limit = 200) => get(`/api/events?limit=${limit}`),
 
   deviceState: (key) => get(`/api/device/${key}/state`),
@@ -118,11 +128,22 @@ export const api = {
     post("/api/run/stop", { reason, shutdown }),
   shutdownPump: (reason = "requested by the operator") =>
     post("/api/pump/shutdown", { reason, confirm: true }),
+  // Motor off, fault acknowledged, forevacuum pump kept on.
+  securePump: (reason = "requested by the operator") =>
+    post("/api/pump/secure", { reason, confirm: true }),
+  cancelShutdown: () => post("/api/pump/cancel-shutdown", { confirm: true }),
+  pumpDiagnostics: (key = "pump") => get(`/api/device/${key}/diagnostics`),
+  acknowledgeAlarms: (id = "all") => post("/api/alarms/ack", { id }),
+  setAutoRecovery: (on) => post("/api/supervisor", { auto_recover: !!on, confirm: true }),
   acknowledgeStep: (note = "") => post("/api/run/acknowledge", { note }),
 
   ports: (kind = "all", includePhantom = false) =>
     get(`/api/ports?kind=${encodeURIComponent(kind)}${includePhantom ? "&all=1" : ""}`),
   actuators: () => get("/api/actuators"),
+  // What answers on every free port: probed with read-only queries.
+  portSurvey: () => get("/api/ports/survey"),
+  setPortSearch: (enabled) => post("/api/ports/searching", { enabled: !!enabled }),
+  searchDevice: (key) => post(`/api/device/${key}/search`, {}),
   setPort: (device, port, extra = {}) =>
     post("/api/device/port", { device, port, confirm: true, ...extra }),
 

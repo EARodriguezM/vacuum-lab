@@ -20,7 +20,7 @@
   --crit:#b8372c; --crit-bg:#fbe9e7; --idle:#6f7a82; --idle-bg:#e8edee;
   --field:#fff;
   --series-1:#2a78d6; --series-2:#eb6834; --series-3:#1baf7a;
-  --grid:#e1e0d9; --axis:#c3c2b7; --muted:#898781;
+  --grid:#e1e0d9; --axis:#c3c2b7; --muted:#898781; --context:#a9b2b8;
   --shadow:0 1px 2px rgba(11,11,11,.05), 0 4px 12px rgba(11,11,11,.04);
 }
 @media (prefers-color-scheme: dark) {
@@ -32,7 +32,7 @@
     --crit:#e2695c; --crit-bg:#2d1613; --idle:#93a1aa; --idle-bg:#1c262c;
     --field:#0d1418;
     --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70;
-    --grid:#2c2c2a; --axis:#383835; --muted:#898781;
+    --grid:#2c2c2a; --axis:#383835; --muted:#898781; --context:#56636b;
     --shadow:0 1px 2px rgba(0,0,0,.3), 0 4px 12px rgba(0,0,0,.25);
   }
 }
@@ -44,7 +44,7 @@
   --crit:#e2695c; --crit-bg:#2d1613; --idle:#93a1aa; --idle-bg:#1c262c;
   --field:#0d1418;
   --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70;
-  --grid:#2c2c2a; --axis:#383835; --muted:#898781;
+  --grid:#2c2c2a; --axis:#383835; --muted:#898781; --context:#56636b;
   --shadow:0 1px 2px rgba(0,0,0,.3), 0 4px 12px rgba(0,0,0,.25);
 }
 
@@ -191,33 +191,114 @@ dl.pairs { display:grid; grid-template-columns:auto 1fr; gap:5px 14px;
 dl.pairs dt { color:var(--ink-faint); }
 dl.pairs dd { margin:0; text-align:right; }
 
-/* ---------- charts ---------- */
-.chart { width:100%; display:block; overflow:visible; }
+/* ---------- charts ----------
+ * Gridlines and axes are solid hairlines one step off the surface. A dashed
+ * line on a chart always means a limit somebody wrote down (a switchpoint, a
+ * crossover pressure, a rated supply), never a grid. Annotation text wears
+ * ink tokens, never a series colour. */
+.chart { width:100%; display:block; overflow:visible; touch-action:pan-y; }
+.chart:focus { outline:none; }
+.chart:focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:4px; }
 .chart .grid-line { stroke:var(--grid); stroke-width:1; }
+.chart .grid-line.v { opacity:.55; }
 .chart .axis-line { stroke:var(--axis); stroke-width:1; }
 .chart .tick { fill:var(--muted); font-size:10.5px; font-variant-numeric:tabular-nums; }
 .chart .series { fill:none; stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
-.chart .series-area { stroke:none; opacity:.10; }
-.chart .end-label { font-size:11px; font-weight:640; font-variant-numeric:tabular-nums; }
-.chart .crosshair { stroke:var(--ink-faint); stroke-width:1; stroke-dasharray:3 3; }
+.chart .series.faint { stroke-width:1.5; opacity:.9; }
+.chart .dot { stroke:var(--card); stroke-width:1.5; opacity:.9; }
+.chart .end-label { font-size:11px; font-weight:640; font-variant-numeric:tabular-nums;
+                    fill:var(--ink-soft); }
+.chart .crosshair { stroke:var(--ink-faint); stroke-width:1; }
 .chart .marker { stroke:var(--card); stroke-width:2; }
-.chart .phase-band { opacity:.05; }
-.chart .phase-label { fill:var(--muted); font-size:10px; }
+.chart .phase-band { fill:var(--ink); opacity:.045; }
+.chart .phase-edge { stroke:var(--axis); stroke-width:1; }
+.chart .phase-label { fill:var(--muted); font-size:10px; font-weight:560; }
+.chart .ref-line { stroke-width:1.25; stroke-dasharray:5 4; fill:none; }
+.chart .ref-label { fill:var(--ink-faint); font-size:10.5px; font-weight:560;
+                    paint-order:stroke; stroke:var(--card); stroke-width:3px;
+                    stroke-linejoin:round; }
+.chart .band { fill:var(--ink); opacity:.06; }
+.chart .band-label { fill:var(--ink-faint); font-size:10.5px; }
+.chart .event line { stroke-width:1; stroke-dasharray:2 3; }
+.chart .strip-label { fill:var(--muted); font-size:10px; }
+.chart .strip-track { fill:var(--sunk); }
+.chart .strip-seg.idle   { fill:var(--idle); opacity:.45; }
+.chart .strip-seg.warn   { fill:var(--warn); }
+.chart .strip-seg.crit   { fill:var(--crit); }
+.chart .strip-seg.good   { fill:var(--good); }
+.chart .strip-seg.accent { fill:var(--accent); }
 .chart-empty { color:var(--ink-faint); font-size:13px; text-align:center;
-               padding:36px 12px; }
+               padding:30px 12px; }
 
-.legend { display:flex; gap:14px; flex-wrap:wrap; font-size:12.5px;
+.legend { display:flex; gap:6px 16px; flex-wrap:wrap; font-size:12.5px;
           color:var(--ink-soft); }
-.legend .item { display:inline-flex; align-items:center; gap:6px; }
+.legend .item { display:inline-flex; align-items:center; gap:7px; }
 .legend .swatch { width:11px; height:11px; border-radius:3px; flex:0 0 auto; }
+.legend .key { flex:0 0 auto; display:inline-block; }
+.legend .key.line { width:16px; height:2px; border-radius:1px; }
+.legend .key.dot  { width:9px; height:9px; border-radius:50%; }
+.legend .key.faint { background:var(--context); }
+.legend .key.block { width:12px; height:9px; border-radius:2px; }
+.legend .key.block.warn { background:var(--warn); }
+.legend .key.block.idle { background:var(--idle); opacity:.55; }
+.legend .key.block.crit { background:var(--crit); }
+.legend .key.block.accent { background:var(--accent); }
+.strip-legend { font-size:12px; }
 
 .tooltip { position:absolute; pointer-events:none; z-index:20;
            background:var(--card); border:1px solid var(--rule); border-radius:8px;
            padding:7px 10px; font-size:12.5px; box-shadow:var(--shadow);
-           white-space:nowrap; }
-.tooltip .t-row { display:flex; gap:10px; justify-content:space-between; }
+           white-space:nowrap; max-width:320px; }
+.tooltip .t-row { display:flex; gap:8px; align-items:center; }
+.tooltip .t-row strong { font-weight:650; }
+.tooltip .t-label { color:var(--ink-faint); }
+.tooltip .t-key { width:12px; height:2px; border-radius:1px; flex:0 0 auto; }
+.tooltip .t-key.faint { background:var(--context); }
+.tooltip .t-key.none { background:transparent; }
+.tooltip .t-key.strip-key { height:9px; width:9px; border-radius:2px; }
+.tooltip .t-key.strip-key.idle { background:var(--idle); }
+.tooltip .t-key.strip-key.warn { background:var(--warn); }
+.tooltip .t-key.strip-key.crit { background:var(--crit); }
+.tooltip .t-key.strip-key.accent { background:var(--accent); }
 .tooltip .t-time { color:var(--ink-faint); font-size:11.5px; margin-bottom:3px; }
+.tooltip .t-event { white-space:normal; font-size:12px; margin-top:4px;
+                    padding-top:4px; border-top:1px solid var(--rule);
+                    color:var(--ink-soft); min-width:220px; }
+.tooltip .t-event.error { color:var(--crit); }
+.tooltip .t-event.warning { color:var(--warn); }
 .chart-holder { position:relative; }
+
+/* A titled chart: title and current value on one line, the chart beneath. */
+.chart-stack { display:flex; flex-direction:column; gap:2px; }
+.chart-panel { display:flex; flex-direction:column; gap:4px; min-width:0; }
+.chart-panel + .chart-panel { padding-top:6px; border-top:1px solid var(--rule); }
+.chart-stack + .chart-panel, .chart-panel + .chart-stack,
+.chart-stack + .chart-stack { margin-top:10px; padding-top:10px;
+                              border-top:1px solid var(--rule); }
+.chart-panel > header { display:flex; justify-content:space-between; align-items:baseline;
+                        gap:6px 12px; flex-wrap:wrap; }
+.chart-title { display:flex; align-items:baseline; gap:4px 10px; flex-wrap:wrap; min-width:0; }
+.chart-title h3 { font-size:13.5px; font-weight:640; }
+.chart-sub { font-size:12px; color:var(--ink-faint); }
+.readout { font-size:13.5px; font-weight:640; color:var(--ink); }
+.chart-tools { margin:2px 0 0; }
+.table-view { max-height:320px; overflow:auto; border:1px solid var(--rule); border-radius:8px; }
+.table-view table { font-size:12.5px; }
+.table-view th { position:sticky; top:0; background:var(--card); }
+.table-view .hint { padding:6px 10px; }
+.row.tight { gap:6px; }
+
+/* Segmented control: one choice of a few, e.g. the time window. */
+.segmented { display:inline-flex; border:1px solid var(--rule); border-radius:8px;
+             overflow:hidden; background:var(--card); }
+.segmented button { border:none; border-radius:0; min-height:30px; padding:4px 10px;
+                    font-size:12.5px; background:none; color:var(--ink-soft); }
+.segmented button + button { border-left:1px solid var(--rule); }
+.segmented button[aria-pressed="true"] { background:var(--accent-soft); color:var(--accent);
+                                         font-weight:650; }
+button[aria-pressed="true"].small { border-color:var(--accent); color:var(--accent); }
+button.tiny { font-size:11.5px; padding:2px 8px; min-height:24px; }
+.tile .value.warn { color:var(--warn); }
 
 /* ---------- run progress ---------- */
 .phases { display:flex; gap:6px; flex-wrap:wrap; }
@@ -341,9 +422,9 @@ dl.pairs dd { margin:0; text-align:right; }
      deliberate rather than as a stray button under the heading. */
   .top-actions { width:100%; justify-content:flex-end; margin-top:-6px; }
 }
-@media (prefers-reduced-motion: no-preference) {
-  .chart .series { transition: d .2s linear; }
-}
+/* No transition on a series' path: a trace that morphs between polls shows
+   motion the instrument never measured, and it animates from the chart's
+   first, unmeasured layout -- which drew lines past the plot on a phone. */
 
 /* Choice dialog: each option is a full-width button carrying its own
    consequence, because "Stop" and "Stop and power down" leave the rig in
@@ -355,3 +436,32 @@ dl.pairs dd { margin:0; text-align:right; }
           height:auto; line-height:1.35; white-space:normal; }
 .choice strong { font-size:13.5px; }
 .choice .help { margin:0; }
+
+/* ---------- alarms ----------
+ * Shown on every page until acknowledged, worst first. Each says what the
+ * panel already did, so nobody has to guess whether the chamber is still
+ * under vacuum. */
+.alarm-bar { border:2px solid var(--warn); background:var(--warn-bg); border-radius:10px;
+             padding:12px 14px; display:flex; flex-direction:column; gap:10px; }
+.alarm-bar.crit { border-color:var(--crit); background:var(--crit-bg); }
+.alarm-bar > header { display:flex; justify-content:space-between; align-items:center; gap:10px;
+                      color:var(--ink); }
+.alarm { background:var(--card); border:1px solid var(--rule); border-radius:8px;
+         padding:9px 11px; display:flex; flex-direction:column; gap:4px; }
+.alarm.critical { border-left:4px solid var(--crit); }
+.alarm.warning { border-left:4px solid var(--warn); }
+.alarm-head { display:flex; flex-wrap:wrap; gap:6px 10px; align-items:center; }
+.alarm-title { font-size:14px; }
+.alarm-detail { margin:0; font-size:13px; color:var(--ink-soft); }
+.alarm-actions { list-style:none; margin:4px 0 0; padding:0; display:flex; flex-wrap:wrap;
+                 gap:4px 14px; }
+.alarm-actions li { font-size:12.5px; }
+.alarm-actions .mark { font-weight:700; margin-right:4px; }
+.alarm-actions li.done .mark { color:var(--good); }
+.alarm-actions li.failed .mark { color:var(--crit); }
+.sub-head { font-size:12.5px; text-transform:uppercase; letter-spacing:.05em;
+            color:var(--ink-faint); margin:0 0 6px; }
+.fault-history { margin:0 0 8px; padding-left:20px; font-size:13px; }
+.alarm-log .entry { display:grid; grid-template-columns:auto auto 1fr; gap:4px 10px;
+                    align-items:baseline; padding:6px 0; border-bottom:1px solid var(--rule);
+                    font-size:13px; }

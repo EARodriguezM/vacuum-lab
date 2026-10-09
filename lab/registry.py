@@ -41,6 +41,17 @@ class DeviceService:
     #: while the descriptor still looks healthy, so nothing ever raises.
     reconnect_after = 3
 
+    #: Which probe in lab/discovery.py recognises this instrument, or None
+    #: for one that cannot be searched for.
+    probe_kind: str | None = None
+    #: Silence this long before searching the other ports for the instrument,
+    #: and at most one search this often. A replugged adapter comes back as a
+    #: different /dev/ttyUSBn; a powered-off instrument does not come back at
+    #: all, and searching for it every cycle would only probe ports nobody
+    #: asked about.
+    SEARCH_AFTER_S = 10.0
+    SEARCH_EVERY_S = 60.0
+
     kind = "device"
     label = "Device"
 
@@ -55,6 +66,16 @@ class DeviceService:
 
         self._snap: dict = self.offline("starting up")
         self._snap_lock = threading.Lock()
+
+        #: Set by the application: a lab.discovery.Finder that can search the
+        #: free ports for this instrument. None means the port is fixed.
+        self.finder = None
+        self._silent_since: float | None = None
+        self._searched_at = 0.0
+        #: The last time this instrument was found on a different port and
+        #: moved there by itself: {"from", "to", "at"}. The supervisor alarms
+        #: on it, so a move is never silent.
+        self.moved: dict | None = None
 
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -162,14 +183,60 @@ class DeviceService:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                snap = self._read()
-            except Exception as exc:              # never kill the thread
-                snap = self.offline(str(exc))
+            if (self.port or "auto").lower() == "auto":
+                # Not found on any port yet: nothing to open, only to look for.
+                snap = self.offline(
+                    "not found on any serial port yet"
+                    + ("; the panel keeps looking, about once a minute"
+                       if self.finder is not None
+                       and getattr(self.finder, "enabled", False) else ""))
+            else:
+                try:
+                    snap = self._read()
+                except Exception as exc:          # never kill the thread
+                    snap = self.offline(str(exc))
             self.observe(snap)
             with self._snap_lock:
                 self._snap = snap
+            self._maybe_search(snap)
             self._stop.wait(self.interval)
+
+    def _maybe_search(self, snap: dict) -> None:
+        """Look for the instrument on the other ports once it has gone quiet.
+
+        Runs on this service's own sampler thread, so nothing else is using
+        its port meanwhile; the finder never probes a port another service
+        holds. Found elsewhere, the service moves there and says so.
+        """
+        now = time.monotonic()
+        if snap.get("connected"):
+            self._silent_since = None
+            return
+        if self.finder is None or not getattr(self.finder, "enabled", False):
+            return
+        self._silent_since = self._silent_since or now
+        if now - self._silent_since < self.SEARCH_AFTER_S:
+            return
+        if now - self._searched_at < self.SEARCH_EVERY_S:
+            return
+        self._searched_at = now
+        with self.lock:
+            self.drop()                  # release the port so it can be probed
+        try:
+            found = self.finder.search(self)
+        except Exception:
+            found = None
+        if not found:
+            return
+        with self.lock:
+            previous = self.port
+            self.port = found["port"]
+            if found.get("baudrate") and hasattr(self, "baudrate"):
+                self.baudrate = found["baudrate"]
+            self._failures = 0
+        if self.port != previous:
+            self.moved = {"from": previous, "to": self.port,
+                          "device": found.get("device"), "at": time.time()}
 
     def observe(self, snap: dict) -> None:
         """Hook for state that must be tracked continuously, e.g. timers."""
@@ -227,7 +294,9 @@ class Registry:
     def descriptors(self) -> list[dict]:
         """What the UI needs to render a device list without polling each one."""
         return [
-            {"key": s.key, "kind": s.kind, "label": s.label, "port": s.port}
+            {"key": s.key, "kind": s.kind, "label": s.label, "port": s.port,
+             "searching": bool(s.finder and getattr(s.finder, "enabled", False)),
+             "moved": s.moved}
             for s in self._devices.values()
         ]
 

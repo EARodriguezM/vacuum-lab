@@ -6,6 +6,106 @@ import { Banner, Card, Empty, Pairs, Pill } from "../ui.js";
 import { api, normaliseHost, settings, updateSettings } from "../api.js";
 import * as fmt from "../format.js";
 
+/**
+ * Finding the instruments without being told where they are.
+ *
+ * The server asks every free serial port what is on it -- a read of the
+ * TC 600's type, the TPG's firmware query -- so a replugged or replaced USB
+ * adapter does not matter: the instrument is found wherever it answers, and
+ * an instrument that goes quiet is looked for on the other ports.
+ */
+function AutoPorts({ state, notify }) {
+  const [survey, setSurvey] = useState(null);
+  const [surveying, setSurveying] = useState(false);
+  const ports = state?.ports || {};
+  const devices = state?.devices || {};
+  const descriptors = Object.fromEntries((ports.devices || []).map((d) => [d.key, d]));
+
+  const detect = async () => {
+    setSurveying(true);
+    try {
+      setSurvey(await api.portSurvey());
+    } catch (error) {
+      notify(error.message, "error");
+    } finally {
+      setSurveying(false);
+    }
+  };
+  const toggle = async () => {
+    try {
+      const result = await api.setPortSearch(!ports.search);
+      notify(`Automatic port search ${result.enabled ? "on" : "off"}.`, "ok");
+    } catch (error) {
+      notify(error.message, "error");
+    }
+  };
+  const searchNow = async (key) => {
+    try {
+      const result = await api.searchDevice(key);
+      notify(result.ok ? "Searching the other ports…" : result.error,
+             result.ok ? "ok" : "error");
+    } catch (error) {
+      notify(error.message, "error");
+    }
+  };
+
+  return html`
+    <${Card} title="Finding the instruments"
+      hint="Each instrument is found by asking every serial port what is on it — a read of the TC 600's type, the TPG's firmware query; nothing is written — so a replugged or replaced USB adapter does not matter. An instrument that stops answering for 10 s is looked for on the other ports, at most once a minute. A port one of the instruments is using is never probed."
+      actions=${html`
+        <button class="small" disabled=${surveying} onClick=${detect}>
+          ${surveying ? "Asking every port…" : "Detect instruments now"}</button>`}>
+      <div class="row">
+        <span class=${`pill ${ports.search ? "good" : "idle"}`}><span class="dot" />
+          automatic search ${ports.search ? "on" : "off"}</span>
+        <button class="small ghost" onClick=${toggle}>
+          ${ports.search ? "Switch off — keep the ports fixed" : "Switch on"}</button>
+      </div>
+      <div class="scroll-x">
+        <table>
+          <thead><tr><th>Instrument</th><th>Port</th><th>State</th><th></th></tr></thead>
+          <tbody>
+            ${Object.entries(devices).map(([key, device]) => {
+              const moved = descriptors[key]?.moved;
+              return html`
+                <tr key=${key}>
+                  <td>${device.label}</td>
+                  <td class="mono">${device.port === "auto" ? "not found yet" : device.port}
+                    ${moved && html`<div class="small muted">moved here from ${moved.from}
+                      at ${fmt.clock(moved.at)}</div>`}</td>
+                  <td><${Pill} tone=${device.connected ? "good" : "crit"}>
+                    ${device.connected ? "answering" : "not answering"}<//></td>
+                  <td>${!device.connected && html`
+                    <button class="small" onClick=${() => searchNow(key)}>Search now</button>`}</td>
+                </tr>`;
+            })}
+          </tbody>
+        </table>
+      </div>
+      ${survey?.ok && html`
+        <div class="scroll-x">
+          <table>
+            <thead><tr><th>Port</th><th>Adapter</th><th>Stable name</th><th>What answered</th></tr></thead>
+            <tbody>
+              ${survey.ports.map((port) => html`
+                <tr key=${port.device}>
+                  <td class="mono">${port.device}</td>
+                  <td class="wrap-cell">${port.description || port.kind}
+                    ${port.serial_number && html`<div class="small muted mono">serial ${port.serial_number}</div>`}</td>
+                  <td class="mono small">${port.stable !== port.device ? port.stable : "—"}</td>
+                  <td class="wrap-cell"><${Pill} tone=${port.status === "silent" ? "idle"
+                    : port.status === "in use" ? "accent" : "good"}>${port.status}<//>
+                    <div class="small">${port.says}</div></td>
+                </tr>`)}
+            </tbody>
+          </table>
+          ${!survey.ports.length && html`<${Empty}>No serial ports found on the server.<//>`}
+          <p class="hint">Asked at ${fmt.clock(survey.at)}. Ports in use belong to one of
+            the panel's instruments and were not probed.</p>
+        </div>`}
+    <//>`;
+}
+
 /** Pick which port an instrument is on: filter by attachment, then choose.
  *
  * Worth being a first-class control rather than a command-line flag on this
@@ -53,8 +153,8 @@ function PortPicker({ devices, notify, onChanged }) {
   const entries = Object.entries(devices);
 
   return html`
-    <${Card} title="Instrument ports"
-             hint="Filter by how the adapter attaches, then pick a port. Changing one drops the link and reopens it, so it is refused while a run is recording."
+    <${Card} title="Set a port by hand"
+             hint="Only needed if the automatic search cannot find an instrument. Filter by how the adapter attaches, then pick a port. Changing one drops the link and reopens it, so it is refused while a run is recording."
              actions=${html`
                <button class="small" onClick=${() => scan()} disabled=${loading}>
                  ${loading ? "Scanning…" : "Rescan"}</button>`}>
@@ -142,6 +242,7 @@ export function SettingsView({ state, onSettingsChanged, notify }) {
       token: draft.token.trim(),
       pollMs: Math.max(500, Number(draft.pollMs) || 2000),
       theme: draft.theme,
+      alarmSound: draft.alarmSound !== false,
     });
     onSettingsChanged();
     notify("Settings saved.", "ok");
@@ -155,7 +256,7 @@ export function SettingsView({ state, onSettingsChanged, notify }) {
                hint="Leave the address empty when this page is served by the lab PC itself. Fill it in to drive that machine from another one — the API sends permissive CORS headers so that works.">
         <label class="field">
           <span>Controller address</span>
-          <input value=${draft.host} placeholder="e.g. 172.16.2.62:8600"
+          <input value=${draft.host} placeholder="e.g. 172.16.2.69:8600"
                  onInput=${(e) => setDraft({ ...draft, host: e.target.value })} />
           <span class="help">
             ${draft.host
@@ -188,11 +289,21 @@ export function SettingsView({ state, onSettingsChanged, notify }) {
             </select>
           </label>
         </div>
+        <label class="check">
+          <input type="checkbox" checked=${draft.alarmSound !== false}
+                 onChange=${(e) => setDraft({ ...draft, alarmSound: e.target.checked })} />
+          <span>Sound an alarm for critical alarms
+            <div class="help">Two short tones every few seconds until the alarm is
+              acknowledged. The browser only allows sound after the first click on
+              the page.</div></span>
+        </label>
         <div class="row">
           <button class="primary" onClick=${apply}>Save</button>
           <span class="small muted">Stored in this browser only.</span>
         </div>
       <//>
+
+      <${AutoPorts} state=${state} notify=${notify} />
 
       <${PortPicker} devices=${devices} notify=${notify}
                      onChanged=${onSettingsChanged} />

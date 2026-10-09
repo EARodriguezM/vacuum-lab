@@ -26,7 +26,7 @@ from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
 from . import db as dbmod
-from . import export, runs
+from . import discovery, export, history, runs, trends
 from .pump import GUARDED
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,37 +38,10 @@ CONFIRM_REQUIRED = GUARDED | {
 }
 
 
-#: How a serial port is classified for the port picker. A USB adapter has a
-#: vendor:product id in its hwid; an onboard UART does not. Worth
-#: distinguishing on this rig, where the gauge only works on an onboard port
-#: and two different USB adapters failed on it.
-def classify_port(port) -> str:
-    hwid = (getattr(port, "hwid", "") or "").upper()
-    device = getattr(port, "device", "") or ""
-    if "USB" in hwid or "USB" in device.upper():
-        return "usb"
-    if "/dev/ttyS" in device or "COM" in device.upper():
-        return "serial"
-    return "other"
-
-
-def uart_present(device: str) -> bool:
-    """Whether an onboard serial node is backed by a real UART.
-
-    Linux creates /dev/ttyS0 through ttyS31 whether or not the hardware is
-    there. The sysfs `type` attribute reads 0 (PORT_UNKNOWN) for the phantoms
-    and non-zero for a real chip, which is how the lab PC's two genuine
-    16550As were told apart from the thirty that do not exist. Listing all
-    thirty-two buries the ones that matter.
-
-    Anything without that attribute -- every USB adapter -- is assumed real.
-    """
-    name = os.path.basename(device)
-    try:
-        with open(f"/sys/class/tty/{name}/type") as handle:
-            return int(handle.read().strip()) != 0
-    except (OSError, ValueError):
-        return True
+#: How a serial port is classified, and whether an onboard one is real, live
+#: in lab/discovery.py, which needs them to know where to look.
+classify_port = discovery.classify_port
+uart_present = discovery.uart_present
 
 
 def list_ports(kind: str = "all", include_phantom: bool = False) -> dict:
@@ -108,11 +81,18 @@ class Application:
     """Everything the request handler needs, assembled once at startup."""
 
     def __init__(self, registry, database: "dbmod.Database",
-                 engine: "runs.RunEngine", token: str | None = None):
+                 engine: "runs.RunEngine", token: str | None = None,
+                 history=None, supervisor=None, finder=None):
         self.registry = registry
         self.db = database
         self.engine = engine
         self.token = token
+        #: The rolling chart recorder, or None if this server keeps none.
+        self.history = history
+        #: Alarms and the automatic safe state after a fault, or None.
+        self.supervisor = supervisor
+        #: Finds the instruments' ports by asking, or None.
+        self.finder = finder
         self.started_at = time.time()
         self._export_dir = tempfile.mkdtemp(prefix="vacuum-lab-export-")
 
@@ -127,14 +107,37 @@ class Application:
             "run": self.engine.status(),
             "actuators": self.engine.hardware.describe(),
             "automatic_ready": self.engine.hardware.automatic_ready,
+            "alarms": self.supervisor.describe() if self.supervisor else None,
+            "ports": {"search": bool(self.finder and self.finder.enabled),
+                      "devices": self.registry.descriptors()},
             "server_time": time.time(),
             "uptime_s": round(time.time() - self.started_at, 1),
         }
 
-    def live(self, limit: int = 600) -> dict:
-        """The in-progress run's samples, for the live chart."""
-        return {"ok": True, "samples": self.engine.recent_samples(limit),
-                "run": self.engine.status()}
+    def live(self, limit: int = 600, points: int | None = None) -> dict:
+        """The in-progress run's samples, for the live chart.
+
+        `points` asks for the whole run decimated to about that many rows;
+        without it, the most recent `limit` samples as before.
+        """
+        samples = (self.engine.run_samples(points) if points
+                   else self.engine.recent_samples(limit))
+        return {"ok": True, "samples": samples, "run": self.engine.status()}
+
+    def trends(self) -> dict:
+        """Health indicators of every finished run, oldest first."""
+        nominal = None
+        if "pump" in self.registry:
+            value = self.registry.get("pump").snapshot().get("identity", {}) \
+                .get("NominalSpd")
+            nominal = value if isinstance(value, (int, float)) else None
+        return {"ok": True, "runs": trends.trends(self.db, nominal)}
+
+    def history_window(self, seconds: float | None, points: int,
+                       since: float | None) -> dict:
+        if self.history is None:
+            return {"ok": False, "error": "this server keeps no history"}
+        return self.history.window(seconds, points=points, since=since)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -148,7 +151,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # The UI polls /api/state every couple of seconds; logging it buries
         # everything that matters.
-        if self.path.startswith(("/api/state", "/api/live")):
+        if self.path.startswith(("/api/state", "/api/live", "/api/history")):
             return
         sys.stderr.write(f"  {self.address_string()} {fmt % args}\n")
 
@@ -248,6 +251,13 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             return default
 
+    def _float(self, key: str, default: float | None) -> float | None:
+        try:
+            value = float(self._query().get(key, [default])[0])
+        except (TypeError, ValueError):
+            return default
+        return value if value == value else default      # NaN is no value
+
     def _body(self) -> dict:
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -282,11 +292,18 @@ class Handler(BaseHTTPRequestHandler):
         handler = {
             "/api/state": lambda: self._json(self.app.state()),
             "/api/live": lambda: self._json(
-                self.app.live(self._int("limit", 600))),
+                self.app.live(self._int("limit", 600),
+                              self._int("points", 0) or None)),
+            "/api/history": lambda: self._json(
+                self.app.history_window(
+                    self._float("seconds", 3600.0),
+                    max(50, min(self._int("points", 1500), 20000)),
+                    self._float("since", None))),
             "/api/devices": lambda: self._json(
                 {"ok": True, "devices": self.app.registry.descriptors()}),
             "/api/procedures": lambda: self._json(
                 {"ok": True, "procedures": runs.catalogue()}),
+            "/api/trends": lambda: self._json(self.app.trends()),
             "/api/stats": lambda: self._json(
                 {"ok": True, "stats": self.app.db.stats(),
                  "devices": self.app.db.devices()}),
@@ -299,6 +316,9 @@ class Handler(BaseHTTPRequestHandler):
                  **list_ports(
                      (self._query().get("kind") or ["all"])[0],
                      include_phantom=bool(self._query().get("all")))}),
+            "/api/ports/survey": lambda: self._json(
+                self.app.finder.survey() if self.app.finder
+                else {"ok": False, "error": "port search is not available"}),
             "/api/actuators": lambda: self._json(
                 {"ok": True,
                  "actuators": self.app.engine.hardware.describe(),
@@ -350,6 +370,42 @@ class Handler(BaseHTTPRequestHandler):
                 str(payload.get("reason", "stopped by the operator")),
                 shutdown=bool(payload.get("shutdown"))))
             return
+        if route == "/api/alarms/ack":
+            # Acknowledging moves nothing, so it needs no confirm.
+            if self.app.supervisor is None:
+                self._json({"ok": False, "error": "no supervisor"}, 404)
+                return
+            which = payload.get("id", "all")
+            self._json(self.app.supervisor.acknowledge(
+                which if which == "all" else int(which)))
+            return
+        if route == "/api/supervisor":
+            if not payload.get("confirm"):
+                self._json({"ok": False, "error": "changing automatic recovery "
+                                                  "needs confirm"}, 400)
+                return
+            if self.app.supervisor is None:
+                self._json({"ok": False, "error": "no supervisor"}, 404)
+                return
+            self._json(self.app.supervisor.set_auto_recover(
+                bool(payload.get("auto_recover"))))
+            return
+        if route == "/api/pump/secure":
+            # The manual "make safe": motor off, fault acknowledged, station
+            # (forevacuum pump) on. Moves hardware, so it is confirmed.
+            if not payload.get("confirm"):
+                self._json({"ok": False, "error": "making the pump safe needs "
+                                                  "confirm"}, 400)
+                return
+            self._json(self.app.engine.secure_pump(
+                str(payload.get("reason", "requested by the operator"))))
+            return
+        if route == "/api/pump/cancel-shutdown":
+            if not payload.get("confirm"):
+                self._json({"ok": False, "error": "cancelling needs confirm"}, 400)
+                return
+            self._json(self.app.engine.cancel_shutdown())
+            return
         if route == "/api/pump/shutdown":
             # The same guided power-down, without a run to stop. Guarded like
             # any other hardware action: a stray GET cannot stop a pump.
@@ -364,6 +420,39 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/run/acknowledge":
             self._json(self.app.engine.acknowledge(
                 str(payload.get("note", ""))))
+            return
+        if route == "/api/ports/searching":
+            # Turning the automatic search on or off moves nothing.
+            if self.app.finder is None:
+                self._json({"ok": False, "error": "port search is not available"},
+                           404)
+                return
+            self.app.finder.enabled = bool(payload.get("enabled"))
+            self.app.db.add_event(None, "action",
+                                  "Automatic port search switched "
+                                  + ("on" if self.app.finder.enabled else "off"))
+            self._json({"ok": True, "enabled": self.app.finder.enabled})
+            return
+        if route.startswith("/api/device/") and route.endswith("/search"):
+            # Search for an instrument that is not answering, now rather than
+            # at its next scheduled search. Done on its own sampler thread,
+            # so nothing else touches its port meanwhile.
+            key = route.split("/")[3]
+            if key not in self.app.registry:
+                self._json({"ok": False, "error": f"no device named {key!r}"}, 404)
+                return
+            service = self.app.registry.get(key)
+            if service.snapshot().get("connected"):
+                self._json({"ok": False, "error": f"{service.label} is answering "
+                                                  f"on {service.port}; there is "
+                                                  f"nothing to search for"})
+                return
+            if service.finder is None:
+                self._json({"ok": False, "error": "port search is not available"})
+                return
+            service._searched_at = 0.0
+            service._silent_since = time.monotonic() - service.SEARCH_AFTER_S
+            self._json({"ok": True, "searching": True})
             return
         if route == "/api/device/port":
             # Moving an instrument to a different port. Deliberately guarded:
@@ -384,10 +473,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False,
                             "error": f"no device named {key!r}"}, 404)
                 return
-            self._json(self.app.registry.get(key).rebind(
+            service = self.app.registry.get(key)
+            result = service.rebind(
                 str(payload.get("port", "")),
                 baudrate=payload.get("baudrate"),
-                address=payload.get("address")))
+                address=payload.get("address"))
+            # A port chosen by hand that works is remembered like a found one.
+            if result.get("ok") and self.app.finder and service.probe_kind:
+                self.app.finder.memory.remember(service.probe_kind, service.port)
+            self._json(result)
             return
         if route.startswith("/api/runs/"):
             self._runs_post(route, payload)
@@ -414,6 +508,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(device.accessories())
         elif view == "details" and hasattr(device, "details"):
             self._json(device.details())
+        elif view == "diagnostics" and hasattr(device, "diagnostics"):
+            self._json(device.diagnostics())
         else:
             self._json({"ok": False,
                         "error": f"{key} has no view {view!r}"}, 404)
@@ -455,13 +551,20 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "run": run,
                         "sample_count": self.app.db.sample_count(run_id)})
         elif view == "samples":
-            count = self.app.db.sample_count(run_id)
             # Decimate rather than truncate: a six-hour bakeout must still
-            # plot end to end, just with fewer points.
+            # plot end to end, just with fewer points. And decimate keeping
+            # every extreme rather than every Nth row -- a stride steps
+            # straight over the two-sample pressure jump that tripped the
+            # pump, which is the one feature of the curve that matters.
+            samples = self.app.db.samples(run_id)
             requested = self._int("max", 2000)
-            every = max(1, -(-count // requested)) if requested else 1
-            self._json({"ok": True, "samples": self.app.db.samples(
-                run_id, every=every), "every": every, "total": count})
+            if requested and len(samples) > requested:
+                columns = [[s.get(key) for s in samples]
+                           for key in history.SHAPE_KEYS]
+                samples = [samples[i] for i in history.decimate(
+                    len(samples), requested, columns)]
+            self._json({"ok": True, "samples": samples,
+                        "total": self.app.db.sample_count(run_id)})
         elif view == "events":
             self._json({"ok": True,
                         "events": self.app.db.events(run_id, limit=5000)})

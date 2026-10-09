@@ -8,9 +8,12 @@
 // the firmware what it implements beats trusting a table.
 
 import { html } from "../html.js";
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useMemo, useState } from "preact/hooks";
 import { Banner, Card, Empty, Pairs, Pill, Tile } from "../ui.js";
+import { ChartPanel, DataTable, Legend, Plot } from "../chart.js";
+import { RateChart, WindowPicker, downloadCsv, useHistory, useStored } from "../rigcharts.js";
 import { api } from "../api.js";
+import * as A from "../analysis.js";
 import * as fmt from "../format.js";
 import * as status from "../status.js";
 
@@ -187,6 +190,110 @@ function Setpoints({ setpoints, statuses, busy, onCommand }) {
     </div>`;
 }
 
+/**
+ * The gauge's record: pressure per channel, why any channel had no reading,
+ * how fast the pressure is moving, and what the window adds up to.
+ *
+ * The strip under each channel is the explanation for every gap in its line:
+ * underrange, overrange, sensor off, no sensor. A gauge that went underrange
+ * has measured nothing, and the line breaks there rather than pretend.
+ */
+function PressureHistory({ gauge, pump, setpoints }) {
+  const [seconds, setSeconds] = useStored("vacuum-lab-gauge-window", 3600);
+  const [cursor, setCursor] = useState(null);
+  const history = useHistory(seconds);
+  const samples = history.samples;
+  const now = history.now;
+  const domain = now ? [now - seconds, now] : null;
+  const names = Object.fromEntries((gauge?.identity?.gauges || [])
+    .map((g) => [g.channel, g.present === false ? "no sensor" : g.identifier]));
+
+  const series = useMemo(() => [1, 2].map((channel) => ({
+    key: `p${channel}`,
+    label: `Channel ${channel}${names[channel] ? ` · ${names[channel]}` : ""}`,
+    color: channel === 1 ? "--series-1" : "--series-2",
+    points: A.column(samples, `p${channel}`, { positive: true }),
+  })), [samples, names[1], names[2]]);
+
+  const strips = useMemo(() => [1, 2]
+    .filter((channel) => samples.some((s) => s[`p${channel}_status`] !== undefined))
+    .map((channel) => ({ label: `Ch ${channel}`, segments: A.gaugeStrip(samples, channel) })),
+  [samples]);
+
+  const statistics = useMemo(() => A.pressureStats(samples.map((s) => s.p_best)), [samples]);
+  // Gauge noise is a few percent. Scatter far beyond that over two minutes is
+  // the chamber moving, not the gauge, and is reported as such.
+  const noise = useMemo(() => A.pressureNoise(samples, 120), [samples]);
+  const steady = noise != null && noise <= 30;
+  const crossover = pump?.interlocks?.motor_on?.limit_mbar;
+  // Switching-function thresholds, where they fall inside the chart: the
+  // relay closes below the lower one and opens above the upper.
+  const refs = [
+    crossover && { axis: "y", value: crossover, tone: "warn",
+                   label: `turbopump start ≤ ${fmt.pressure(crossover, 0)}` },
+    ...(setpoints || []).flatMap((sp) => [
+      { axis: "y", value: sp.lower, tone: "muted",
+        label: `SP${sp.setpoint} closes below ${fmt.pressure(sp.lower, 1)}` },
+      { axis: "y", value: sp.upper, tone: "muted",
+        label: `SP${sp.setpoint} opens above ${fmt.pressure(sp.upper, 1)}` },
+    ]).filter((r) => Number.isFinite(r.value) && r.value > 1e-10),
+  ].filter(Boolean);
+  const xAxis = domain ? { kind: "clock", min: domain[0], max: domain[1] } : { kind: "clock" };
+
+  return html`
+    <${Card} title="Pressure history"
+      hint=${`Every ${history.interval} s, whether or not a run is going; the server keeps 24 hours.`
+             + (history.oldest && now && history.oldest > now - seconds + 60
+               ? ` Recording since ${fmt.clock(history.oldest)}, when the server started.` : "")}
+      actions=${html`
+        <${WindowPicker} value=${seconds} onChange=${setSeconds} />
+        <button class="small" disabled=${!samples.length}
+                onClick=${() => downloadCsv(samples, `gauge-history-${new Date().toISOString().slice(0, 16)}.csv`)}>
+          CSV</button>`}>
+      ${history.error && html`<${Banner} tone="warn">${history.error}<//>`}
+
+      <div class="tiles">
+        <${Tile} label="Lowest" value=${statistics ? fmt.pressure(statistics.min, 2) : "—"}
+                 unit=${statistics ? "mbar" : ""} foot="in this window" />
+        <${Tile} label="Highest" value=${statistics ? fmt.pressure(statistics.max, 2) : "—"}
+                 unit=${statistics ? "mbar" : ""}
+                 foot=${statistics ? `${fmt.number(statistics.decades, 1)} decades of range` : ""} />
+        <${Tile} label="Typical" value=${statistics ? fmt.pressure(statistics.geomean, 2) : "—"}
+                 unit=${statistics ? "mbar" : ""} foot="geometric mean" />
+        <${Tile} label="Noise, last 2 min" value=${steady ? fmt.number(noise, noise < 10 ? 1 : 0) : "—"}
+                 unit=${steady ? "%" : ""}
+                 foot=${noise == null ? "needs two minutes of valid readings"
+                   : steady ? "scatter about the trend: the gauge, not the chamber"
+                   : "the pressure is moving — needs a steady stretch"} />
+      </div>
+
+      <div class="chart-stack">
+        <${ChartPanel} title="Pressure by channel"
+          readout=${statistics ? `${fmt.pressure(statistics.last, 2)} mbar` : "no reading"}
+          legend=${html`
+            <${Legend} series=${series} />
+            ${strips.length > 0 && html`
+              <div class="legend strip-legend">
+                <span class="item"><span class="key block warn" />under- or overrange</span>
+                <span class="item"><span class="key block idle" />sensor off, or none fitted</span>
+                <span class="item"><span class="key block crit" />sensor error</span>
+                <span class="item muted">— the strips show why a line has a gap</span>
+              </div>`}`}
+          table=${() => html`<${DataTable} series=${series} x=${xAxis} unit="mbar"
+                                           formatValue=${(v) => fmt.pressure(v, 3)} />`}>
+          <${Plot} series=${series} height=${250 + strips.length * 17} x=${xAxis}
+                   y=${{ log: true }} unit="mbar" formatValue=${(v) => fmt.pressure(v, 2)}
+                   refs=${refs} strips=${strips} xLabels=${false}
+                   cursor=${cursor} onCursor=${setCursor}
+                   emptyText="No valid reading on either channel in this window." />
+        <//>
+        <${RateChart} samples=${samples} x="clock" domain=${domain}
+                      windowS=${Math.max(120, seconds / 120)}
+                      cursor=${cursor} onCursor=${setCursor} />
+      </div>
+    <//>`;
+}
+
 function ProbeResult({ result }) {
   if (!result) return null;
   return html`
@@ -298,6 +405,9 @@ export function GaugeView({ state, onCommand, busy }) {
             supports=${details?.supports}
             busy=${busy} onCommand=${onCommand} />`)}
       </div>
+
+      <${PressureHistory} gauge=${gauge} pump=${state?.devices?.pump}
+                          setpoints=${details?.setpoints} />
 
       <div class="grid two">
         <${Card} title="Controller">

@@ -9,9 +9,13 @@ import { html } from "../html.js";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { Banner, Card, Empty, Field, Pairs, Pill, coerceConfig, defaultConfig }
   from "../ui.js";
-import { PressureChart, SpeedChart, TemperatureChart } from "../chart.js";
+import { RunCharts } from "../runcharts.js";
+import { useStored } from "../rigcharts.js";
+import { ActionList } from "../alarms.js";
+import * as A from "../analysis.js";
 import { api } from "../api.js";
 import * as fmt from "../format.js";
+import * as status from "../status.js";
 
 function ResultSummary({ procedure, result }) {
   if (!result) return null;
@@ -111,15 +115,20 @@ function Actuators({ actuators }) {
     </div>`;
 }
 
-function LiveRun({ run, samples, events, onStop, onAcknowledge, busy }) {
+function LiveRun({ run, samples, events, onStop, onAcknowledge, busy, devices }) {
   const phases = run.phases || [];
   const index = phases.indexOf(run.phase);
   const share = phases.length > 1
     ? Math.max(0, Math.min(1, (index + 0.5) / phases.length)) : 0;
-  const bakeout = run.procedure === "bakeout";
+
+  const pumpState = status.pumpSummary(devices?.pump);
 
   return html`
     <div class="grid" style="gap:16px">
+      ${pumpState.dragged && html`
+        <${Banner} tone="crit">
+          <strong>${pumpState.headline}.</strong> ${pumpState.detail}
+        <//>`}
       <${OperatorPrompt} prompt=${run.prompt} busy=${busy}
                          onAcknowledge=${onAcknowledge} />
 
@@ -133,7 +142,7 @@ function LiveRun({ run, samples, events, onStop, onAcknowledge, busy }) {
           ${phases.map((phase, position) => html`
             <span class=${`step${phase === run.phase ? " now"
                           : position < index ? " done" : ""}`}>
-              ${fmt.titleCase(phase)}</span>`)}
+              ${fmt.phaseLabel(phase)}</span>`)}
         </div>
         <div class="bar"><span style=${`width:${(share * 100).toFixed(0)}%`} /></div>
         <div class="spread small muted">
@@ -148,15 +157,10 @@ function LiveRun({ run, samples, events, onStop, onAcknowledge, busy }) {
           <${Actuators} actuators=${run.actuators} />
         <//>`}
 
-      <${Card} title="Pressure">
-        <${PressureChart} samples=${samples} height=${250} />
-      <//>
-
-      <${Card} title=${bakeout ? "TMS temperature" : "Rotor speed"}>
-        ${bakeout
-          ? html`<${TemperatureChart} samples=${samples} height=${170} />`
-          : html`<${SpeedChart} samples=${samples} height=${170} />`}
-      <//>
+      <${RunCharts} run=${run.run} procedure=${run.procedure}
+                    config=${run.run?.config || {}} samples=${samples} events=${events}
+                    startedAt=${run.run?.started_at} pump=${devices?.pump}
+                    gauge=${devices?.gauge} live=${true} />
 
       <${Card} title="Run log">
         <${EventLog} events=${events} />
@@ -213,7 +217,7 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [] }) {
         <p class="hint">${procedure.description}</p>
         <div class="phases">
           ${procedure.phases.map((phase) => html`
-            <span class="step">${fmt.titleCase(phase)}</span>`)}
+            <span class="step">${fmt.phaseLabel(phase)}</span>`)}
         </div>
       <//>
 
@@ -260,9 +264,117 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [] }) {
     </div>`;
 }
 
+/**
+ * A run that has ended -- and the rig carrying on after it.
+ *
+ * When a run aborted, this page used to snap straight back to an empty form,
+ * and the curves vanished at exactly the moment somebody needed them: what
+ * the rotor did after the fault, whether the pressure recovered. Now the run
+ * stays on screen, and its charts continue live from the server's rolling
+ * history in an "After the run" phase, until you start a new run.
+ */
+function AfterRun({ last, state, onDismiss }) {
+  const [record, setRecord] = useState(null);
+  const [stored, setStored] = useState([]);
+  const [after, setAfter] = useState([]);
+  const [events, setEvents] = useState([]);
+  const startedAt = last.started_at;
+
+  useEffect(() => {
+    let cancelled = false;
+    api.run(last.id).then((data) => { if (!cancelled) setRecord(data.run); }).catch(() => {});
+    api.runSamples(last.id, 1500)
+      .then((data) => { if (!cancelled) setStored(data.samples || []); })
+      .catch(() => {});
+    const loadEvents = () => api.runEvents(last.id)
+      .then((data) => { if (!cancelled) setEvents(data.events || []); })
+      .catch(() => {});
+    loadEvents();
+    // The recovery after a fault is logged a few seconds after the end.
+    const timer = setInterval(loadEvents, 5000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [last.id]);
+
+  // Everything the rig recorded since the run ended, kept up to date.
+  useEffect(() => {
+    let cancelled = false;
+    let timer = null;
+    let newest = null;
+    let rows = [];
+    const tick = async () => {
+      try {
+        const payload = newest === null
+          ? await api.history(Math.max(60, (state?.server_time || Date.now() / 1000)
+                                             - last.ended_at + 10), 1500)
+          : await api.history(0, 2000, newest);
+        if (payload.ok) {
+          const fresh = A.historySamples(payload).filter((r) => r.at > last.ended_at);
+          if (fresh.length) {
+            rows = rows.concat(fresh.filter((r) => newest === null || r.at > newest));
+            newest = rows[rows.length - 1].at;
+            if (!cancelled) setAfter(rows);
+          } else if (newest === null) {
+            newest = last.ended_at;
+          }
+        }
+      } catch { /* the main poll reports an outage */ }
+      if (!cancelled) timer = setTimeout(tick, 2000);
+    };
+    tick();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, [last.id]);
+
+  const samples = useMemo(() => stored.concat(after.map((r) => ({
+    ...r, t: r.at - startedAt, phase: "after",
+  }))), [stored, after, startedAt]);
+
+  const tone = last.status === "completed" ? "good"
+    : last.status === "failed" ? "crit" : "warn";
+  const secure = state?.run?.secure;
+  const recent = secure && secure.started_at >= last.ended_at - 5;
+
+  return html`
+    <div class="grid" style="gap:16px">
+      <section class=${`summary ${tone}`}>
+        <div class="spread">
+          <span class="headline">
+            Run ${last.id} ${last.status}: ${last.name || last.label}</span>
+          <div class="row">
+            <a class="btn" href=${`#history/${last.id}`}>Open in History</a>
+            <button class="primary" onClick=${onDismiss}>Start a new run</button>
+          </div>
+        </div>
+        ${last.message && html`<div>${last.message}</div>`}
+        <div class="small muted">
+          Ended at ${fmt.clock(last.ended_at)}, after ${fmt.duration(last.ended_at - startedAt)}.
+          The charts carry on with live data in the "After the run" band, so you can
+          watch the rotor and the pressure after the end.
+          ${last.pump_trouble ? " The pump was put in its safe state: motor off, forevacuum pump kept running."
+            : " The pump has been left as it was."}
+        </div>
+        ${recent && html`
+          <div class="small">
+            <strong>${secure.active ? "Making the pump safe…" : secure.ok ? "Pump made safe:" : "Pump not confirmed safe:"}</strong>
+            <${ActionList} actions=${secure.actions} />
+            ${secure.error && html`<span class="muted">${secure.error}</span>`}
+          </div>`}
+      </section>
+
+      <${RunCharts} run=${record || { id: last.id }} procedure=${last.procedure}
+                    config=${record?.config || {}} samples=${samples} events=${events}
+                    startedAt=${startedAt} pump=${state?.devices?.pump}
+                    gauge=${state?.devices?.gauge} live=${true} />
+
+      <${Card} title="Run log">
+        <${EventLog} events=${events} />
+      <//>
+    </div>`;
+}
+
 export function TestsView({ state, live, onStart, onStop, onAcknowledge, busy }) {
   const [procedures, setProcedures] = useState([]);
   const [events, setEvents] = useState([]);
+  const [dismissed, setDismissed] = useStored("vacuum-lab-dismissed-run", null);
   const run = state?.run;
 
   useEffect(() => {
@@ -285,7 +397,15 @@ export function TestsView({ state, live, onStart, onStop, onAcknowledge, busy })
   if (run?.running) {
     return html`<${LiveRun} run=${run} samples=${live?.samples || []}
                             events=${events} onStop=${onStop}
-                            onAcknowledge=${onAcknowledge} busy=${busy} />`;
+                            onAcknowledge=${onAcknowledge} busy=${busy}
+                            devices=${state?.devices} />`;
+  }
+
+  // The run that just ended stays on screen, live, until it is dismissed.
+  const last = run?.last;
+  if (last && last.id !== dismissed) {
+    return html`<${AfterRun} last=${last} state=${state}
+                             onDismiss=${() => setDismissed(last.id)} />`;
   }
 
   const devices = state?.devices || {};

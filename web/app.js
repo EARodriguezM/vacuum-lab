@@ -15,6 +15,7 @@ import { render } from "preact";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { api, settings, updateSettings } from "./api.js";
 import { Banner, Choose, Confirm, Toasts, useToasts } from "./ui.js";
+import { AlarmBar, useAlarmSignals } from "./alarms.js";
 import { DashboardView } from "./views/dashboard.js";
 import { Overview } from "./views/overview.js";
 import { PumpView } from "./views/pump.js";
@@ -41,8 +42,10 @@ function applyTheme(theme) {
 }
 
 function App() {
-  const [tab, setTab] = useState(
-    () => location.hash.replace("#", "") || "dashboard");
+  // The hash is "#tab" or "#tab/detail" -- "#history/26" opens run 26, so a
+  // run can be linked to directly.
+  const tabOf = () => location.hash.replace("#", "").split("/")[0] || "dashboard";
+  const [tab, setTab] = useState(tabOf);
   const [state, setState] = useState(null);
   const [live, setLive] = useState(null);
   const [error, setError] = useState(null);
@@ -50,6 +53,7 @@ function App() {
   const [pending, setPending] = useState(null);
   const [stopping, setStopping] = useState(false);
   const [poweringDown, setPoweringDown] = useState(false);
+  const [securing, setSecuring] = useState(false);
   const [toasts, notify, dismiss] = useToasts();
   const [tick, setTick] = useState(0);
 
@@ -60,7 +64,7 @@ function App() {
   useEffect(() => { applyTheme(settings().theme); }, [tick]);
 
   useEffect(() => {
-    const onHash = () => setTab(location.hash.replace("#", "") || "dashboard");
+    const onHash = () => setTab(tabOf());
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
@@ -84,10 +88,13 @@ function App() {
         runningRef.current = !!next.run?.running;
 
         // The live sample buffer is only worth fetching while something is
-        // recording; otherwise it is an empty array every two seconds.
+        // recording; otherwise it is an empty array every two seconds. The
+        // whole run comes back, decimated with every extreme kept, so the
+        // charts show the run from its first sample rather than its last
+        // half hour.
         if (runningRef.current) {
           try {
-            const samples = await api.live(900);
+            const samples = await api.liveRun(1500);
             if (!cancelled) setLive(samples);
           } catch { /* the state poll already reported any outage */ }
         } else if (!cancelled) {
@@ -191,11 +198,11 @@ function App() {
     }
   };
 
-  // A full-vacuum run has no ending of its own: stopping it *is* how it
-  // finishes, and powering down is the expected answer. Every other
-  // procedure runs to its own end, so stopping one early usually means
-  // "leave the chamber as it is and let me look at it".
-  const stopOptions = (procedure) => {
+  // Keeping the vacuum is the first answer for every procedure: it leaves
+  // the forevacuum pump running, and a power-down switches the station off,
+  // which on this drive also vents the chamber (factory automatic venting).
+  // Powering down stays one click away for the end of the day.
+  const stopOptions = () => {
     const keep = {
       key: "keep", label: "Stop the run, keep the vacuum",
       description: "The turbopump and the backing pump carry on exactly as "
@@ -209,7 +216,7 @@ function App() {
         + "the station. Takes several minutes; the chamber only comes back "
         + "up to air pressure if you vent it.",
     };
-    return procedure === "full_vacuum" ? [down, keep] : [keep, down];
+    return [keep, down];
   };
 
   // Stopping a run is two decisions, not one: end the recording, and decide
@@ -247,6 +254,44 @@ function App() {
     applyTheme(next);
     setTick((t) => t + 1);
   };
+
+  const acknowledgeAlarms = async (id) => {
+    try {
+      await api.acknowledgeAlarms(id);
+      setTick((t) => t + 1);          // poll again now rather than in 2 s
+    } catch (problem) {
+      notify(problem.message, "error");
+    }
+  };
+
+  // Make safe: motor off, fault acknowledged, forevacuum pump on. The same
+  // sequence the supervisor runs by itself after a fault, for when that is
+  // switched off or a person wants it now.
+  const makeSafe = async () => {
+    setSecuring(false);
+    setBusy(true);
+    try {
+      const result = await api.securePump("Make safe, from the panel");
+      if (result.ok) notify("Making the pump safe: motor off, fault cleared, forevacuum pump on…", "ok");
+      else notify(result.error, "error");
+    } catch (problem) {
+      notify(problem.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const cancelPowerDown = async () => {
+    try {
+      const result = await api.cancelShutdown();
+      if (result.ok) notify("Power-down cancelled. The backing pump keeps running.", "ok");
+      else notify(result.error, "error");
+    } catch (problem) {
+      notify(problem.message, "error");
+    }
+  };
+
+  useAlarmSignals(state?.alarms);
 
   // The guided power-down, reachable without a run to stop: switch the
   // motor off, wait for the rotor to reach rest with the backing pump still
@@ -295,6 +340,8 @@ function App() {
         return html`<${PumpView} state=${state} onCommand=${pumpCommand}
                                  onWriteParam=${writeParam} busy=${busy}
                                  onShutdown=${() => setPoweringDown(true)}
+                                 onSecure=${() => setSecuring(true)}
+                                 notify=${notify}
                                  shutdown=${shutdown} />`;
       case "gauge":
         return html`<${GaugeView} state=${state} onCommand=${gaugeCommand}
@@ -304,7 +351,7 @@ function App() {
                                   onStop=${stopRun} busy=${busy}
                                   onAcknowledge=${acknowledgeStep} />`;
       case "history":
-        return html`<${HistoryView} notify=${notify} />`;
+        return html`<${HistoryView} notify=${notify} state=${state} />`;
       case "settings":
         return html`<${SettingsView} state=${state} notify=${notify}
                                      onSettingsChanged=${() => setTick((t) => t + 1)} />`;
@@ -346,6 +393,8 @@ function App() {
       ${error && state && html`
         <${Banner} tone="warn">Lost contact with the server: ${error}<//>`}
 
+      <${AlarmBar} alarms=${state?.alarms} onAcknowledge=${acknowledgeAlarms} busy=${busy} />
+
       ${showShutdown && html`
         <${Banner} tone=${shutdown.active ? "warn"
                           : shutdown.ok ? "good" : "crit"}>
@@ -354,6 +403,9 @@ function App() {
                     : "Power-down stopped:"}</strong> ${shutdown.message}
           ${shutdown.active && shutdown.rotor_hz != null
             ? ` Rotor at ${Math.round(shutdown.rotor_hz)} Hz.` : ""}
+          ${shutdown.active && html`
+            <button class="small" style="margin-left:10px" onClick=${cancelPowerDown}>
+              Cancel — keep the backing pump running</button>`}
         <//>`}
 
       ${body()}
@@ -362,8 +414,18 @@ function App() {
         title="Stop the run"
         body=${html`<p>The recording ends either way and everything measured
           so far is kept. What should the pump do?</p>`}
-        options=${stopOptions(run?.procedure)}
+        options=${stopOptions()}
         onChoose=${finishStop} onCancel=${() => setStopping(false)} />
+
+      <${Confirm} open=${securing}
+        title="Make the pump safe"
+        confirmLabel="Make safe"
+        body=${html`<p>Switches the turbopump motor off, acknowledges the drive's
+          fault, and makes sure the pumping station — which runs the forevacuum
+          pump — is on. Nothing that keeps the chamber under vacuum is switched
+          off. Restart the turbopump afterwards from the Station card, once the
+          cause is dealt with.</p>`}
+        onCancel=${() => setSecuring(false)} onConfirm=${makeSafe} />
 
       <${Confirm} open=${poweringDown}
         title="Power the pump down"

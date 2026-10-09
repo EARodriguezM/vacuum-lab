@@ -20,8 +20,10 @@
 import { html } from "../html.js";
 import { useEffect, useState } from "preact/hooks";
 import { Empty, Pill } from "../ui.js";
-import { PressureChart, SpeedChart, Sparkline, TimeChart } from "../chart.js";
+import { Sparkline } from "../chart.js";
+import { RigStack, useHistory } from "../rigcharts.js";
 import { api } from "../api.js";
+import { headline } from "./history.js";
 import * as fmt from "../format.js";
 import * as status from "../status.js";
 
@@ -81,7 +83,14 @@ export function DashboardView({ state, live }) {
   const pump = devices.pump;
   const gauge = devices.gauge;
   const run = state?.run;
-  const samples = live?.samples || [];
+  // A run's own samples while one is recording; otherwise the last hour the
+  // server has kept anyway, so the wall display is never an empty frame.
+  const history = useHistory(3600);
+  const recording = !!(run?.running && live?.samples?.length);
+  const samples = recording ? live.samples : history.samples;
+  const domain = !recording && history.now ? [history.now - 3600, history.now] : null;
+  const gaugeNames = Object.fromEntries((gauge?.identity?.gauges || [])
+    .filter((g) => g.present !== false).map((g) => [g.channel, g.identifier]));
   const actuators = state?.actuators || [];
   const actuator = (key) => actuators.find((a) => a.key === key);
 
@@ -106,7 +115,7 @@ export function DashboardView({ state, live }) {
           ${run?.running
             ? html`
               <span class="pill accent"><span class="dot" />
-                ${fmt.titleCase(run.phase)}</span>
+                ${fmt.phaseLabel(run.phase)}</span>
               <div class="dash-run-name">${run.run?.name}</div>
               <div class="dash-run-time">
                 ${fmt.duration(run.elapsed_s)} elapsed</div>`
@@ -172,18 +181,21 @@ export function DashboardView({ state, live }) {
       </div>
 
       <${Panel} title="Pressure against time" wide=${true}
-                subtitle=${run?.running
-                  ? "live, this run" : "start a run to record"}>
+                subtitle=${recording ? "live, this run" : "last hour — no run is recording"}>
         ${samples.length
-          ? html`<${PressureChart} samples=${samples} height=${300} />`
-          : html`<${Empty}>No run is recording.<//>`}
+          ? html`<${RigStack} samples=${samples} x=${recording ? "elapsed" : "clock"}
+                             domain=${domain} pump=${pump} gaugeNames=${gaugeNames}
+                             panels=${["pressure"]} pressureHeight=${300} bare=${true} />`
+          : html`<${Empty}>Nothing recorded yet.<//>`}
       <//>
 
       <div class="dash-grid two-up">
         <${Panel} title="Rotor speed">
           ${samples.length
-            ? html`<${SpeedChart} samples=${samples} height=${180} />`
-            : html`<${Empty}>No run is recording.<//>`}
+            ? html`<${RigStack} samples=${samples} x=${recording ? "elapsed" : "clock"}
+                               domain=${domain} pump=${pump} panels=${["speed"]}
+                               height=${200} bare=${true} />`
+            : html`<${Empty}>Nothing recorded yet.<//>`}
         <//>
         <${Panel} title="Process hardware">
           ${actuators.length
@@ -225,7 +237,7 @@ export function DashboardView({ state, live }) {
                         : r.status === "running" ? "accent"
                         : r.status === "failed" ? "crit" : "warn"}>
                         ${r.status}<//></td>
-                      <td class="num">${resultLine(r)}</td>
+                      <td class="num">${headline(r)}</td>
                     </tr>`)}
                 </tbody>
               </table>
@@ -233,15 +245,4 @@ export function DashboardView({ state, live }) {
           : html`<${Empty}>Nothing recorded yet.<//>`}
       <//>
     </div>`;
-}
-
-function resultLine(run) {
-  const result = run.result || {};
-  if (result.base_mbar) return `base ${fmt.pressure(result.base_mbar, 1)} mbar`;
-  if (result.ultimate_mbar) return `${fmt.pressure(result.ultimate_mbar, 1)} mbar`;
-  if (result.leak_rate_mbar_l_s !== undefined && result.leak_rate_mbar_l_s !== null) {
-    return `${fmt.pressure(result.leak_rate_mbar_l_s, 1)} mbar·L/s`;
-  }
-  if (result.deposition_s) return `${fmt.duration(result.deposition_s)} deposited`;
-  return "—";
 }

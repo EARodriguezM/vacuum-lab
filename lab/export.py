@@ -28,6 +28,8 @@ SAMPLE_HEADER = (
     "p1_mbar", "p1_status", "p2_mbar", "p2_status", "p_best_mbar",
     "speed_hz", "set_speed_hz", "current_a", "voltage_v", "power_w",
     "tms_temp_c", "error_code", "station", "motor",
+    "ov_temp_pump", "ov_temp_elec",
+    "argon_sccm", "gate_pct", "magnetron_w", "shutter_open", "rate_pct_min",
 )
 
 #: Columns of the all-runs index CSV.
@@ -98,6 +100,10 @@ def run_csv(database: "dbmod.Database", run_id: int) -> tuple[str, str] | None:
             sample.get("current"), sample.get("voltage"), sample.get("power"),
             sample.get("tms_temp"), sample.get("error_code") or "",
             sample.get("station"), sample.get("motor"),
+            sample.get("ov_temp_pump"), sample.get("ov_temp_elec"),
+            sample.get("gas_sccm"), sample.get("gate_pct"),
+            sample.get("magnetron_w"), sample.get("shutter"),
+            sample.get("rate_pct_min"),
         ])
     return filename(run, "csv"), buffer.getvalue()
 

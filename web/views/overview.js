@@ -2,7 +2,7 @@
 
 import { html } from "../html.js";
 import { Banner, Card, Empty, Pill, Tile } from "../ui.js";
-import { PressureChart, SpeedChart, TemperatureChart } from "../chart.js";
+import { RigStack, useHistory } from "../rigcharts.js";
 import * as fmt from "../format.js";
 import * as status from "../status.js";
 
@@ -20,12 +20,35 @@ function RunBanner({ run, onStop, onOpen }) {
       <div class="phases">
         ${phases.map((phase, position) => html`
           <span class=${`step${phase === run.phase ? " now"
-                        : position < index ? " done" : ""}`}>${fmt.titleCase(phase)}</span>`)}
+                        : position < index ? " done" : ""}`}>${fmt.phaseLabel(phase)}</span>`)}
       </div>
       <div class="spread small muted">
         <span>Elapsed ${fmt.duration(run.elapsed_s)}</span>
         <span>${run.samples} samples · every ${fmt.number(run.interval_s, 0)}s</span>
       </div>
+    <//>`;
+}
+
+/** Every alarm the supervisor has raised since the server started. */
+function AlarmLog({ alarms }) {
+  const recent = alarms?.recent || [];
+  return html`
+    <${Card} title="Alarm log"
+             hint=${`Kept since the server started; every entry is also in the events of the run it happened in. Automatic recovery is ${alarms?.auto_recover ? "on" : "off"}.`}>
+      ${recent.length
+        ? html`
+          <div class="alarm-log">
+            ${recent.map((alarm) => html`
+              <div class="entry" key=${alarm.id}>
+                <span class="mono small muted">${fmt.clock(alarm.raised_at)}</span>
+                <${Pill} tone=${alarm.level === "critical" ? "crit" : "warn"}>
+                  ${alarm.active ? alarm.level : "cleared"}<//>
+                <span><strong>${alarm.title}</strong>
+                  ${alarm.acknowledged ? html` <span class="small muted">· acknowledged</span>` : null}
+                  <div class="small muted">${alarm.detail}</div></span>
+              </div>`)}
+          </div>`
+        : html`<${Empty}>No alarms since the server started.<//>`}
     <//>`;
 }
 
@@ -38,8 +61,13 @@ export function Overview({ state, live, onStop, onNavigate }) {
   const pumpStatus = pump?.status || {};
   const run = state?.run;
 
-  const samples = live?.samples || [];
+  const history = useHistory(3600);
+  const recording = !!(run?.running && live?.samples?.length);
+  const samples = recording ? live.samples : history.samples;
+  const domain = !recording && history.now ? [history.now - 3600, history.now] : null;
   const bakeout = run?.running && run.procedure === "bakeout";
+  const gaugeNames = Object.fromEntries((gauge?.identity?.gauges || [])
+    .filter((g) => g.present !== false).map((g) => [g.channel, g.identifier]));
 
   return html`
     <div class="grid" style="gap:16px">
@@ -81,9 +109,12 @@ export function Overview({ state, live, onStop, onNavigate }) {
                  unit="W"
                  foot=${`${fmt.number(pumpStatus.DrvCurrent, 2)} A · ${
                    fmt.number(pumpStatus.DrvVoltage, 1)} V`} />
-        <${Tile} label="TMS temperature"
-                 value=${fmt.integer(pumpStatus.TMSActTemp)} unit="°C"
-                 foot=${pumpStatus.Heating ? "heating on" : "heating off"} />
+        <${Tile} label="Pump temperature"
+                 value=${pumpStatus.TMSActTemp > 0 ? fmt.integer(pumpStatus.TMSActTemp) : "—"}
+                 unit=${pumpStatus.TMSActTemp > 0 ? "°C" : ""}
+                 foot=${pumpStatus.TMSActTemp > 0
+                   ? (pumpStatus.Heating ? "TMS, heating on" : "TMS")
+                   : "not measured — the TMS reads 0 with its heater off"} />
         <${Tile} label="Operating hours"
                  value=${fmt.integer(pumpStatus.OpHrsPump)} unit="h" />
         <${Tile} label="Fault"
@@ -93,21 +124,19 @@ export function Overview({ state, live, onStop, onNavigate }) {
                    ? "crit" : null} />
       </div>
 
-      <${Card} title="Pressure"
-               hint=${run?.running
-                 ? "Live, from the run in progress."
-                 : "Charts fill in while a test run is recording. Start one from the Process tab."}>
+      <${Card} title=${recording ? "This run" : "The last hour"}
+               hint=${recording
+                 ? "Live, from the run in progress. The Process tab has every chart for it."
+                 : "Recorded by the server whether or not a run is going. The Pump and Gauge tabs go back 24 hours."}>
         ${samples.length
-          ? html`<${PressureChart} samples=${samples} height=${230} />`
-          : html`<${Empty}>No run is recording. Live pressure is shown in the tiles above;
-                 start a run to record a curve.<//>`}
+          ? html`<${RigStack} samples=${samples} x=${recording ? "elapsed" : "clock"}
+                             domain=${domain} pump=${pump} gaugeNames=${gaugeNames}
+                             panels=${bakeout ? ["pressure", "temperature"] : ["pressure", "speed"]}
+                             pressureHeight=${230} height=${150} />`
+          : html`<${Empty}>Nothing recorded yet. The server records every couple of
+                 seconds once it has started.<//>`}
       <//>
 
-      ${samples.length > 0 && html`
-        <${Card} title=${bakeout ? "TMS temperature" : "Rotor speed"}>
-          ${bakeout
-            ? html`<${TemperatureChart} samples=${samples} height=${160} />`
-            : html`<${SpeedChart} samples=${samples} height=${160} />`}
-        <//>`}
+      ${state?.alarms && html`<${AlarmLog} alarms=${state.alarms} />`}
     </div>`;
 }

@@ -126,6 +126,23 @@ class Actuator:
         except Exception as exc:
             raise ActuatorError(f"{self.label}: {exc}") from exc
 
+    def known(self):
+        """The state as far as anything actually knows it, for recording.
+
+        A driven actuator reports what its hardware reads. A manual one is
+        only known once a human has confirmed the step: between the prompt
+        and the Done press the valve may or may not have moved, and a run
+        record that showed the requested value there would date the change
+        to the moment the software *asked*. None means "not known", and the
+        chart breaks its line there rather than inventing a step.
+        """
+        if self.driver is not None:
+            try:
+                return self.driver.read()
+            except Exception:
+                return None
+        return self.requested if self.confirmed else None
+
     def describe(self) -> dict:
         try:
             actual = self.read()
@@ -258,6 +275,27 @@ class ProcessHardware:
 
     def describe(self) -> list[dict]:
         return [a.describe() for a in self._all.values()]
+
+    def sample_fields(self) -> dict:
+        """The process state as run-sample columns.
+
+        This is what makes a deposition's record complete: the curve of the
+        chamber is only half the story without the plasma power, the argon
+        and the shutter timing beside it. Values are `known()` ones, so a
+        manual step shows up from the moment it was confirmed, not asked for.
+        """
+        def number(value):
+            if isinstance(value, bool):
+                return 1.0 if value else 0.0
+            return float(value) if isinstance(value, (int, float)) else None
+
+        shutter = self.shutter.known()
+        return {
+            "gas_sccm": number(self.gas.known()),
+            "gate_pct": number(self.gate.known()),
+            "magnetron_w": number(self.magnetron.known()),
+            "shutter": None if shutter is None else (1 if shutter else 0),
+        }
 
     def safe_shutdown(self, log=None) -> None:
         """Put the process hardware in its safe state, best effort.

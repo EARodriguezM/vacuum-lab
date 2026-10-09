@@ -7,23 +7,19 @@
 # --token, anyone who can reach port 8600 can start and stop the pump and the
 # magnetron, and a service starts that exposure automatically on every boot.
 #
-# Both ports are named explicitly rather than left to the defaults, so that a
-# change of default in webserver.py cannot silently move a running rig onto a
-# different instrument.
+# Both ports are "auto": the panel finds each instrument by asking every
+# serial port what is on it (read-only queries -- the TC 600's type, the TPG's
+# firmware), so a replugged or replaced USB adapter, or a renumbered
+# /dev/ttyUSBn, does not matter. It tries the udev names /dev/tc600 and
+# /dev/tpg252 first when deploy/99-vacuum-lab.rules is installed, then the
+# adapter it found each instrument on last time (ports.json, next to the
+# database), then every other port. An instrument that goes quiet is looked
+# for again, about once a minute. --no-port-search pins the ports instead.
 #
-# They are named /dev/tc600 and /dev/tpg252, which exist because of
-# deploy/99-vacuum-lab.rules. Install that first or this unit will not
-# start:
-#
-#   sudo cp deploy/99-vacuum-lab.rules /etc/udev/rules.d/
-#   sudo udevadm control --reload-rules
-#   sudo udevadm trigger --subsystem-match=tty --action=add
-#
-# Not /dev/ttyUSBn, which is assigned in enumeration order and swaps on a
-# replug; not /dev/ttyS0 and /dev/ttyS1, which is what this unit used to say
-# and which stopped working when the onboard UARTs vanished on 2026-08-31 --
-# a unit naming a dead port starts cleanly and reports both instruments
-# offline, which reads as a dead rig rather than a stale config file.
+# This unit used to name /dev/ttyS0 and /dev/ttyS1, which stopped working when
+# the onboard UARTs vanished on 2026-08-31 -- a unit naming a dead port starts
+# cleanly and reports both instruments offline, which reads as a dead rig
+# rather than a stale config file. Finding the ports removes that trap.
 
 [Unit]
 Description=Vacuum lab control panel (TC 600 turbopump + TPG 252 A gauge)
@@ -40,8 +36,8 @@ WorkingDirectory=/home/esarodriguezm/tc600-control
 # never reaches `journalctl -u tc600-web`.
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /home/esarodriguezm/tc600-control/webserver.py \
-    --serial /dev/tc600 --address 1 \
-    --gauge /dev/tpg252 --gauge-baud 9600 \
+    --serial auto --address 1 \
+    --gauge auto \
     --port 8600
 Restart=on-failure
 RestartSec=5

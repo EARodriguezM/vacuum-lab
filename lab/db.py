@@ -24,7 +24,7 @@ import threading
 import time
 import uuid
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: Statuses a run can be in. `running` is the only one the engine writes live;
 #: everything else is terminal.
@@ -74,7 +74,22 @@ CREATE TABLE IF NOT EXISTS samples (
     tms_temp    REAL,
     error_code  TEXT,
     station     INTEGER,
-    motor       INTEGER
+    motor       INTEGER,
+    -- The drive's over-temperature flags, 1 while raised. Only the full-vacuum
+    -- run acted on them before; every run records them now, so a curve can
+    -- show when the pump started cooking rather than only that it stopped.
+    ov_temp_pump INTEGER,
+    ov_temp_elec INTEGER,
+    -- Process hardware, as far as it is known: a driven actuator's reading,
+    -- or a manual one's value once the operator confirmed it. NULL means
+    -- not known -- between "please open the valve" and the Done press.
+    gas_sccm    REAL,
+    gate_pct    REAL,
+    magnetron_w REAL,
+    shutter     INTEGER,
+    -- The fractional pumping rate, %/min, that the base-pressure judgement
+    -- was looking at, so a reader can see why a run called base when it did.
+    rate_pct_min REAL
 );
 
 CREATE INDEX IF NOT EXISTS samples_by_run ON samples(run_id, t);
@@ -106,6 +121,8 @@ SAMPLE_COLUMNS = (
     "t", "at", "phase", "p1", "p1_status", "p2", "p2_status", "p_best",
     "speed", "set_speed", "current", "voltage", "power",
     "tms_temp", "error_code", "station", "motor",
+    "ov_temp_pump", "ov_temp_elec",
+    "gas_sccm", "gate_pct", "magnetron_w", "shutter", "rate_pct_min",
 )
 
 #: Columns added after schema version 1. `CREATE TABLE IF NOT EXISTS` does
@@ -114,6 +131,13 @@ SAMPLE_COLUMNS = (
 #: believes is there.
 MIGRATIONS = (
     ("samples", "p_best", "REAL"),
+    ("samples", "ov_temp_pump", "INTEGER"),
+    ("samples", "ov_temp_elec", "INTEGER"),
+    ("samples", "gas_sccm", "REAL"),
+    ("samples", "gate_pct", "REAL"),
+    ("samples", "magnetron_w", "REAL"),
+    ("samples", "shutter", "INTEGER"),
+    ("samples", "rate_pct_min", "REAL"),
 )
 
 

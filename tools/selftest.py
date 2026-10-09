@@ -72,9 +72,9 @@ def test_pump(port: str) -> None:
         identity = pump.identify()
         check("identify() returns fields", bool(identity), str(identity))
         check("ElecName is TC600", identity.get("ElecName") == "TC600")
-        check("NominalSpd is 1000 Hz", identity.get("NominalSpd") == 1000)
+        check("NominalSpd is 1500 Hz", identity.get("NominalSpd") == 1500)
         check("DrvVoltage decodes as u_real",
-              pump.read("DrvVoltage") == 48.0, f"{pump.read('DrvVoltage')} V")
+              pump.read("DrvVoltage") == 23.25, f"{pump.read('DrvVoltage')} V")
         check("lookup by number works", pump.read(311) == pump.read("OpHrsPump"))
 
         status = pump.status()
@@ -494,6 +494,258 @@ def test_database() -> None:
         database.close()
 
 
+def test_history_and_charts() -> None:
+    """The chart recorder, the decimation behind every chart, and the data
+    the new charts depend on."""
+    print("\nHistory, decimation and chart data")
+    from lab import history, process, trends
+
+    # --- decimation must keep the spike that tripped the pump --------------
+    # Run 25 (2026-10-08): two samples at 5.9e-2 and 1.6e-1 mbar in an hour
+    # of 1e-4. A stride of every Nth row steps straight over them.
+    count = 10_000
+    pressures = [1.0e-4] * count
+    pressures[5000], pressures[5001] = 5.9e-2, 1.6e-1
+    speeds = [1500.0] * count
+    speeds[5002] = 1171.0
+    keep = history.decimate(count, 300, [pressures, speeds])
+    check("decimation keeps a two-sample pressure spike",
+          5000 in keep and 5001 in keep)
+    check("decimation keeps a one-sample dip in rotor speed", 5002 in keep)
+    check("decimation keeps the first and the newest row",
+          keep[0] == 0 and keep[-1] == count - 1)
+    check("decimation actually thins the data", len(keep) < 1000,
+          f"{len(keep)} of {count}")
+    check("decimated indices stay in order", keep == sorted(set(keep)))
+    check("short series pass through untouched",
+          history.decimate(5, 300, [[1, 2, 3, 4, 5]]) == [0, 1, 2, 3, 4])
+
+    # --- the recorder -------------------------------------------------------
+    class Gauge:
+        def best_pressure(self):
+            return 2.0e-5
+
+    class Devices:
+        def __init__(self):
+            self.n = 0
+
+        def sample_row(self):
+            self.n += 1
+            return {"p1": 2.0e-5, "p1_status": 0, "speed": 1500.0 + self.n,
+                    "power": 12.0, "current": 0.52}
+
+        def __contains__(self, key):
+            return key == "gauge"
+
+        def get(self, key):
+            return Gauge()
+
+    recorder = history.History(Devices(), process.ProcessHardware(),
+                               interval=2.0, span_s=20.0)
+    base = 1_000_000.0
+    for step in range(30):
+        recorder.record(now=base + step * 2.0)
+    check("the recorder is bounded by its span", len(recorder) == 11,
+          f"{len(recorder)} rows kept of 30 recorded")
+    window = recorder.window(seconds=None, points=1500)
+    fields = window["fields"]
+    check("history rows carry the run-sample columns",
+          {"p_best", "speed", "power", "gas_sccm", "shutter"} <= set(fields))
+    row = dict(zip(fields, window["rows"][-1]))
+    check("history rows carry the best pressure", row["p_best"] == 2.0e-5)
+    newer = recorder.window(since=base + 54.0)
+    check("asking with `since` returns only newer rows",
+          [r[0] for r in newer["rows"]] == [base + 56.0, base + 58.0])
+
+    # --- process hardware as sample columns ---------------------------------
+    hardware = process.ProcessHardware()
+    check("nothing asked for, nothing recorded",
+          hardware.sample_fields() == {"gas_sccm": None, "gate_pct": None,
+                                       "magnetron_w": None, "shutter": None})
+    try:
+        hardware.gas.set(20)
+    except process.OperatorRequired:
+        pass
+    check("a manual step is not recorded until it is confirmed",
+          hardware.sample_fields()["gas_sccm"] is None)
+    hardware.gas.confirm()
+    check("a confirmed manual step is recorded",
+          hardware.sample_fields()["gas_sccm"] == 20.0)
+    try:
+        hardware.shutter.set(True)
+    except process.OperatorRequired:
+        pass
+    hardware.shutter.confirm()
+    check("the shutter records as 1 when open",
+          hardware.sample_fields()["shutter"] == 1)
+
+    # --- the base-pressure judgement must not be fooled by a dragged rotor -
+    # Run 26: the pressure sat flat at 3.4e-2 mbar with the rotor held at
+    # 1160 Hz of 1500 by the gas load, and the run called that "base
+    # pressure" twelve minutes before the pump tripped on over-temperature.
+    class Nominal(_QuietEngine):
+        def nominal_speed(self):
+            return 1500.0
+
+    engine = Nominal()
+    recipe = runs.BaseCalibration({"base_rate_pct": 2, "base_settle_min": 0.5})
+    recipe.begin(engine)
+    recipe.enter("basepressure")
+    outcomes = [recipe.phase_basepressure(engine, {
+        "t": 1000.0 + i * 2.0, "p_best": 3.36e-2, "speed": 1160.0})
+        for i in range(120)]
+    check("a flat pressure with the rotor dragged down is not base pressure",
+          all(o is None for o in outcomes))
+    outcomes = [recipe.phase_basepressure(engine, {
+        "t": 2000.0 + i * 2.0, "p_best": 4.0e-6, "speed": 1500.0})
+        for i in range(120)]
+    check("the same flat curve at full speed is base pressure",
+          "done" in outcomes)
+
+    # --- a rotor held down by gas ends the run before the drive trips -------
+    # Runs 25 and 26 spent minutes at the power limit, rotor sinking below
+    # the 1200 Hz switchpoint, until Err006 or over-temperature stopped them.
+    def dragged(recipe, start, seconds, speed=1160.0, motor=1):
+        for i in range(int(seconds / 2) + 1):
+            recipe.check_rotor(engine, {"t": start + i * 2.0, "speed": speed,
+                                        "motor": motor, "p_best": 3.3e-2})
+
+    recipe = runs.FullVacuum({})
+    recipe.begin(engine)
+    try:
+        dragged(recipe, 0.0, 300.0)
+        check("no rotor check before the rotor has reached full speed", True)
+    except runs.Abort:
+        check("no rotor check before the rotor has reached full speed", False)
+    recipe.full_speed_at = 100.0
+    try:
+        dragged(recipe, 200.0, 100.0, speed=1350.0)
+        check("a short dip below full speed is tolerated", True)
+    except runs.Abort:
+        check("a short dip below full speed is tolerated", False)
+    recipe.check_rotor(engine, {"t": 302.0, "speed": 1500.0, "motor": 1})
+    try:
+        dragged(recipe, 304.0, 300.0, motor=0)
+        check("a rotor coasting with its motor off is not 'held down'", True)
+    except runs.Abort:
+        check("a rotor coasting with its motor off is not 'held down'", False)
+    recipe.check_rotor(engine, {"t": 690.0, "speed": 1500.0, "motor": 1})
+    try:
+        # Run 25: Err006 came five seconds after 1200 Hz. Nearing the
+        # switchpoint must end the run on the spot, not after a dwell.
+        recipe.check_rotor(engine, {"t": 692.0, "speed": 1260.0, "motor": 1})
+        recipe.check_rotor(engine, {"t": 694.0, "speed": 1260.0, "motor": 1})
+        check("nearing the switchpoint ends the run at once", False)
+    except runs.Abort as abort:
+        check("nearing the switchpoint ends the run at once",
+              "switchpoint" in abort.reason, abort.reason[:60])
+    recipe.check_rotor(engine, {"t": 696.0, "speed": 1500.0, "motor": 1})
+    try:
+        dragged(recipe, 700.0, runs.VacuumSequence.DRAGGED_LIMIT_S + 10,
+                speed=1350.0)
+        check("two minutes held below full speed by gas ends the run", False)
+    except runs.Abort as abort:
+        check("two minutes held below full speed by gas ends the run",
+              "more gas than this pump can carry" in abort.reason,
+              abort.reason[:60])
+
+    # --- what the engine concluded is stored with the sample ----------------
+    class Marking(runs.Procedure):
+        name = "selftest_marking"
+        phases = ("running", "done")
+        interval = 0.05
+
+        def step(self, engine, sample):
+            sample["rate_pct_min"] = 1.25
+            return len(engine._samples) >= 3
+
+    with tempfile.TemporaryDirectory() as directory:
+        database = dbmod.Database(os.path.join(directory, "order.db"))
+        runs.CATALOGUE[Marking.name] = Marking
+        try:
+            engine = runs.RunEngine(database, registry.Registry())
+            started = engine.start(Marking.name, {})
+            deadline = time.monotonic() + 10
+            while engine.status()["running"] and time.monotonic() < deadline:
+                time.sleep(0.05)
+            stored = database.samples(started["run"]["id"])
+            check("a sample is stored after the procedure has seen it",
+                  stored and all(s.get("rate_pct_min") == 1.25 for s in stored),
+                  f"{[s.get('rate_pct_min') for s in stored]}")
+            check("a run's samples carry the process-hardware columns",
+                  stored and "gas_sccm" in stored[0] and "shutter" in stored[0])
+        finally:
+            del runs.CATALOGUE[Marking.name]
+            database.close()
+
+        # An existing database gains the new columns rather than failing the
+        # first insert on a column the code believes is there.
+        import sqlite3
+        old = os.path.join(directory, "old.db")
+        connection = sqlite3.connect(old)
+        connection.executescript(
+            "CREATE TABLE samples (id INTEGER PRIMARY KEY, run_id INTEGER, "
+            "t REAL, at REAL, phase TEXT, p1 REAL, p1_status INTEGER, p2 REAL, "
+            "p2_status INTEGER, speed REAL, set_speed REAL, current REAL, "
+            "voltage REAL, power REAL, tms_temp REAL, error_code TEXT, "
+            "station INTEGER, motor INTEGER);")
+        connection.close()
+        migrated = dbmod.Database(old)
+        columns = {row["name"] for row in
+                   migrated._db.execute("PRAGMA table_info(samples)")}
+        missing = set(dbmod.SAMPLE_COLUMNS) - columns
+        check("an older database gains every new sample column", not missing,
+              f"missing {sorted(missing)}" if missing else "")
+        migrated.close()
+
+    # --- health indicators measured from a run's curve ----------------------
+    curve = []
+    t = 0.0
+    for _ in range(10):                       # station on, motor off
+        curve.append({"t": t, "motor": 0, "speed": 0.0, "power": 0.0,
+                      "voltage": 23.25, "p_best": 0.5})
+        t += 2.0
+    speed = 0.0
+    while speed < 1500:                       # run-up at the power limit
+        speed = min(1500.0, speed + 15.0)
+        curve.append({"t": t, "motor": 1, "speed": speed, "power": 82.0,
+                      "voltage": 21.5, "p_best": 1e-3})
+        t += 2.0
+    for _ in range(20):                       # full speed, nothing to pump
+        curve.append({"t": t, "motor": 1, "speed": 1500.0, "power": 11.0,
+                      "voltage": 23.0, "p_best": 3e-5})
+        t += 2.0
+    for drag in range(30):                    # argon drags the rotor down
+        curve.append({"t": t, "motor": 1, "speed": 1450.0 - drag * 10,
+                      "power": 80.0, "voltage": 21.75, "p_best": 3.3e-2})
+        t += 2.0
+    found = trends.metrics(curve, 1500.0)
+    # Motor on at 15 Hz, +15 Hz per 2 s sample, 95 % of 1500 at 1425 Hz:
+    # 94 steps, 188 s.
+    check("run-up is timed from rest to full speed",
+          found["runup_s"] == 188.0, f"{found['runup_s']} s")
+    check("friction is the full-speed power with nothing to pump",
+          found["friction_w"] == 11.0, f"{found['friction_w']} W")
+    check("supply sag is idle voltage minus the lowest under load",
+          found["sag_v"] == 1.75, f"{found['sag_v']} V")
+    # The first three drag samples (1450, 1440, 1430 Hz) are still above
+    # 95 % of nominal; the other 27 are held down, 2 s each.
+    check("time held below full speed is counted",
+          found["held_s"] == 54.0, f"{found['held_s']} s")
+    check("a base pressure taken with the rotor dragged down is flagged",
+          trends.base_valid(curve, {"time_to_base_s": curve[-1]["t"]}, 1500.0)
+          is False)
+
+    # --- the pump simulator's power line ------------------------------------
+    check("simulated power line is 60 W at nominal speed (gas mode 0)",
+          fake_tc600.power_limit(1500, 1500) == 60.0)
+    check("simulated power line reaches 80 W at 1300 Hz",
+          abs(fake_tc600.power_limit(1300, 1500) - 80.0) < 1e-9)
+
+    check("the pump's ratings name their source",
+          pumpmod.RATINGS.get("source", "").startswith("PM 0504"))
+
+
 def wait_for_gauge(service, accept, timeout: float = 6.0) -> float | None:
     """Wait until the gauge sampler publishes a pressure `accept` likes."""
     deadline = time.monotonic() + timeout
@@ -821,6 +1073,150 @@ def check_guided_shutdown(engine, devices) -> None:
         runs.RunEngine.SHUTDOWN_POLL_S = poll
 
 
+def wait_until(predicate, timeout: float = 15.0, step: float = 0.3) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(step)
+    return predicate()
+
+
+def check_fault_handling(engine, devices, database) -> None:
+    """After a fault: motor off, fault cleared, forevacuum pump kept on.
+
+    The rig's real problem on 2026-10-08 was not only the Err006 itself but
+    what came after: a latched fault, and an automatic power-down that
+    switched the station off -- which stops the forevacuum pump and, with the
+    drive's factory venting setting, vents the chamber.
+    """
+    from lab import alarms
+
+    pump_service = devices.get("pump")
+    state = fake_tc600.STATE
+
+    check("Err006 is described as the run-up time error",
+          pumpmod.describe_error("Err006").get("title") == "Run-up time error")
+    check("no fault describes itself as none",
+          pumpmod.describe_error("000000").get("code") is None)
+
+    # --- the safe-state sequence itself ------------------------------------
+    pump_service.command("on", override=True)
+    pump_service.command("motor_on", override=True)
+    wait_until(lambda: (pump_service.snapshot().get("status", {})
+                        .get("ActualSpd") or 0) > 30)
+    state[303] = "Err006"                      # the drive faults
+    wait_until(lambda: pump_service.snapshot().get("fault", {}).get("code"))
+    check("the snapshot says what the fault means",
+          pump_service.snapshot().get("fault", {}).get("title")
+          == "Run-up time error")
+    result = pump_service.secure("selftest fault")
+    check("making safe switches the turbopump motor off",
+          state[23] is False, str(result.get("actions")))
+    check("making safe clears the fault", str(state[303]) == "000000")
+    check("making safe keeps the forevacuum pump (station) on",
+          state[10] is True)
+    check("making safe confirms what it did", result.get("ok") is True,
+          str(result.get("error")))
+
+    # --- the supervisor does it by itself ------------------------------------
+    supervisor = alarms.Supervisor(devices, engine, database, auto_recover=True)
+    supervisor.check()                         # learn the healthy state
+    pump_service.command("motor_on", override=True)
+    wait_until(lambda: (pump_service.snapshot().get("setpoints", {})
+                        .get("MotorPump")) is True)
+    supervisor.check()
+    state[303] = "Err006"
+    wait_until(lambda: pump_service.snapshot().get("fault", {}).get("code"))
+    supervisor.check()
+    raised = [a for a in supervisor.describe()["alarms"] if a["key"] == "pump_fault"]
+    check("a drive fault raises a critical alarm",
+          bool(raised) and raised[0]["level"] == "critical",
+          raised[0]["title"] if raised else "none")
+    recovered = wait_until(lambda: str(state[303]) == "000000"
+                           and state[23] is False and state[10] is True)
+    check("the supervisor makes the pump safe on its own", recovered,
+          f"motor {state[23]}, station {state[10]}, fault {state[303]}")
+    wait_until(lambda: (supervisor.recovering or {}).get("active") is False)
+    check("the recovery says what it did",
+          bool((supervisor.recovering or {}).get("actions")))
+    wait_until(lambda: not pump_service.snapshot().get("fault", {}).get("code"))
+    supervisor.check()
+    alarm = [a for a in supervisor.describe()["recent"] if a["key"] == "pump_fault"][0]
+    check("the alarm stays until acknowledged, though the fault has cleared",
+          alarm["active"] is False and alarm["acknowledged"] is False)
+    supervisor.acknowledge("all")
+    check("acknowledging clears the alarm bar",
+          not supervisor.describe()["alarms"])
+
+    # --- no automatic path switches the station off ---------------------------
+    class Watching(_QuietEngine):
+        def __init__(self):
+            self.powered_down = False
+
+        def shutdown_pump(self, reason: str = "") -> dict:
+            self.powered_down = True
+            return {"ok": True}
+
+    watcher = Watching()
+    recipe = runs.FullVacuum({})
+    recipe.begin(watcher)
+    recipe.finish(watcher)
+    check("a full-vacuum run ending on its own does not power the pump down",
+          watcher.powered_down is False)
+
+    # --- a pump-trouble abort makes the pump safe -----------------------------
+    class Overheating(runs.Procedure):
+        name = "selftest_overheat"
+        phases = ("running", "done")
+        interval = 0.1
+
+        def step(self, engine, sample):
+            raise runs.Abort("selftest over temperature", pump_trouble=True)
+
+    pump_service.command("motor_on", override=True)
+    wait_until(lambda: pump_service.snapshot().get("setpoints", {})
+               .get("MotorPump") is True)
+    runs.CATALOGUE[Overheating.name] = Overheating
+    try:
+        started = engine.start(Overheating.name, {})
+        check("the pump-trouble test run starts", started.get("ok") is True,
+              str(started.get("error")))
+        wait_until(lambda: not engine.status()["running"])
+        wait_until(lambda: (engine.status().get("secure") or {}).get("active")
+                   is False)
+        secured = engine.status().get("secure") or {}
+        check("a pump-trouble abort makes the pump safe afterwards",
+              secured.get("ok") is True and state[23] is False
+              and state[10] is True,
+              f"motor {state[23]}, station {state[10]}")
+        last = engine.status().get("last") or {}
+        check("the ended run is kept for the panel to show",
+              last.get("status") == "aborted" and last.get("pump_trouble") is True)
+    finally:
+        del runs.CATALOGUE[Overheating.name]
+
+    # --- no new run while a power-down is still bringing the rotor to rest ----
+    blocker = threading.Thread(target=time.sleep, args=(1.0,), daemon=True)
+    blocker.start()
+    engine._shutdown_thread = blocker
+    refused = engine.start("hold", {"duration_min": 0.05})
+    check("no new run starts while a power-down is still running",
+          refused.get("ok") is False and "powered down" in refused.get("error", ""),
+          refused.get("error", "")[:50])
+    blocker.join()
+
+    # --- the drive's protective settings, on demand ----------------------------
+    found = pump_service.diagnostics()
+    check("diagnostics read the run-up time limit",
+          found.get("values", {}).get("RUTimeSVal") == 15)
+    check("diagnostics read the speed switchpoint",
+          found.get("values", {}).get("SpdSwPt") == 80)
+
+    # Leave the simulated pump at rest for the tests that follow.
+    pump_service.command("motor_off", override=True)
+
+
 def test_run_engine(pump_port: str, gauge_port: str) -> None:
     print("\nRun engine, both instruments attached")
     with tempfile.TemporaryDirectory() as directory:
@@ -849,6 +1245,7 @@ def test_run_engine(pump_port: str, gauge_port: str) -> None:
             check_phase_timeouts()
             check_full_vacuum()
             check_guided_shutdown(engine, devices)
+            check_fault_handling(engine, devices, database)
 
             check("unknown procedure refused",
                   engine.start("nonsense", {})["ok"] is False)
@@ -890,6 +1287,63 @@ def test_run_engine(pump_port: str, gauge_port: str) -> None:
             database.close()
 
 
+def test_discovery(pump_port: str, gauge_port: str) -> None:
+    """Finding the instruments by asking: no port is assumed.
+
+    Runs after every service has let go of the simulators' ports -- a probe
+    is a second client on a port, and one owner per port is the rule.
+    """
+    print("\nFinding the instruments")
+    from lab import discovery
+
+    found = discovery.probe_tc600(pump_port)
+    check("the TC 600 probe recognises the pump",
+          found is not None and found["identity"].get("ElecName") == "TC600",
+          found["says"] if found else "nothing answered")
+    check("the TC 600 probe does not mistake the gauge for a pump",
+          discovery.probe_tc600(gauge_port) is None)
+    found = discovery.probe_tpg(gauge_port)
+    check("the TPG probe recognises the gauge and its baud rate",
+          found is not None and found["baudrate"] == 9600,
+          found["says"] if found else "nothing answered")
+    check("the TPG probe does not mistake the pump for a gauge",
+          discovery.probe_tpg(pump_port) is None)
+
+    tried: list = []
+    found = discovery.find("tc600", ["/dev/does-not-exist", gauge_port, pump_port],
+                           tried=tried)
+    check("a search finds the pump on whichever port it is",
+          found is not None and found["device"] == os.path.realpath(pump_port))
+    check("the search reports what each port said",
+          [t["answered"] for t in tried] == [False, True], str(tried))
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "ports.json")
+        discovery.PortMemory(path).remember("tc600", pump_port, "BG03FP5F")
+        memory = discovery.PortMemory(path)
+        check("the adapter that carried an instrument is remembered",
+              memory.preferred("tc600", [{"device": "/dev/ttyUSB7",
+                                          "serial_number": "BG03FP5F"}])[0]
+              == "/dev/ttyUSB7")
+
+        # A service started on a dead port finds its instrument by itself.
+        devices = registry.Registry()
+        service = devices.add(pumpmod.PumpService("pump", "/dev/no-such-port"))
+        service.SEARCH_AFTER_S = 0.5
+        service.SEARCH_EVERY_S = 1.0
+        service.finder = discovery.Finder(devices, memory, enabled=True)
+        try:
+            moved = wait_until(lambda: service.snapshot().get("connected"), 30)
+            check("a silent instrument is found on another port and reconnected",
+                  moved and os.path.realpath(service.port)
+                  == os.path.realpath(pump_port),
+                  f"now on {service.port}")
+            check("the move is recorded for the alarm",
+                  (service.moved or {}).get("from") == "/dev/no-such-port")
+        finally:
+            devices.close()
+
+
 def main() -> int:
     pump_master, pump_slave = os.openpty()
     gauge_master, gauge_slave = os.openpty()
@@ -911,7 +1365,9 @@ def main() -> int:
         test_process()
         test_deposition_engine()
         test_database()
+        test_history_and_charts()
         test_run_engine(pump_port, gauge_port)
+        test_discovery(pump_port, gauge_port)
     finally:
         stop.set()
         for thread in threads:

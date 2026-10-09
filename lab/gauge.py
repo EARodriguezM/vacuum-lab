@@ -44,6 +44,7 @@ class GaugeService(DeviceService):
     kind = "tpg"
     label = "TPG gauge controller"
     interval = 1.0          # cheap to read, and the curve wants resolution
+    probe_kind = "tpg"
 
     def __init__(self, key: str, port: str, baudrate: int | None = None,
                  channels: int = 2, timeout: float = 0.8, **options):
