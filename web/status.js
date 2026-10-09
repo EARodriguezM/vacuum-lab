@@ -143,6 +143,19 @@ export function gaugeSummary(gauge) {
   const valid = readings.filter((r) => r.valid);
   if (!valid.length) {
     const reasons = readings.map((r) => `channel ${r.channel}: ${r.status_text}`);
+    // Overrange is what this rig's only gauge says whenever the chamber is
+    // at or near atmosphere -- vented, or before roughing starts. That is
+    // the normal idle state, not a fault, and must not read like one.
+    if (readings.some((r) => r.status === 2)) {
+      return {
+        tone: "idle",
+        headline: "Chamber at atmosphere",
+        detail: "The gauge reads above its range, as it does with the chamber "
+          + "vented or before roughing has started. It shows a number again "
+          + "once the backing pump has taken the chamber below about 1000 mbar.",
+        atmosphere: true,
+      };
+    }
     return {
       tone: "warn",
       headline: "No usable pressure reading",

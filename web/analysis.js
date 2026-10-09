@@ -387,3 +387,48 @@ export function pressureNoise(samples, seconds = 300) {
   const variance = residuals.reduce((a, r) => a + r * r, 0) / residuals.length;
   return (10 ** Math.sqrt(variance) - 1) * 100;
 }
+
+// --- estimates for the dashboard ----------------------------------------------
+
+/**
+ * Seconds until the pressure reaches `target`, at its recent fractional rate.
+ *
+ * A pump-down is close to exponential over a minute or two, so ln(p) falls
+ * linearly and the time to a lower pressure is ln(p / target) over the rate.
+ * Null when the pressure is not falling, or already there. An estimate --
+ * the dashboard says "about".
+ */
+export function etaToPressure(samples, target, windowS = 60) {
+  const recent = samples.slice(-Math.max(10, Math.ceil(windowS / 2) + 5));
+  const rates = fractionalRate(recent, windowS);
+  const last = [...rates].reverse().find((r) => finite(r.rate));
+  const pressure = [...recent].reverse().find((s) => finite(s.p_best) && s.p_best > 0)?.p_best;
+  if (!last || !finite(pressure) || !(target > 0) || last.rate >= -0.01) return null;
+  if (pressure <= target) return 0;
+  const perSecond = -last.rate / 100 / 60;
+  return Math.log(pressure / target) / perSecond;
+}
+
+/** Rotor acceleration over the last `windowS` seconds, Hz per second. */
+export function speedSlope(samples, windowS = 20) {
+  const end = samples.length ? samples[samples.length - 1].t : null;
+  if (end === null) return null;
+  const fit = linearFit(samples.filter((s) => s.t >= end - windowS && finite(s.speed))
+    .map((s) => [s.t, s.speed]));
+  return fit ? fit.slope : null;
+}
+
+/** Seconds until the rotor reaches `target` Hz at its current acceleration. */
+export function etaToSpeed(samples, target, windowS = 20) {
+  const slope = speedSlope(samples, windowS);
+  const speed = [...samples].reverse().find((s) => finite(s.speed))?.speed;
+  if (!finite(slope) || slope <= 0.5 || !finite(speed)) return null;
+  return speed >= target ? 0 : (target - speed) / slope;
+}
+
+/** The latest fractional rate of change, %/min, or null. */
+export function latestRate(samples, windowS = 120) {
+  const rates = fractionalRate(samples.slice(-400), windowS);
+  for (let i = rates.length - 1; i >= 0; i--) if (finite(rates[i].rate)) return rates[i].rate;
+  return null;
+}

@@ -23,7 +23,7 @@ const VACUUM_SEQUENCES = new Set(["deposition", "base_calibration", "full_vacuum
 const PROCESS_PHASES = new Set(["backfill", "presputter", "deposit", "recover"]);
 
 /** Pressure limits a procedure was configured with, as chart references. */
-function pressureRefs(procedure, config, pump) {
+export function pressureRefs(procedure, config, pump) {
   const refs = [];
   const limit = pump?.interlocks?.motor_on?.limit_mbar;
   if (VACUUM_SEQUENCES.has(procedure)) {
@@ -72,7 +72,7 @@ function panelsFor(procedure, samples) {
 /** The procedure catalogue, fetched once: its field defaults are the values
  *  the engine used for anything a run's config left out. */
 let catalogue = null;
-function useCatalogue() {
+export function useCatalogue() {
   const [value, setValue] = useState(catalogue);
   useEffect(() => {
     if (catalogue) return;
@@ -93,7 +93,7 @@ function useCatalogue() {
  * can draw the setpoint and the ceiling for a run started with an empty
  * config (run 21 was).
  */
-function effectiveConfig(procedure, config, procedures) {
+export function effectiveConfig(procedure, config, procedures) {
   const defaults = {};
   for (const field of procedures.find((p) => p.name === procedure)?.fields || []) {
     defaults[field.key] = field.default;

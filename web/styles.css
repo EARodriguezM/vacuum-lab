@@ -465,3 +465,141 @@ button.tiny { font-size:11.5px; padding:2px 8px; min-height:24px; }
 .alarm-log .entry { display:grid; grid-template-columns:auto auto 1fr; gap:4px 10px;
                     align-items:baseline; padding:6px 0; border-bottom:1px solid var(--rule);
                     font-size:13px; }
+
+/* ---------- dashboard v2 ----------
+ * Laid out by the questions asked at the wall: what is it doing, what is
+ * next, the key numbers, where on the vacuum scale, the curves, is it
+ * healthy, what happened. Status colours always come with a mark and a word;
+ * a meter's track is a lighter step of its own fill. */
+.dash-side { display:flex; flex-direction:column; align-items:flex-end; gap:6px; }
+.dash-clock { font-size:clamp(20px,2.6vw,28px); font-weight:640; letter-spacing:-.01em; }
+.dash-tools { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
+.panel > header { flex-wrap:wrap; }
+.panel-actions { margin-left:auto; }
+
+.guide { gap:12px; }
+.guide-head { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-start; }
+.guide-kicker { font-size:13px; text-transform:uppercase; letter-spacing:.06em;
+                color:var(--ink-faint); font-weight:650; }
+.guide-title { font-size:clamp(18px,2.4vw,23px); font-weight:640; margin-top:2px; }
+.guide-time { display:flex; flex-direction:column; align-items:flex-end; }
+.guide-time .num { font-size:22px; font-weight:640; }
+.guide-label { font-size:13px; font-weight:650; color:var(--ink-soft); margin-bottom:4px; }
+.guide-next { font-size:16px; line-height:1.45; }
+.guide-now { display:grid; gap:14px 24px; grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+             border-top:1px solid var(--rule); padding-top:12px; }
+.guide-prompt { background:var(--warn-bg); border:2px solid var(--warn); border-radius:10px;
+                padding:12px 14px; font-size:16px; display:flex; gap:10px; flex-wrap:wrap;
+                align-items:center; }
+.guide-last { border-radius:9px; padding:9px 12px; font-size:14px; border:1px solid var(--rule);
+              background:var(--sunk); display:flex; gap:6px; flex-wrap:wrap; align-items:baseline; }
+.guide-last.good { border-left:4px solid var(--good); }
+.guide-last.warn { border-left:4px solid var(--warn); }
+.guide-last.crit { border-left:4px solid var(--crit); }
+.guide-actions { display:flex; gap:8px; flex-wrap:wrap; }
+.btn.primary { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
+.btn.primary:hover { color:var(--accent-ink); filter:brightness(1.08); }
+.bar.big { height:10px; margin-top:8px; }
+
+.stepper { list-style:none; margin:0; padding:0; display:flex; gap:4px; flex-wrap:wrap; }
+.stepper li { display:flex; align-items:center; gap:6px; padding:5px 10px 5px 6px;
+              border:1px solid var(--rule); border-radius:999px; font-size:13.5px;
+              color:var(--ink-faint); background:var(--card); }
+.stepper .step-mark { width:20px; height:20px; border-radius:50%; display:inline-flex;
+                      align-items:center; justify-content:center; font-size:11.5px; font-weight:700;
+                      background:var(--sunk); color:var(--ink-soft); }
+.stepper li.done { color:var(--good); border-color:var(--good); }
+.stepper li.done .step-mark { background:var(--good-bg); color:var(--good); }
+.stepper li.now { color:var(--accent-ink); background:var(--accent); border-color:var(--accent);
+                  font-weight:650; }
+.stepper li.now .step-mark { background:var(--accent-ink); color:var(--accent); }
+.stepper li.next { border-style:dashed; border-color:var(--accent); color:var(--ink-soft); }
+
+.dash-grid.four { grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); }
+.warn-text { color:var(--warn); font-weight:600; }
+.feed-text { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+             overflow:hidden; }
+.stat-value.small-value { font-size:clamp(24px,3.4vw,32px); }
+.explain { margin:2px 0 0; font-size:13px; line-height:1.45; color:var(--ink-soft);
+           border-left:3px solid var(--accent-soft); padding-left:8px; }
+
+.meter { display:flex; flex-direction:column; gap:3px; margin-top:4px; }
+.meter-track { position:relative; height:8px; border-radius:999px; background:var(--accent-soft); }
+.meter-fill { position:absolute; left:0; top:0; bottom:0; border-radius:999px; background:var(--accent); }
+.meter-fill.good { background:var(--good); }
+.meter-fill.warn { background:var(--warn); }
+.meter-fill.crit { background:var(--crit); }
+.meter-tick { position:absolute; top:-3px; bottom:-3px; width:2px; margin-left:-1px;
+              background:var(--ink-soft); }
+.meter-labels { position:relative; height:14px; font-size:11.5px; color:var(--ink-faint); }
+.meter-labels span { position:absolute; transform:translateX(-50%); white-space:nowrap; }
+
+.process-list { display:grid; grid-template-columns:auto 1fr; gap:3px 12px; margin:0; font-size:15px; }
+.process-list dt { color:var(--ink-faint); }
+.process-list dd { margin:0; text-align:right; font-weight:600; }
+
+/* The vacuum scale: atmosphere on the left, UHV on the right -- the way a
+   pump-down travels. Regimes are one neutral ramp (ordinal), the landmarks
+   are dashed (written-down limits), the pointer is the accent. */
+.vscale { position:relative; padding:4px 0 0; }
+.vscale-marks { position:relative; }
+.vscale-mark { position:absolute; display:flex; justify-content:center; }
+.vscale-mark span { display:block; white-space:nowrap; font-size:12px; color:var(--ink-soft);
+                    background:var(--card); padding:0 4px; line-height:18px; }
+.vscale-mark b { font-weight:650; }
+.vscale-mark.badge span { width:18px; height:18px; padding:0; border-radius:50%;
+                          text-align:center; font-weight:700; font-size:11px;
+                          color:var(--ink); border:1.5px dashed var(--ink-faint); }
+.vscale-bar { position:relative; height:46px; border-radius:8px; overflow:visible; }
+.vscale-regime { position:absolute; top:0; bottom:0; display:flex; align-items:center;
+                 justify-content:center; font-size:12.5px; color:var(--ink-soft);
+                 border-right:1px solid var(--card); overflow:hidden; }
+.vscale-regime span { white-space:nowrap; }
+.vscale-regime.shade-1 { background:color-mix(in srgb, var(--ink) 5%, transparent); border-radius:8px 0 0 8px; }
+.vscale-regime.shade-2 { background:color-mix(in srgb, var(--ink) 9%, transparent); }
+.vscale-regime.shade-3 { background:color-mix(in srgb, var(--ink) 13%, transparent); }
+.vscale-regime.shade-4 { background:color-mix(in srgb, var(--ink) 18%, transparent); border-radius:0 8px 8px 0; }
+.vscale-line { position:absolute; top:-6px; bottom:-2px; width:0; border-left:1.5px dashed var(--ink-faint); }
+.vscale-now { position:absolute; top:-10px; bottom:-10px; width:4px; margin-left:-2px;
+              background:var(--accent); border-radius:2px; box-shadow:0 0 0 2px var(--card); }
+.vscale-ticks { position:relative; height:56px; margin-top:12px; }
+.vscale-now-label { position:absolute; top:0; white-space:nowrap; font-size:14px; font-weight:700;
+                    color:var(--ink); background:var(--accent-soft); border:1px solid var(--accent);
+                    border-radius:6px; padding:1px 8px; }
+.vscale-tick { position:absolute; top:34px; transform:translateX(-50%); font-size:11.5px;
+               white-space:nowrap; color:var(--ink-faint); font-variant-numeric:tabular-nums; }
+.vscale-tick.first { transform:none; }
+.vscale-tick.last { transform:translateX(-100%); }
+.vscale-key { list-style:none; margin:2px 0 10px; padding:0; display:flex; flex-direction:column;
+              gap:4px; font-size:13.5px; color:var(--ink-soft); }
+.vscale-key li { display:flex; align-items:baseline; gap:8px; }
+.vscale-key b { color:var(--ink); font-weight:650; margin-left:auto; white-space:nowrap; }
+.vscale-key-number { flex:none; width:18px; height:18px; border-radius:50%; text-align:center;
+                     font-size:11px; font-weight:700; line-height:15px; color:var(--ink);
+                     border:1.5px dashed var(--ink-faint); align-self:center; }
+
+.health { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; }
+.health-item { display:grid; grid-template-columns:24px minmax(110px,auto) 1fr; gap:8px;
+               align-items:baseline; padding:7px 0; border-bottom:1px solid var(--rule); font-size:14.5px; }
+.health-mark { width:20px; height:20px; border-radius:50%; display:inline-flex; align-items:center;
+               justify-content:center; font-size:12px; font-weight:800; align-self:center;
+               background:var(--idle-bg); color:var(--idle); }
+.health-item.good .health-mark { background:var(--good-bg); color:var(--good); }
+.health-item.warn .health-mark { background:var(--warn-bg); color:var(--warn); }
+.health-item.crit .health-mark { background:var(--crit-bg); color:var(--crit); }
+.health-label { color:var(--ink-soft); }
+.health-value { font-weight:560; }
+.health-hint { color:var(--ink-faint); font-weight:450; font-size:13px; }
+
+.feed { list-style:none; margin:0 0 10px; padding:0; display:flex; flex-direction:column; }
+.feed li { display:grid; grid-template-columns:auto 1fr; gap:10px; padding:6px 0;
+           border-bottom:1px solid var(--rule); font-size:13.5px; align-items:baseline; }
+.feed li.error { color:var(--crit); }
+.feed li.warning { color:var(--warn); }
+.runs-mini tbody tr { cursor:pointer; }
+.runs-mini td { font-size:13.5px; }
+
+/* Full screen on a lab monitor: use the whole width, and the type grows. */
+body.wall .wrap { max-width:none; padding:18px 28px; }
+body.wall .dashboard { font-size:17px; }
+body.wall .stat-value { font-size:clamp(40px,4.4vw,64px); }
