@@ -332,7 +332,7 @@ function Guide({ state, samples, config, explain }) {
         the way.</p>`}
       <div class="guide-actions">
         <a class="btn primary" href="#tests">Start a run — Process tab</a>
-        <a class="btn" href="#pump">Drive the pump by hand — Pump tab</a>
+        <a class="btn" href="#equipment/pump">Drive the pump by hand — Equipment tab</a>
       </div>
     </section>`;
 }

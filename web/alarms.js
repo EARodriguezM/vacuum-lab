@@ -70,13 +70,23 @@ export function AlarmBar({ alarms, onAcknowledge, busy }) {
 // --- sound and title ----------------------------------------------------------
 
 let audio = null;
+let quiet = null;
 
-/** Browsers only allow sound after a user gesture: unlock on the first one. */
+/**
+ * Browsers only allow sound after a user gesture: unlock on the first one.
+ *
+ * The context is suspended as soon as it exists, and again after every beep.
+ * A running AudioContext renders silence without pause, and on the kiosk
+ * tablet -- which taps itself once after every load to unlock sound -- that
+ * silence was most of the panel's CPU: 0.39 of a core on an idle dashboard
+ * against 0.01 for a blank page (measured 2026-10-10).
+ */
 function unlockAudio() {
   if (audio || typeof window === "undefined") return;
   const Context = window.AudioContext || window.webkitAudioContext;
   if (!Context) return;
   audio = new Context();
+  audio.suspend().catch(() => {});
 }
 if (typeof window !== "undefined") {
   window.addEventListener("pointerdown", unlockAudio, { once: true });
@@ -84,21 +94,29 @@ if (typeof window !== "undefined") {
 }
 
 /** Two short tones: distinct from anything a browser plays by itself. */
-function beep() {
-  if (!audio) return;
-  if (audio.state === "suspended") audio.resume().catch(() => {});
-  const now = audio.currentTime;
-  [[880, 0], [660, 0.22]].forEach(([frequency, offset]) => {
-    const oscillator = audio.createOscillator();
-    const gain = audio.createGain();
-    oscillator.frequency.value = frequency;
-    gain.gain.setValueAtTime(0.0001, now + offset);
-    gain.gain.exponentialRampToValueAtTime(0.25, now + offset + 0.02);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.18);
-    oscillator.connect(gain).connect(audio.destination);
-    oscillator.start(now + offset);
-    oscillator.stop(now + offset + 0.2);
-  });
+export function beep() {
+  if (!audio) return false;
+  clearTimeout(quiet);
+  const play = () => {
+    const now = audio.currentTime;
+    [[880, 0], [660, 0.22]].forEach(([frequency, offset]) => {
+      const oscillator = audio.createOscillator();
+      const gain = audio.createGain();
+      oscillator.frequency.value = frequency;
+      gain.gain.setValueAtTime(0.0001, now + offset);
+      gain.gain.exponentialRampToValueAtTime(0.25, now + offset + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.18);
+      oscillator.connect(gain).connect(audio.destination);
+      oscillator.start(now + offset);
+      oscillator.stop(now + offset + 0.2);
+    });
+    // Back to silence once both tones have played.
+    quiet = setTimeout(() => audio.suspend().catch(() => {}), 1000);
+  };
+  // Always through resume(): it queues behind a suspend still in flight --
+  // the one unlockAudio sends when the same tap both unlocks and beeps.
+  audio.resume().then(play, () => {});
+  return true;
 }
 
 /**

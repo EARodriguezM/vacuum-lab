@@ -16,7 +16,7 @@
 import { html } from "./html.js";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { ChartPanel, DataTable, Legend, Plot } from "./chart.js";
-import { api } from "./api.js";
+import { api, joinPoll } from "./api.js";
 import * as A from "./analysis.js";
 import * as fmt from "./format.js";
 
@@ -55,48 +55,73 @@ export function useStored(key, fallback) {
  * then asks only for rows newer than the last one it holds -- one row per
  * poll -- so watching a day of history costs the same as watching a minute.
  * Long windows are reloaded once a minute to stay decimated.
+ *
+ * It has no clock of its own: after the first load it rides the panel's
+ * state poll (api.js joinPoll), so its rows and the instruments' state
+ * arrive in the same redraw instead of two redraws out of step -- and it
+ * stops when the poll stops, with the page hidden.
  */
 export function useHistory(seconds, points = 1500) {
   const [state, setState] = useState({ samples: [], loading: true, error: null,
                                        now: null, oldest: null, interval: 2 });
   useEffect(() => {
     let cancelled = false;
-    let timer = null;
     let samples = [];
     let newest = null;
     let lastFull = 0;
+    let pending = null;
 
-    const tick = async () => {
-      try {
-        const reload = newest === null
-          || (seconds >= 6 * 3600 && Date.now() - lastFull > 60000);
-        const payload = reload
-          ? await api.history(seconds, points)
-          : await api.history(seconds, 2000, newest);
-        if (!payload.ok) throw new Error(payload.error || "no history on this server");
-        const rows = A.historySamples(payload);
-        if (reload) {
-          samples = rows;
-          lastFull = Date.now();
-        } else if (rows.length) {
-          samples = samples.concat(rows);
-        }
-        if (rows.length) newest = rows[rows.length - 1].at;
-        else if (newest === null) newest = payload.server_time;
-        const now = payload.server_time ?? Date.now() / 1000;
-        samples = samples.filter((s) => s.t >= now - seconds);
-        if (!cancelled) {
-          setState({ samples, loading: false, error: null, now,
-                     oldest: payload.oldest, interval: payload.interval_s || 2 });
-        }
-      } catch (problem) {
-        if (!cancelled) setState((s) => ({ ...s, loading: false, error: problem.message }));
-      } finally {
-        if (!cancelled) timer = setTimeout(tick, 2000);
-      }
+    const load = async () => {
+      const reload = newest === null
+        || (seconds >= 6 * 3600 && Date.now() - lastFull > 60000);
+      const payload = reload
+        ? await api.history(seconds, points)
+        : await api.history(seconds, 2000, newest);
+      return { payload, reload };
     };
-    tick();
-    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+    // One request at a time: the first load and the first poll can overlap.
+    const fetch = () => {
+      if (pending) return Promise.resolve({ skip: true });
+      pending = load().finally(() => { pending = null; });
+      return pending;
+    };
+    const apply = (result) => {
+      if (cancelled || result.value?.skip) return;
+      if (result.status === "rejected") {
+        setState((s) => ({ ...s, loading: false,
+                           error: result.reason?.message || String(result.reason) }));
+        return;
+      }
+      const { payload, reload } = result.value;
+      if (!payload.ok) {
+        setState((s) => ({ ...s, loading: false,
+                           error: payload.error || "no history on this server" }));
+        return;
+      }
+      const rows = A.historySamples(payload);
+      const before = samples;
+      if (reload) {
+        samples = rows;
+        lastFull = Date.now();
+      } else if (rows.length) {
+        samples = samples.concat(rows);
+      }
+      if (rows.length) newest = rows[rows.length - 1].at;
+      else if (newest === null) newest = payload.server_time;
+      const now = payload.server_time ?? Date.now() / 1000;
+      const kept = samples.filter((s) => s.t >= now - seconds);
+      // Nothing new and nothing aged out: keep the same array, so nothing
+      // that depends on it redraws.
+      if (!reload && !rows.length && kept.length === before.length) return;
+      samples = kept;
+      setState({ samples, loading: false, error: null, now,
+                 oldest: payload.oldest, interval: payload.interval_s || 2 });
+    };
+
+    fetch().then((value) => apply({ status: "fulfilled", value }),
+                 (reason) => apply({ status: "rejected", reason }));
+    const leave = joinPoll({ fetch, apply });
+    return () => { cancelled = true; leave(); };
   }, [seconds, points]);
   return state;
 }

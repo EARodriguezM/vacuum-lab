@@ -16,7 +16,7 @@ function RunBanner({ run, onStop, onOpen }) {
       hint=${`${run.label} · started ${fmt.dateTime(run.run?.started_at)}`}
       actions=${html`
         <button class="small" onClick=${onOpen}>Open</button>
-        <button class="small danger" onClick=${onStop}>Stop run</button>`}>
+        ${onStop && html`<button class="small danger" onClick=${onStop}>Stop run</button>`}`}>
       <div class="phases">
         ${phases.map((phase, position) => html`
           <span class=${`step${phase === run.phase ? " now"

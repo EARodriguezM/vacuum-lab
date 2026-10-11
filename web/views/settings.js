@@ -1,9 +1,16 @@
-// Where the panel points, how often it polls, and what the server is running.
+// Accounts, where the panel points, how often it polls, what is on the rig,
+// and what the server is running.
+//
+// What changes the rig's set-up -- equipment, ports, the port search -- is an
+// admin's (lab/api.py POST_RULES); for everyone else those controls are
+// shown, so the set-up can be read, but greyed out.
 
 import { html } from "../html.js";
 import { useEffect, useState } from "preact/hooks";
 import { Banner, Card, Empty, Pairs, Pill } from "../ui.js";
 import { api, normaliseHost, settings, updateSettings } from "../api.js";
+import { MyAccount, People, Tablets } from "./people.js";
+import { beep } from "../alarms.js";
 import * as fmt from "../format.js";
 
 /**
@@ -14,7 +21,7 @@ import * as fmt from "../format.js";
  * adapter does not matter: the instrument is found wherever it answers, and
  * an instrument that goes quiet is looked for on the other ports.
  */
-function AutoPorts({ state, notify }) {
+function AutoPorts({ state, notify, admin = true }) {
   const [survey, setSurvey] = useState(null);
   const [surveying, setSurveying] = useState(false);
   const ports = state?.ports || {};
@@ -53,12 +60,12 @@ function AutoPorts({ state, notify }) {
     <${Card} title="Finding the instruments"
       hint="Each instrument is found by asking every serial port what is on it — a read of the TC 600's type, the TPG's firmware query; nothing is written — so a replugged or replaced USB adapter does not matter. An instrument that stops answering for 10 s is looked for on the other ports, at most once a minute. A port one of the instruments is using is never probed."
       actions=${html`
-        <button class="small" disabled=${surveying} onClick=${detect}>
+        <button class="small" disabled=${surveying || !admin} onClick=${detect}>
           ${surveying ? "Asking every port…" : "Detect instruments now"}</button>`}>
       <div class="row">
         <span class=${`pill ${ports.search ? "good" : "idle"}`}><span class="dot" />
           automatic search ${ports.search ? "on" : "off"}</span>
-        <button class="small ghost" onClick=${toggle}>
+        <button class="small ghost" disabled=${!admin} onClick=${toggle}>
           ${ports.search ? "Switch off — keep the ports fixed" : "Switch on"}</button>
       </div>
       <div class="scroll-x">
@@ -112,7 +119,7 @@ function AutoPorts({ state, notify }) {
  * needs something not installed is switched off -- listed on the Process tab
  * with what it is waiting for, and refused by the server.
  */
-function RigEquipment({ state, notify }) {
+function RigEquipment({ state, notify, admin = true }) {
   const [rows, setRows] = useState(null);
   const [busy, setBusy] = useState("");
   const unavailable = state?.unavailable || {};
@@ -158,7 +165,9 @@ function RigEquipment({ state, notify }) {
                     ${row.driven ? "installed, software-driven" : row.installed ? "installed" : "not installed"}<//></td>
                   <td class="wrap-cell small">${row.used_by.length ? row.used_by.join(", ") : "—"}</td>
                   <td>${!row.driven && html`
-                    <button class="small" disabled=${busy === row.key} onClick=${() => toggle(row)}>
+                    <button class="small" disabled=${busy === row.key || !admin}
+                            title=${admin ? "" : "Marking equipment is an admin's"}
+                            onClick=${() => toggle(row)}>
                       ${row.installed ? "Mark not installed" : "Mark installed"}</button>`}</td>
                 </tr>`)}
             </tbody>
@@ -177,7 +186,7 @@ function RigEquipment({ state, notify }) {
  * rig: USB adapters renumber on replug, and the gauge had to be moved from a
  * USB adapter to an onboard UART before it would talk at all.
  */
-function PortPicker({ devices, notify, onChanged }) {
+function PortPicker({ devices, notify, onChanged, admin = true }) {
   const [kind, setKind] = useState("all");
   const [ports, setPorts] = useState([]);
   const [hidden, setHidden] = useState(0);
@@ -281,7 +290,7 @@ function PortPicker({ devices, notify, onChanged }) {
                 : device.error}
             </span>
           </label>
-          <button disabled=${applying === key
+          <button disabled=${applying === key || !admin
                     || !chosen[key] || chosen[key] === device.port}
                   onClick=${() => apply(key)}>
             ${applying === key ? "Switching…" : "Move to this port"}
@@ -290,7 +299,7 @@ function PortPicker({ devices, notify, onChanged }) {
     <//>`;
 }
 
-export function SettingsView({ state, onSettingsChanged, notify }) {
+export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
   const current = settings();
   const [draft, setDraft] = useState({ ...current });
   const [stats, setStats] = useState(null);
@@ -304,7 +313,6 @@ export function SettingsView({ state, onSettingsChanged, notify }) {
   const apply = () => {
     updateSettings({
       host: draft.host.trim(),
-      token: draft.token.trim(),
       pollMs: Math.max(500, Number(draft.pollMs) || 2000),
       theme: draft.theme,
       alarmSound: draft.alarmSound !== false,
@@ -314,9 +322,16 @@ export function SettingsView({ state, onSettingsChanged, notify }) {
   };
 
   const devices = state?.devices || {};
+  const me = state?.me;
+  const admin = !!me?.can?.admin;
 
   return html`
     <div class="grid" style="gap:16px">
+      <${MyAccount} me=${me} notify=${notify} onSignOut=${onSignOut}
+                    onChanged=${onSettingsChanged} />
+      <${People} me=${me} notify=${notify} />
+      <${Tablets} me=${me} notify=${notify} />
+
       <${Card} title="Connection"
                hint="Leave the address empty when this page is served by the lab PC itself. Fill it in to drive that machine from another one — the API sends permissive CORS headers so that works.">
         <label class="field">
@@ -328,12 +343,6 @@ export function SettingsView({ state, onSettingsChanged, notify }) {
               ? `Requests go to ${normaliseHost(draft.host)}`
               : "Requests go to this page's own origin."}
           </span>
-        </label>
-        <label class="field">
-          <span>Shared token</span>
-          <input type="password" value=${draft.token} placeholder="only if --token is set"
-                 onInput=${(e) => setDraft({ ...draft, token: e.target.value })} />
-          <span class="help">Sent as X-Token, and appended to download links.</span>
         </label>
         <div class="row">
           <label class="field">
@@ -363,16 +372,21 @@ export function SettingsView({ state, onSettingsChanged, notify }) {
               the page.</div></span>
         </label>
         <div class="row">
+          <button onClick=${() => { if (!beep()) notify("Tap the page once first: the browser only allows sound after a touch.", "error"); }}>
+            Test the alarm sound</button>
+          <span class="small muted">Plays the alarm's two tones on this device, to check its speaker.</span>
+        </div>
+        <div class="row">
           <button class="primary" onClick=${apply}>Save</button>
           <span class="small muted">Stored in this browser only.</span>
         </div>
       <//>
 
-      <${RigEquipment} state=${state} notify=${notify} />
+      <${RigEquipment} state=${state} notify=${notify} admin=${admin} />
 
-      <${AutoPorts} state=${state} notify=${notify} />
+      <${AutoPorts} state=${state} notify=${notify} admin=${admin} />
 
-      <${PortPicker} devices=${devices} notify=${notify}
+      <${PortPicker} devices=${devices} notify=${notify} admin=${admin}
                      onChanged=${onSettingsChanged} />
 
       <${Card} title="Instruments"
@@ -409,17 +423,18 @@ export function SettingsView({ state, onSettingsChanged, notify }) {
           <${Pairs} items=${[
             ["Service", ping?.service || "—"],
             ["Uptime", fmt.duration(state?.uptime_s)],
-            ["Authentication", ping
-              ? (ping.token_required ? "token required" : "open to anyone")
+            ["Chamber", ping?.chamber ? `${ping.chamber.name} (${ping.chamber.id})` : "—"],
+            ["Accounts", ping
+              ? (ping.auth?.enabled ? "everyone signs in" : "off — open to anyone")
               : "—"],
             ["Server time", fmt.dateTime(state?.server_time)],
           ]} />
           ${ping?.error && html`<${Banner} tone="crit">${ping.error}<//>`}
-          ${ping && ping.authenticated !== false && html`
-            <${Banner} tone="warn">
-              No token is set on the server. Anyone who can reach its port can
-              start and stop the pump. Restart it with
-              <span class="mono">--token</span> on a shared network.
+          ${ping && ping.auth && !ping.auth.enabled && html`
+            <${Banner} tone="crit">
+              Accounts are switched off on this server (<span class="mono">--no-auth</span>).
+              Anyone who can reach its port can start and stop the pump. That
+              is for the simulator on a laptop, never for the lab.
             <//>`}
         <//>
 

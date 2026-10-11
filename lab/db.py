@@ -9,6 +9,10 @@ Three tables carry a run: `runs` is the header and the computed result,
 interlock refusals, operator actions). Keeping the narrative separate from the
 curve means a run's log survives even when sampling was patchy.
 
+Four more hold the accounts (`users`, `roles`, `sessions`, `role_requests`).
+The rules about them live in lab/auth.py; this module only stores them. They
+never leave the machine: `snapshot` drops them from the downloadable copy.
+
 Concurrency: one connection guarded by a lock, in WAL mode. The alternative --
 a connection per thread -- buys nothing here, because the writers are a single
 run engine and the readers are short HTTP handlers, and it would cost the
@@ -24,7 +28,7 @@ import threading
 import time
 import uuid
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: Statuses a run can be in. `running` is the only one the engine writes live;
 #: everything else is terminal.
@@ -48,7 +52,14 @@ CREATE TABLE IF NOT EXISTS runs (
     started_at  REAL    NOT NULL,
     ended_at    REAL,
     result      TEXT,
-    created_at  REAL    NOT NULL
+    created_at  REAL    NOT NULL,
+    -- The account that started it. `operator` above is free text typed on
+    -- the form (a student running a run for somebody else); this is who was
+    -- signed in. NULL for runs recorded before accounts existed.
+    started_by  TEXT,
+    -- Which chamber recorded it, so runs from two rigs can be told apart
+    -- once their records meet.
+    chamber     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS samples (
@@ -100,10 +111,68 @@ CREATE TABLE IF NOT EXISTS events (
     at          REAL    NOT NULL,
     level       TEXT    NOT NULL,
     message     TEXT    NOT NULL,
-    detail      TEXT
+    detail      TEXT,
+    -- The username behind an action, NULL for what the rig did by itself.
+    user        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS events_by_run ON events(run_id, at);
+
+-- Accounts. A person signs in with a password; a paired tablet ("device")
+-- has no password at all and only ever watches. `status` is pending until
+-- an admin approves a sign-up, and disabled rather than deleted afterwards,
+-- so the name behind old events still means somebody.
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY,
+    uuid          TEXT    NOT NULL UNIQUE,
+    username      TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    display_name  TEXT    NOT NULL DEFAULT '',
+    kind          TEXT    NOT NULL DEFAULT 'person',
+    password_hash TEXT    NOT NULL DEFAULT '',
+    status        TEXT    NOT NULL DEFAULT 'pending',
+    must_change   INTEGER NOT NULL DEFAULT 0,
+    note          TEXT    DEFAULT '',
+    created_at    REAL    NOT NULL,
+    updated_at    REAL    NOT NULL,
+    last_login_at REAL
+);
+
+-- One role per account per chamber: owner, admin, operator or viewer.
+CREATE TABLE IF NOT EXISTS roles (
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    chamber     TEXT    NOT NULL,
+    role        TEXT    NOT NULL,
+    granted_by  TEXT,
+    granted_at  REAL    NOT NULL,
+    PRIMARY KEY (user_id, chamber)
+);
+
+-- Only a hash of each session token is kept: the token itself exists in the
+-- browser that holds it, so a copy of this file signs nobody in.
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash  TEXT    PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at  REAL    NOT NULL,
+    seen_at     REAL    NOT NULL,
+    active_at   REAL    NOT NULL,
+    expires_at  REAL,
+    address     TEXT    DEFAULT '',
+    agent       TEXT    DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS sessions_by_user ON sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS role_requests (
+    id          INTEGER PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    chamber     TEXT    NOT NULL,
+    role        TEXT    NOT NULL,
+    note        TEXT    DEFAULT '',
+    status      TEXT    NOT NULL DEFAULT 'open',
+    created_at  REAL    NOT NULL,
+    decided_by  TEXT,
+    decided_at  REAL
+);
 
 CREATE TABLE IF NOT EXISTS devices (
     key         TEXT    PRIMARY KEY,
@@ -138,7 +207,13 @@ MIGRATIONS = (
     ("samples", "magnetron_w", "REAL"),
     ("samples", "shutter", "INTEGER"),
     ("samples", "rate_pct_min", "REAL"),
+    ("runs", "started_by", "TEXT"),
+    ("runs", "chamber", "TEXT"),
+    ("events", "user", "TEXT"),
 )
+
+#: Tables holding credentials. Dropped from every copy that leaves the box.
+ACCOUNT_TABLES = ("sessions", "role_requests", "roles", "users")
 
 
 def default_path() -> str:
@@ -192,15 +267,17 @@ class Database:
     # --- runs -------------------------------------------------------------
 
     def create_run(self, procedure: str, name: str, config: dict,
-                   operator: str = "", notes: str = "") -> dict:
+                   operator: str = "", notes: str = "",
+                   started_by: str | None = None,
+                   chamber: str | None = None) -> dict:
         now = time.time()
         with self._lock:
             cursor = self._db.execute(
                 "INSERT INTO runs (uuid, procedure, name, operator, notes, "
-                "config, status, started_at, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "config, status, started_at, created_at, started_by, chamber) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (str(uuid.uuid4()), procedure, name, operator, notes,
-                 json.dumps(config), RUNNING, now, now),
+                 json.dumps(config), RUNNING, now, now, started_by, chamber),
             )
             self._db.commit()
             return self.run(cursor.lastrowid)  # type: ignore[arg-type]
@@ -363,13 +440,13 @@ class Database:
     # --- events -----------------------------------------------------------
 
     def add_event(self, run_id: int | None, level: str, message: str,
-                  detail: dict | None = None) -> None:
+                  detail: dict | None = None, user: str | None = None) -> None:
         with self._lock:
             self._db.execute(
-                "INSERT INTO events (run_id, at, level, message, detail) "
-                "VALUES (?,?,?,?,?)",
+                "INSERT INTO events (run_id, at, level, message, detail, user) "
+                "VALUES (?,?,?,?,?,?)",
                 (run_id, time.time(), level, message,
-                 json.dumps(detail) if detail else None),
+                 json.dumps(detail) if detail else None, user),
             )
             self._db.commit()
 
@@ -455,15 +532,230 @@ class Database:
         """Write a consistent copy of the database, safe to download.
 
         Copying the file directly would race the WAL; `sqlite3.backup` takes a
-        proper online backup instead.
+        proper online backup instead. The accounts are dropped from the copy
+        and the file vacuumed, so the freed pages do not still hold them: a
+        viewer may download the runs, never the password hashes.
         """
         with self._lock:
             target = sqlite3.connect(destination)
             try:
                 self._db.backup(target)
+                for table in ACCOUNT_TABLES:
+                    target.execute(f"DROP TABLE IF EXISTS {table}")
+                target.commit()
+                target.execute("VACUUM")
             finally:
                 target.close()
         return destination
+
+    # --- accounts ---------------------------------------------------------
+    #
+    # Storage only. Who may do what, and what a password must look like, is
+    # lab/auth.py's business; nothing here checks a permission.
+
+    def create_user(self, username: str, password_hash: str, *,
+                    display_name: str = "", kind: str = "person",
+                    status: str = "pending", must_change: bool = False,
+                    note: str = "") -> dict:
+        """Insert an account. Raises sqlite3.IntegrityError if the name is taken."""
+        now = time.time()
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT INTO users (uuid, username, display_name, kind, "
+                "password_hash, status, must_change, note, created_at, "
+                "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), username, display_name or username, kind,
+                 password_hash, status, int(bool(must_change)), note, now, now),
+            )
+            self._db.commit()
+            return self.user(cursor.lastrowid)  # type: ignore[arg-type]
+
+    def user(self, user_id: int) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def user_by_name(self, username: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        return dict(row) if row else None
+
+    def users(self, chamber: str) -> list[dict]:
+        """Every account, with its role in `chamber` (None if it has none)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT u.*, r.role AS role FROM users u "
+                "LEFT JOIN roles r ON r.user_id = u.id AND r.chamber = ? "
+                "ORDER BY u.kind, u.status, u.username", (chamber,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_user(self, user_id: int, **fields) -> dict | None:
+        allowed = {"display_name", "password_hash", "status", "must_change",
+                   "note", "last_login_at"}
+        changes = {k: v for k, v in fields.items() if k in allowed}
+        if changes:
+            changes["updated_at"] = time.time()
+            assignments = ", ".join(f"{k}=?" for k in changes)
+            with self._lock:
+                self._db.execute(f"UPDATE users SET {assignments} WHERE id=?",
+                                 (*changes.values(), user_id))
+                self._db.commit()
+        return self.user(user_id)
+
+    def delete_user(self, user_id: int) -> bool:
+        with self._lock:
+            cursor = self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
+            self._db.commit()
+            return cursor.rowcount > 0
+
+    def role(self, user_id: int, chamber: str) -> str | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT role FROM roles WHERE user_id=? AND chamber=?",
+                (user_id, chamber)).fetchone()
+        return row["role"] if row else None
+
+    def set_role(self, user_id: int, chamber: str, role: str | None,
+                 granted_by: str | None = None) -> None:
+        """Give an account a role in a chamber, or take it away with None."""
+        with self._lock:
+            if role is None:
+                self._db.execute(
+                    "DELETE FROM roles WHERE user_id=? AND chamber=?",
+                    (user_id, chamber))
+            else:
+                self._db.execute(
+                    "INSERT INTO roles (user_id, chamber, role, granted_by, "
+                    "granted_at) VALUES (?,?,?,?,?) "
+                    "ON CONFLICT(user_id, chamber) DO UPDATE SET "
+                    "role=excluded.role, granted_by=excluded.granted_by, "
+                    "granted_at=excluded.granted_at",
+                    (user_id, chamber, role, granted_by, time.time()))
+            self._db.commit()
+
+    def holders(self, chamber: str, role: str) -> list[dict]:
+        """The accounts holding `role` in `chamber` -- one, for the owner."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT u.* FROM users u JOIN roles r ON r.user_id = u.id "
+                "WHERE r.chamber=? AND r.role=?", (chamber, role)).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_session(self, token_hash: str, user_id: int,
+                       expires_at: float | None, address: str = "",
+                       agent: str = "") -> None:
+        now = time.time()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO sessions (token_hash, user_id, created_at, "
+                "seen_at, active_at, expires_at, address, agent) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (token_hash, user_id, now, now, now, expires_at, address,
+                 agent[:200]))
+            self._db.commit()
+
+    def session(self, token_hash: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM sessions WHERE token_hash=?",
+                (token_hash,)).fetchone()
+        return dict(row) if row else None
+
+    def sessions(self, user_id: int | None = None) -> list[dict]:
+        where, args = ("WHERE user_id=?", (user_id,)) if user_id is not None \
+            else ("", ())
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT * FROM sessions {where} ORDER BY seen_at DESC",
+                args).fetchall()
+        return [dict(row) for row in rows]
+
+    def touch_session(self, token_hash: str, *, seen_at: float | None = None,
+                      active_at: float | None = None,
+                      address: str | None = None) -> None:
+        changes = {k: v for k, v in (("seen_at", seen_at),
+                                     ("active_at", active_at),
+                                     ("address", address)) if v is not None}
+        if not changes:
+            return
+        assignments = ", ".join(f"{k}=?" for k in changes)
+        with self._lock:
+            self._db.execute(
+                f"UPDATE sessions SET {assignments} WHERE token_hash=?",
+                (*changes.values(), token_hash))
+            self._db.commit()
+
+    def delete_session(self, token_hash: str) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM sessions WHERE token_hash=?",
+                             (token_hash,))
+            self._db.commit()
+
+    def delete_sessions(self, user_id: int, keep: str | None = None) -> int:
+        """End every session of an account, except `keep` if given."""
+        with self._lock:
+            cursor = self._db.execute(
+                "DELETE FROM sessions WHERE user_id=? AND token_hash IS NOT ?",
+                (user_id, keep))
+            self._db.commit()
+            return cursor.rowcount
+
+    def purge_sessions(self, now: float | None = None) -> int:
+        """Forget sessions past their expiry."""
+        with self._lock:
+            cursor = self._db.execute(
+                "DELETE FROM sessions WHERE expires_at IS NOT NULL "
+                "AND expires_at < ?", (now or time.time(),))
+            self._db.commit()
+            return cursor.rowcount
+
+    def create_role_request(self, user_id: int, chamber: str, role: str,
+                            note: str = "") -> dict:
+        with self._lock:
+            # One open request per person and chamber: a new one replaces it.
+            self._db.execute(
+                "DELETE FROM role_requests WHERE user_id=? AND chamber=? "
+                "AND status='open'", (user_id, chamber))
+            cursor = self._db.execute(
+                "INSERT INTO role_requests (user_id, chamber, role, note, "
+                "created_at) VALUES (?,?,?,?,?)",
+                (user_id, chamber, role, note, time.time()))
+            self._db.commit()
+            return self.role_request(cursor.lastrowid)  # type: ignore[arg-type]
+
+    def role_request(self, request_id: int) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM role_requests WHERE id=?",
+                (request_id,)).fetchone()
+        return dict(row) if row else None
+
+    def role_requests(self, chamber: str, status: str | None = "open",
+                      user_id: int | None = None) -> list[dict]:
+        clauses, args = ["q.chamber=?"], [chamber]
+        if status:
+            clauses.append("q.status=?")
+            args.append(status)
+        if user_id is not None:
+            clauses.append("q.user_id=?")
+            args.append(user_id)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT q.*, u.username, u.display_name FROM role_requests q "
+                "JOIN users u ON u.id = q.user_id "
+                f"WHERE {' AND '.join(clauses)} ORDER BY q.created_at",
+                args).fetchall()
+        return [dict(row) for row in rows]
+
+    def decide_role_request(self, request_id: int, status: str,
+                            decided_by: str) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE role_requests SET status=?, decided_by=?, decided_at=? "
+                "WHERE id=?", (status, decided_by, time.time(), request_id))
+            self._db.commit()
 
 
 def _run_row(row: sqlite3.Row) -> dict:

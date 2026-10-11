@@ -1527,9 +1527,12 @@ class RunEngine:
     def __init__(self, database: "dbmod.Database", registry,
                  hardware: "process.ProcessHardware | None" = None,
                  pump_key: str = "pump", gauge_key: str = "gauge",
-                 equipment: "process.Equipment | None" = None):
+                 equipment: "process.Equipment | None" = None,
+                 chamber: str | None = None):
         self.db = database
         self.registry = registry
+        #: Recorded on every run, so two rigs' records stay apart.
+        self.chamber = chamber
         self.hardware = hardware or process.ProcessHardware()
         # What is on the rig at all. Without a record, everything is: that is
         # the simulator, and the tests, where every actuator exists.
@@ -1760,8 +1763,11 @@ class RunEngine:
                               if row["key"] in p.requires]
         return rows
 
-    def set_equipment(self, key: str, installed: bool) -> dict:
-        """Mark a piece of equipment installed or not, from the Settings page."""
+    def set_equipment(self, key: str, installed: bool, user=None) -> dict:
+        """Mark a piece of equipment installed or not, from the Settings page.
+
+        `user` is whoever asked (lab/auth.py's Principal), for the record.
+        """
         procedure = self._procedure
         if (not installed and procedure is not None and self._thread
                 and self._thread.is_alive() and key in procedure.requires):
@@ -1771,8 +1777,11 @@ class RunEngine:
         if result.get("ok"):
             label = process.EQUIPMENT[key]
             # The rig's log, not a run's: this is not something a run did.
-            self.db.add_event(None, "action", f"Rig equipment: {label} marked "
-                              f"{'installed' if installed else 'not installed'}")
+            self.db.add_event(
+                None, "action",
+                (f"{user.name}: " if user else "") + f"Rig equipment: {label} "
+                f"marked {'installed' if installed else 'not installed'}",
+                user=getattr(user, "username", None))
             result["equipment"] = self.equipment_report()
         return result
 
@@ -1785,7 +1794,8 @@ class RunEngine:
     # --- lifecycle --------------------------------------------------------
 
     def start(self, procedure_name: str, config: dict, name: str = "",
-              operator: str = "", notes: str = "") -> dict:
+              operator: str = "", notes: str = "",
+              started_by: str | None = None) -> dict:
         with self._lock:
             if self._thread and self._thread.is_alive():
                 return {"ok": False,
@@ -1832,7 +1842,8 @@ class RunEngine:
 
             run = self.db.create_run(
                 procedure_name, name or procedure.label, config,
-                operator=operator, notes=notes)
+                operator=operator, notes=notes, started_by=started_by,
+                chamber=self.chamber)
 
             self._procedure = procedure
             self._run = run
@@ -2093,6 +2104,19 @@ class RunEngine:
 
     def recent_samples(self, limit: int = 600) -> list[dict]:
         return self._samples[-limit:]
+
+    def samples_since(self, t: float) -> list[dict]:
+        """The run's samples after run time `t`, oldest first.
+
+        Walks back from the end: a panel polling every couple of seconds is
+        one or two rows behind, so this touches a handful of rows whatever
+        the length of the run.
+        """
+        samples = self._samples
+        start = len(samples)
+        while start > 0 and (samples[start - 1].get("t") or 0) > t:
+            start -= 1
+        return samples[start:]
 
     def run_samples(self, points: int = 1500) -> list[dict]:
         """The whole run in progress, decimated to about `points` rows.

@@ -4,17 +4,22 @@ Routing is a small explicit table rather than a framework: the whole surface
 is about thirty endpoints, the standard library's `http.server` is already
 here, and the lab PC is offline so a dependency would have to be vendored.
 
-Two conventions run through it:
+Three conventions run through it:
 
 * Every response is JSON with an `ok` field, except the file downloads and the
   static assets.
 * Anything that physically moves hardware needs `confirm: true` in the body.
   The UI asks the operator; the API refuses to take the UI's word for it
   implicitly. A stray GET cannot start a pump.
+* Every API call except /api/ping and signing in carries a session
+  (`Authorization: Bearer ...`), and every POST is checked against
+  POST_RULES before it does anything. The rules themselves -- roles, control,
+  idle sessions -- are lab/auth.py's; this module only applies them.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import mimetypes
 import os
@@ -25,6 +30,7 @@ import time
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
+from . import auth as authmod
 from . import db as dbmod
 from . import discovery, export, history, runs, trends
 from .pump import GUARDED
@@ -36,6 +42,60 @@ WEB_ROOT = os.path.join(os.path.dirname(HERE), "web")
 CONFIRM_REQUIRED = GUARDED | {
     "sensor_on", "sensor_off", "degas_on", "degas_off", "setpoint", "unit",
 }
+
+#: Who may make each POST: the lowest role, and whether the caller must hold
+#: control of the rig (lab/auth.py). Whatever moves hardware needs control.
+#: What makes the rig safer does not -- making the pump safe, cancelling a
+#: power-down, acknowledging alarms, and stopping a run without powering down
+#: (see _post_rule) -- because an operator who sees something wrong must not
+#: have to wait for whoever holds control to notice. Setting the rig up --
+#: equipment, ports, automatic recovery -- is an admin's.
+POST_RULES = {
+    "/api/command":              ("operator", True),
+    "/api/run/start":            ("operator", True),
+    "/api/run/acknowledge":      ("operator", True),
+    "/api/pump/shutdown":        ("operator", True),
+    "/api/pump/secure":          ("operator", False),
+    "/api/pump/cancel-shutdown": ("operator", False),
+    "/api/alarms/ack":           ("operator", False),
+    "/api/control/release":      ("operator", False),
+    "/api/equipment":            ("admin", False),
+    "/api/supervisor":           ("admin", False),
+    "/api/device/port":          ("admin", False),
+    "/api/ports/searching":      ("admin", False),
+}
+
+#: Reachable without a session: how a sign-in page finds out where it is.
+PUBLIC_POSTS = ("/api/login", "/api/signup", "/api/pair")
+
+#: GETs that need more than watching.
+ADMIN_GETS = ("/api/ports/survey",)
+
+
+def parse_networks(text: str | None) -> list:
+    """`--allow-from 172.16.2.0/24,10.0.0.0/8` into networks; empty is none."""
+    networks = []
+    for part in str(text or "").split(","):
+        part = part.strip()
+        if part:
+            networks.append(ipaddress.ip_network(part, strict=False))
+    return networks
+
+
+def address_allowed(address: str, networks: list) -> bool:
+    """Whether a client may reach the panel at all. Loopback always may: the
+    tablet on its USB cable arrives as 127.0.0.1."""
+    if not networks:
+        return True
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if ip.is_loopback:
+        return True
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return any(ip in network for network in networks)
 
 
 #: How a serial port is classified, and whether an onboard one is real, live
@@ -81,12 +141,20 @@ class Application:
     """Everything the request handler needs, assembled once at startup."""
 
     def __init__(self, registry, database: "dbmod.Database",
-                 engine: "runs.RunEngine", token: str | None = None,
-                 history=None, supervisor=None, finder=None):
+                 engine: "runs.RunEngine", auth: "authmod.Auth | None" = None,
+                 history=None, supervisor=None, finder=None,
+                 chamber: dict | None = None, allow: list | None = None):
         self.registry = registry
         self.db = database
         self.engine = engine
-        self.token = token
+        #: Accounts and control. Without one, accounts are off: every request
+        #: is the local owner, which is what --no-auth and the tests ask for.
+        self.auth = auth or authmod.Auth(database, "chamber-1", enabled=False)
+        #: Which chamber this server drives: {"id", "name"}.
+        self.chamber = chamber or {"id": self.auth.chamber,
+                                   "name": self.auth.chamber}
+        #: Networks allowed to reach the panel at all; empty allows any.
+        self.allow = allow or []
         #: The rolling chart recorder, or None if this server keeps none.
         self.history = history
         #: Alarms and the automatic safe state after a fault, or None.
@@ -98,10 +166,14 @@ class Application:
 
     # --- composed views ---------------------------------------------------
 
-    def state(self) -> dict:
+    def state(self, principal: "authmod.Principal | None" = None) -> dict:
         """The single poll that drives the whole UI."""
+        principal = principal or authmod.LOCAL
         return {
             "ok": True,
+            "chamber": self.chamber,
+            "me": self.auth.me(principal),
+            "control": self.auth.control(principal),
             "devices": self.registry.snapshot(),
             "order": self.registry.keys(),
             "run": self.engine.status(),
@@ -116,15 +188,25 @@ class Application:
             "uptime_s": round(time.time() - self.started_at, 1),
         }
 
-    def live(self, limit: int = 600, points: int | None = None) -> dict:
+    def live(self, limit: int = 600, points: int | None = None,
+             since: float | None = None) -> dict:
         """The in-progress run's samples, for the live chart.
 
         `points` asks for the whole run decimated to about that many rows;
-        without it, the most recent `limit` samples as before.
+        `since` for only the samples after that run time (`t`, seconds) --
+        what a panel already holding the run needs on each poll, one or two
+        rows instead of the whole run again. Without either, the most recent
+        `limit` samples.
         """
-        samples = (self.engine.run_samples(points) if points
-                   else self.engine.recent_samples(limit))
-        return {"ok": True, "samples": samples, "run": self.engine.status()}
+        if since is not None:
+            samples = self.engine.samples_since(since)
+        elif points:
+            samples = self.engine.run_samples(points)
+        else:
+            samples = self.engine.recent_samples(limit)
+        status = self.engine.status()
+        return {"ok": True, "samples": samples, "run": status,
+                "run_id": (status.get("run") or {}).get("id")}
 
     def trends(self) -> dict:
         """Health indicators of every finished run, oldest first."""
@@ -147,6 +229,8 @@ class Handler(BaseHTTPRequestHandler):
 
     server_version = "vacuum-lab/3.0"
     app: Application
+    #: Whoever sent this request, once it has been resolved.
+    principal: "authmod.Principal | None" = None
 
     # --- plumbing ---------------------------------------------------------
 
@@ -158,8 +242,13 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write(f"  {self.address_string()} {fmt % args}\n")
 
     def _cors(self):
+        # Permissive on purpose: the panel may be opened from another machine
+        # and pointed here. That is safe because the session travels in a
+        # header that no other page can read, never in a cookie a browser
+        # would attach to somebody else's request.
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Token")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, Authorization")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
     def _json(self, payload, code: int = 200):
@@ -236,13 +325,59 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _authorised(self) -> bool:
-        if not self.app.token:
+    def _address(self) -> str:
+        return str(self.client_address[0]) if self.client_address else ""
+
+    def _reachable(self) -> bool:
+        """Refuse a client outside --allow-from before anything else."""
+        if address_allowed(self._address(), self.app.allow):
             return True
-        supplied = self.headers.get("X-Token", "")
-        if not supplied:
-            supplied = self._query().get("token", [""])[0]
-        return supplied == self.app.token
+        self._json({"ok": False, "error": "This panel only answers the lab "
+                                          "network."}, 403)
+        return False
+
+    def _principal(self) -> "authmod.Principal | None":
+        header = self.headers.get("Authorization", "")
+        token = header[7:].strip() if header[:7].lower() == "bearer " else ""
+        self.principal = self.app.auth.resolve(token, self._address())
+        return self.principal
+
+    def _refused(self, refusal: dict) -> None:
+        body = dict(refusal)
+        self._json(body, int(body.pop("status", 403)))
+
+    def _check(self, principal: "authmod.Principal", minimum: str,
+               control: bool) -> dict | None:
+        """The reason this principal may not make this request, or None."""
+        auth = self.app.auth
+        if not auth.enabled:
+            return None
+        if principal.kind == "device":
+            return authmod.refusal("This tablet only watches. Sign in to act.",
+                                   403)
+        if principal.must_change:
+            return authmod.refusal("Choose a new password first.", 403,
+                                   must_change=True)
+        if not principal.at_least(minimum):
+            return authmod.refusal(f"This needs the {minimum} role; you are "
+                                   f"{principal.role}.", 403)
+        if principal.idle():
+            return authmod.refusal("Your session has been idle. Enter your "
+                                   "password to act again.", 401, reauth=True)
+        if control:
+            return auth.ensure_control(principal)
+        return None
+
+    def _audit(self, message: str, level: str = "action",
+               detail: dict | None = None) -> None:
+        """Put an action in the rig's record under the name of who took it."""
+        who = self.principal or authmod.LOCAL
+        try:
+            self.app.db.add_event(self.app.engine.run_id(), level,
+                                  f"{who.name}: {message}", detail,
+                                  user=who.username)
+        except Exception:
+            pass
 
     def _query(self) -> dict:
         return parse_qs(urlparse(self.path).query)
@@ -270,13 +405,20 @@ class Handler(BaseHTTPRequestHandler):
     # --- verbs ------------------------------------------------------------
 
     def do_OPTIONS(self):
+        if not self._reachable():
+            return
         self.send_response(204)
         self._cors()
         self.end_headers()
 
     def do_GET(self):
         route = urlparse(self.path).path
+        if not self._reachable():
+            return
 
+        # The panel itself is public -- it has to be, to show a sign-in page
+        # -- and so is the ping, which is how the kiosk tablet recognises the
+        # server. Keep "service": "vacuum-lab" in it.
         if not route.startswith("/api/"):
             self._static(route)
             return
@@ -284,18 +426,41 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/ping":
             self._json({"ok": True, "service": "vacuum-lab",
                         "devices": self.app.registry.descriptors(),
-                        "token_required": bool(self.app.token)})
+                        "chamber": self.app.chamber,
+                        "auth": self.app.auth.status()})
             return
 
-        if not self._authorised():
-            self._json({"ok": False, "error": "bad token"}, 403)
+        principal = self._principal()
+        if principal is None:
+            self._json({"ok": False, "error": "Sign in first.", "login": True},
+                       401)
+            return
+        # The controller's own polling is what keeps control alive.
+        self.app.auth.renew(principal)
+
+        if route in ADMIN_GETS:
+            refusal = self._check(principal, "admin", False)
+            if refusal:
+                self._refused(refusal)
+                return
+        if route == "/api/me":
+            self._json({"ok": True, "me": self.app.auth.me(principal),
+                        "control": self.app.auth.control(principal)})
+            return
+        if route == "/api/users":
+            report = self.app.auth.users_report(principal)
+            if report.get("ok"):
+                self._json(report)
+            else:
+                self._refused(report)
             return
 
         handler = {
-            "/api/state": lambda: self._json(self.app.state()),
+            "/api/state": lambda: self._json(self.app.state(principal)),
             "/api/live": lambda: self._json(
                 self.app.live(self._int("limit", 600),
-                              self._int("points", 0) or None)),
+                              self._int("points", 0) or None,
+                              self._float("since", None))),
             "/api/history": lambda: self._json(
                 self.app.history_window(
                     self._float("seconds", 3600.0),
@@ -347,32 +512,64 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         route = urlparse(self.path).path
-        if not self._authorised():
-            self._json({"ok": False, "error": "bad token"}, 403)
+        if not self._reachable():
+            return
+        payload = self._body()
+
+        if route in PUBLIC_POSTS:
+            self._public_post(route, payload)
             return
 
-        payload = self._body()
+        principal = self._principal()
+        if principal is None:
+            self._json({"ok": False, "error": "Sign in first.", "login": True},
+                       401)
+            return
+        if route.startswith(("/api/session/", "/api/me/", "/api/logout",
+                             "/api/control/take", "/api/users/",
+                             "/api/devices/", "/api/role-requests")):
+            self._account_post(route, payload, principal)
+            return
+
+        minimum, control = self._post_rule(route, payload)
+        refusal = self._check(principal, minimum, control)
+        if refusal:
+            self._refused(refusal)
+            return
+        # Doing something on purpose is a touch: it keeps the session awake.
+        self.app.auth.mark_active(principal)
 
         if route == "/api/command":
             self._command(payload)
             return
         if route == "/api/run/start":
-            self._json(self.app.engine.start(
+            result = self.app.engine.start(
                 str(payload.get("procedure", "")),
                 payload.get("config") or {},
                 name=str(payload.get("name", "")),
-                operator=str(payload.get("operator", "")),
+                operator=str(payload.get("operator", "")) or principal.name,
                 notes=str(payload.get("notes", "")),
-            ))
+                started_by=principal.username,
+            )
+            if result.get("ok"):
+                self._audit(f"started {result['run']['name']} "
+                            f"(run {result['run']['id']})")
+            self._json(result)
             return
         if route == "/api/run/stop":
             # `shutdown` is a separate decision from stopping the run: it
             # asks for the pump to be brought to rest as well, in the order
             # the hardware needs. Without it the rig is left exactly as it
             # is, still under vacuum.
-            self._json(self.app.engine.stop(
+            shutdown = bool(payload.get("shutdown"))
+            result = self.app.engine.stop(
                 str(payload.get("reason", "stopped by the operator")),
-                shutdown=bool(payload.get("shutdown"))))
+                shutdown=shutdown)
+            if result.get("ok"):
+                self._audit("stopped the run, " + ("powering the pump down"
+                                                   if shutdown else
+                                                   "keeping the vacuum"))
+            self._json(result)
             return
         if route == "/api/alarms/ack":
             # Acknowledging moves nothing, so it needs no confirm.
@@ -381,7 +578,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             which = payload.get("id", "all")
             self._json(self.app.supervisor.acknowledge(
-                which if which == "all" else int(which)))
+                which if which == "all" else int(which), user=principal))
             return
         if route == "/api/equipment":
             # Moves nothing, but changes which procedures may run: confirmed.
@@ -390,7 +587,8 @@ class Handler(BaseHTTPRequestHandler):
                                                   "needs confirm"}, 400)
                 return
             self._json(self.app.engine.set_equipment(
-                str(payload.get("key", "")), bool(payload.get("installed"))))
+                str(payload.get("key", "")), bool(payload.get("installed")),
+                user=principal))
             return
         if route == "/api/supervisor":
             if not payload.get("confirm"):
@@ -401,7 +599,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "no supervisor"}, 404)
                 return
             self._json(self.app.supervisor.set_auto_recover(
-                bool(payload.get("auto_recover"))))
+                bool(payload.get("auto_recover")), user=principal))
             return
         if route == "/api/pump/secure":
             # The manual "make safe": motor off, fault acknowledged, station
@@ -410,14 +608,22 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "making the pump safe needs "
                                                   "confirm"}, 400)
                 return
-            self._json(self.app.engine.secure_pump(
-                str(payload.get("reason", "requested by the operator"))))
+            result = self.app.engine.secure_pump(
+                str(payload.get("reason", "requested by the operator")))
+            if result.get("ok"):
+                self._audit("made the pump safe (motor off, fault acknowledged, "
+                            "forevacuum pump on)")
+            self._json(result)
             return
         if route == "/api/pump/cancel-shutdown":
             if not payload.get("confirm"):
                 self._json({"ok": False, "error": "cancelling needs confirm"}, 400)
                 return
-            self._json(self.app.engine.cancel_shutdown())
+            result = self.app.engine.cancel_shutdown()
+            if result.get("ok"):
+                self._audit("cancelled the power-down; the backing pump keeps "
+                            "running")
+            self._json(result)
             return
         if route == "/api/pump/shutdown":
             # The same guided power-down, without a run to stop. Guarded like
@@ -427,12 +633,20 @@ class Handler(BaseHTTPRequestHandler):
                             "error": "shutting the pump down needs confirm"},
                            400)
                 return
-            self._json(self.app.engine.shutdown_pump(
-                str(payload.get("reason", "requested by the operator"))))
+            result = self.app.engine.shutdown_pump(
+                str(payload.get("reason", "requested by the operator")))
+            if result.get("ok"):
+                self._audit("asked for the pump to be powered down")
+            self._json(result)
             return
         if route == "/api/run/acknowledge":
-            self._json(self.app.engine.acknowledge(
-                str(payload.get("note", ""))))
+            result = self.app.engine.acknowledge(str(payload.get("note", "")))
+            if result.get("ok"):
+                self._audit("confirmed the manual step")
+            self._json(result)
+            return
+        if route == "/api/control/release":
+            self._json(self.app.auth.release(principal))
             return
         if route == "/api/ports/searching":
             # Turning the automatic search on or off moves nothing.
@@ -441,9 +655,8 @@ class Handler(BaseHTTPRequestHandler):
                            404)
                 return
             self.app.finder.enabled = bool(payload.get("enabled"))
-            self.app.db.add_event(None, "action",
-                                  "Automatic port search switched "
-                                  + ("on" if self.app.finder.enabled else "off"))
+            self._audit("switched the automatic port search "
+                        + ("on" if self.app.finder.enabled else "off"))
             self._json({"ok": True, "enabled": self.app.finder.enabled})
             return
         if route.startswith("/api/device/") and route.endswith("/search"):
@@ -491,6 +704,8 @@ class Handler(BaseHTTPRequestHandler):
                 str(payload.get("port", "")),
                 baudrate=payload.get("baudrate"),
                 address=payload.get("address"))
+            if result.get("ok"):
+                self._audit(f"moved the {service.label} to {service.port}")
             # A port chosen by hand that works is remembered like a found one.
             if result.get("ok") and self.app.finder and service.probe_kind:
                 self.app.finder.memory.remember(service.probe_kind, service.port)
@@ -501,6 +716,112 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self._json({"ok": False, "error": "not found"}, 404)
+
+    # --- who may post what -----------------------------------------------
+
+    def _post_rule(self, route: str, payload: dict) -> tuple[str, bool]:
+        """The lowest role a POST needs, and whether it needs control."""
+        if route in POST_RULES:
+            return POST_RULES[route]
+        if route == "/api/run/stop":
+            # Stopping a run and keeping the vacuum makes the rig safer -- it
+            # shuts a deposition's gas off -- so any operator may, control or
+            # not. Powering the pump down is a decision, and needs control.
+            return "operator", bool(payload.get("shutdown"))
+        if route.startswith("/api/device/") and route.endswith("/search"):
+            return "operator", False
+        if route.startswith("/api/runs/"):
+            # Editing a run's name or notes is bookkeeping; deleting a run
+            # destroys a record, which is an admin's call.
+            return ("admin" if route.endswith("/delete") else "operator"), False
+        # Anything not listed needs the most, not the least.
+        return "admin", True
+
+    def _public_post(self, route: str, payload: dict) -> None:
+        auth = self.app.auth
+        agent = self.headers.get("User-Agent", "")
+        if route == "/api/login":
+            result = auth.login(str(payload.get("username", "")),
+                                str(payload.get("password", "")),
+                                self._address(), agent)
+        elif route == "/api/signup":
+            result = auth.signup(str(payload.get("username", "")),
+                                 str(payload.get("name", "")),
+                                 str(payload.get("password", "")),
+                                 str(payload.get("note", "")), self._address())
+        else:
+            result = auth.pair(str(payload.get("code", "")), self._address(),
+                               agent)
+        if result.get("ok"):
+            self._json(result)
+        else:
+            self._refused(result)
+
+    def _account_post(self, route: str, payload: dict,
+                      principal: "authmod.Principal") -> None:
+        """Signing out, the idle prompt, one's own password, and the admin
+        pages. lab/auth.py checks each of these itself."""
+        auth = self.app.auth
+
+        def number(key: str) -> int:
+            try:
+                return int(payload.get(key))
+            except (TypeError, ValueError):
+                return -1
+
+        if route == "/api/logout":
+            result = auth.logout(principal)
+        elif route == "/api/session/touch":
+            result = {"ok": True, "active": auth.mark_active(principal),
+                      "me": auth.me(principal)}
+        elif route == "/api/session/reauth":
+            result = auth.reauth(principal, str(payload.get("password", "")))
+        elif route == "/api/me/password":
+            result = auth.change_password(principal,
+                                          str(payload.get("current", "")),
+                                          str(payload.get("new", "")))
+        elif route == "/api/control/take":
+            if principal.must_change:
+                result = authmod.refusal("Choose a new password first.", 403,
+                                         must_change=True)
+            else:
+                result = auth.take(principal, force=bool(payload.get("force")))
+            if result.get("ok"):
+                auth.mark_active(principal)
+        elif route == "/api/role-requests":
+            result = auth.request_role(principal, str(payload.get("role", "")),
+                                       str(payload.get("note", "")))
+        elif route == "/api/role-requests/decide":
+            result = auth.decide(principal, number("id"),
+                                 bool(payload.get("approve")))
+        elif route == "/api/users/approve":
+            result = auth.approve(principal, number("id"),
+                                  str(payload.get("role", "viewer")))
+        elif route == "/api/users/decline":
+            result = auth.decline(principal, number("id"))
+        elif route == "/api/users/role":
+            result = auth.set_role(principal, number("id"),
+                                   str(payload.get("role", "")))
+        elif route == "/api/users/status":
+            result = auth.set_status(principal, number("id"),
+                                     bool(payload.get("enabled")))
+        elif route == "/api/users/reset-password":
+            result = auth.reset_password(principal, number("id"))
+        elif route == "/api/users/transfer-owner":
+            result = auth.transfer_owner(principal, number("id"),
+                                         str(payload.get("password", "")))
+        elif route == "/api/devices/add":
+            result = auth.create_device(principal, str(payload.get("label", "")))
+        elif route == "/api/devices/code":
+            result = auth.renew_code(principal, number("id"))
+        elif route == "/api/devices/remove":
+            result = auth.remove_device(principal, number("id"))
+        else:
+            result = authmod.refusal("not found", 404)
+        if result.get("ok"):
+            self._json(result)
+        else:
+            self._refused(result)
 
     # --- route groups -----------------------------------------------------
 
@@ -617,7 +938,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False,
                             "error": "deleting a run needs confirm"}, 400)
                 return
+            record = self.app.db.run(run_id)
             deleted = self.app.db.delete_run(run_id)
+            if deleted:
+                # Kept in the rig's log, not the run's, which is now gone.
+                who = self.principal or authmod.LOCAL
+                self.app.db.add_event(
+                    None, "warning",
+                    f"{who.name}: deleted run {run_id} "
+                    f"({(record or {}).get('name', '?')})", user=who.username)
             self._json({"ok": deleted,
                         "error": None if deleted else f"no run {run_id}"})
         else:
@@ -641,7 +970,17 @@ class Handler(BaseHTTPRequestHandler):
     def _command(self, payload: dict):
         key = str(payload.get("device", "pump"))
         action = str(payload.get("action", ""))
+        who = self.principal or authmod.LOCAL
+        override = bool(payload.get("override"))
 
+        # Bypassing a safety rule is an admin's call, whoever holds control.
+        # Checked first, so the answer never depends on anything else.
+        if override and not who.at_least("admin"):
+            self._json({"ok": False, "interlock": True,
+                        "error": "Only an admin may override an interlock. "
+                                 "Ask one, or deal with what the interlock "
+                                 "is refusing."}, 403)
+            return
         if key not in self.app.registry:
             self._json({"ok": False, "error": f"no device named {key!r}"}, 404)
             return
@@ -651,24 +990,26 @@ class Handler(BaseHTTPRequestHandler):
                                  f"confirm"}, 400)
             return
 
-        override = bool(payload.get("override"))
         if override:
             sys.stderr.write(f"  !! INTERLOCK OVERRIDDEN for {key}.{action} "
-                             f"by {self.address_string()}\n")
+                             f"by {who.username} at {self.address_string()}\n")
             self.app.db.add_event(
-                None, "warning", f"Interlock overridden: {key}.{action}",
-                {"from": self.address_string(), "value": payload.get("value")})
+                self.app.engine.run_id(), "warning",
+                f"{who.name}: interlock overridden for {key}.{action}",
+                {"from": self.address_string(), "value": payload.get("value")},
+                user=who.username)
 
         device = self.app.registry.get(key)
         result = device.command(action, payload.get("value"), override)
 
-        # Operator actions belong in the run's narrative, so a curve with a
-        # step in it can be explained months later.
-        if result.get("ok"):
-            active = self.app.engine.status()
-            if active.get("running"):
-                self.app.db.add_event(
-                    active["run"]["id"], "action",
-                    f"Operator: {key}.{action}",
-                    {"value": payload.get("value"), "overridden": override})
+        # Actions that change the hardware belong in the rig's narrative, so
+        # a curve with a step in it can be explained months later -- and now
+        # say who took them.
+        if result.get("ok") and (action in CONFIRM_REQUIRED or override):
+            value = payload.get("value")
+            self._audit(f"{device.label}, {action.replace('_', ' ')}"
+                        + (f" {value}" if value is not None else "")
+                        + (" (interlock overridden)" if override else ""),
+                        detail={"device": key, "action": action, "value": value,
+                                "overridden": override})
         self._json(result)

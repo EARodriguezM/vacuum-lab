@@ -5,14 +5,20 @@ import { useEffect, useState } from "preact/hooks";
 import { Banner, Card, Confirm, Empty, Pairs, Pill } from "../ui.js";
 import { CompareRuns, RunCharts, RunTrends } from "../runcharts.js";
 import { ResultSummary, EventLog } from "./tests.js";
-import { api, downloadUrl } from "../api.js";
+import { api, download } from "../api.js";
 import * as fmt from "../format.js";
+
+/** Save a server export. Fetched with the session, so no token is in a URL. */
+function save(path, notify) {
+  download(path).catch((error) => notify(error.message, "error"));
+}
 
 const STATUS_TONE = {
   completed: "good", running: "accent", aborted: "warn", failed: "crit",
 };
 
-function RunDetail({ run, onClose, onChanged, notify, devices, runs }) {
+function RunDetail({ run, onClose, onChanged, notify, devices, runs,
+                    canEdit = true, canDelete = true }) {
   const [samples, setSamples] = useState([]);
   const [events, setEvents] = useState([]);
   const [meta, setMeta] = useState({
@@ -37,7 +43,7 @@ function RunDetail({ run, onClose, onChanged, notify, devices, runs }) {
     return () => { cancelled = true; };
   }, [run.id]);
 
-  const save = async () => {
+  const saveMeta = async () => {
     setSaving(true);
     try {
       await api.updateRun(run.id, meta);
@@ -69,8 +75,8 @@ function RunDetail({ run, onClose, onChanged, notify, devices, runs }) {
                `${run.operator ? ` · ${run.operator}` : ""}`}
         actions=${html`
           <${Pill} tone=${STATUS_TONE[run.status] || "idle"}>${run.status}<//>
-          <a class="btn" href=${downloadUrl(`/api/runs/${run.id}/export.csv`)}>CSV</a>
-          <a class="btn" href=${downloadUrl(`/api/runs/${run.id}/export.json`)}>JSON</a>
+          <button onClick=${() => save(`/api/runs/${run.id}/export.csv`, notify)}>CSV</button>
+          <button onClick=${() => save(`/api/runs/${run.id}/export.json`, notify)}>JSON</button>
           <button onClick=${onClose}>Close</button>`}>
         <${Pairs} items=${[
           ["Started", fmt.dateTime(run.started_at)],
@@ -119,8 +125,10 @@ function RunDetail({ run, onClose, onChanged, notify, devices, runs }) {
                       onInput=${(e) => setMeta({ ...meta, notes: e.target.value })} />
           </label>
           <div class="row">
-            <button class="primary" disabled=${saving} onClick=${save}>Save</button>
-            <button class="danger right"
+            <button class="primary" disabled=${saving || !canEdit} onClick=${saveMeta}
+                    title=${canEdit ? "" : "Editing a run needs the operator role"}>Save</button>
+            <button class="danger right" disabled=${!canDelete}
+                    title=${canDelete ? "" : "Deleting a run is an admin's"}
                     onClick=${() => setConfirmDelete(true)}>Delete run</button>
           </div>
         <//>
@@ -177,7 +185,9 @@ export function HistoryView({ notify, state }) {
   if (selected) {
     return html`<${RunDetail} run=${selected} onClose=${() => setSelected(null)}
                               onChanged=${() => { load(); setSelected(null); }}
-                              notify=${notify} devices=${state?.devices} runs=${runs} />`;
+                              notify=${notify} devices=${state?.devices} runs=${runs}
+                              canEdit=${(state?.me?.rank ?? 3) >= 1}
+                              canDelete=${state?.me?.can?.admin !== false} />`;
   }
 
   const procedures = [...new Set(runs.map((r) => r.procedure))];
@@ -191,15 +201,16 @@ export function HistoryView({ notify, state }) {
             `${fmt.bytes(stats.stats.bytes)} · ${stats.stats.path}`
           : ""}
         actions=${html`
-          <a class="btn" href=${downloadUrl("/api/export/runs.csv")}>All runs (CSV)</a>
-          <a class="btn" href=${downloadUrl("/api/export/runs.json")}>Index (JSON)</a>
-          <a class="btn" href=${downloadUrl("/api/export/archive.json")}>Full archive</a>
-          <a class="btn" href=${downloadUrl("/api/export/database.db")}>SQLite file</a>`}>
+          <button onClick=${() => save("/api/export/runs.csv", notify)}>All runs (CSV)</button>
+          <button onClick=${() => save("/api/export/runs.json", notify)}>Index (JSON)</button>
+          <button onClick=${() => save("/api/export/archive.json", notify)}>Full archive</button>
+          <button onClick=${() => save("/api/export/database.db", notify)}>SQLite file</button>`}>
         <p class="hint">
           <strong>All runs (CSV)</strong> is one row per test with its result —
           the spreadsheet view. <strong>Full archive</strong> and the${" "}
           <strong>SQLite file</strong> both include every recorded curve; the
-          SQLite file is the exact database, taken as a consistent online backup.
+          SQLite file is the database itself, taken as a consistent online backup —
+          without the accounts, which never leave the machine.
         </p>
         <div class="row">
           <label class="field" style="flex:2 1 220px">

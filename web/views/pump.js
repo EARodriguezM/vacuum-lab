@@ -202,7 +202,10 @@ const BKP_MODE_NAMES = { 0: "continuous", 1: "intermittent", 2: "delayed" };
  * restarts the turbopump. The drive's own protective settings sit beside it,
  * because they decide when a dragged rotor becomes an Err006.
  */
-function FaultsCard({ pump, alarms, busy, onCommand, onSecure, notify }) {
+// `safeBusy` locks only Make safe, which every operator may press whoever
+// holds control; switching automatic recovery is an admin's (`canAdmin`).
+function FaultsCard({ pump, alarms, busy, safeBusy, canAdmin = true, onCommand,
+                      onSecure, notify }) {
   const [diagnostics, setDiagnostics] = useState(null);
   const [loading, setLoading] = useState(false);
   const [showCodes, setShowCodes] = useState(false);
@@ -247,7 +250,8 @@ function FaultsCard({ pump, alarms, busy, onCommand, onSecure, notify }) {
         : html`<div class="small muted">No fault on the drive now.</div>`}
 
       <div class="row">
-        <button class="primary" disabled=${busy || !pump?.connected} onClick=${onSecure}
+        <button class="primary" disabled=${(safeBusy ?? busy) || !pump?.connected}
+                onClick=${onSecure}
                 title="Motor off, fault acknowledged, forevacuum pump on">Make safe now</button>
         <button disabled=${busy || !fault}
                 onClick=${() => onCommand("ack", "Acknowledge fault",
@@ -255,7 +259,8 @@ function FaultsCard({ pump, alarms, busy, onCommand, onSecure, notify }) {
           Acknowledge only</button>
         <span class=${`pill ${auto ? "good" : "warn"}`}>
           <span class="dot" />automatic recovery ${auto ? "on" : "off"}</span>
-        <button class="small ghost" onClick=${toggleAuto}>
+        <button class="small ghost" onClick=${toggleAuto} disabled=${!canAdmin}
+                title=${canAdmin ? "" : "Switching automatic recovery is an admin's"}>
           ${auto ? "Switch off" : "Switch on"}</button>
       </div>
 
@@ -464,7 +469,7 @@ function TemperaturePanel({ samples, pump }) {
     <//>`;
 }
 
-export function PumpView({ state, onCommand, onWriteParam, busy,
+export function PumpView({ state, onCommand, onWriteParam, busy, safeBusy,
                            onShutdown, onSecure, notify, shutdown }) {
   const pump = state?.devices?.pump;
   const [accessories, setAccessories] = useState(null);
@@ -549,6 +554,7 @@ export function PumpView({ state, onCommand, onWriteParam, busy,
       <//>
 
       <${FaultsCard} pump=${pump} alarms=${state?.alarms} busy=${busy}
+                     safeBusy=${safeBusy} canAdmin=${state?.me?.can?.admin !== false}
                      onCommand=${onCommand} onSecure=${onSecure} notify=${notify} />
 
       <div class="grid two">

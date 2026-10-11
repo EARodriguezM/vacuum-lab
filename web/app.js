@@ -1,39 +1,52 @@
-// Root of the panel: polling, navigation, and the confirmation gate.
+// Root of the panel: signing in, polling, navigation, and the confirmation gate.
 //
 // One poll drives everything. /api/state carries every instrument's cached
-// snapshot plus the run engine's status, so the views never fetch on their
-// own except for the things that are expensive or rarely change (accessory
-// parameters, run history, the capability probe).
+// snapshot plus the run engine's status -- and who is looking, and who has
+// control of the rig -- so the views never fetch on their own except for the
+// things that are expensive or rarely change (accessory parameters, run
+// history, the capability probe). Charts that need more join the same poll
+// (api.js joinPoll), so the page redraws once per cycle, not once per timer.
 //
 // Every command that moves hardware goes through `ask()`, which puts the
 // action in front of the operator in plain words before it is sent. The
-// server independently refuses anything arriving without `confirm`, so this
-// dialog is the courtesy, not the safety.
+// server independently refuses anything arriving without `confirm`, and
+// decides who may send it at all (lab/auth.py), so this dialog is the
+// courtesy, not the safety.
 
 import { html } from "./html.js";
 import { render } from "preact";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
-import { api, settings, updateSettings } from "./api.js";
-import { Banner, Choose, Confirm, Toasts, useToasts } from "./ui.js";
+import { AuthError, api, onAuthProblem, onSessionChange, pollParticipants,
+         sessionTokens, setPersonSession, settings, updateSettings } from "./api.js";
+import { Banner, Choose, Confirm, Pill, Toasts, useToasts } from "./ui.js";
 import { AlarmBar, useAlarmSignals } from "./alarms.js";
 import { DashboardView } from "./views/dashboard.js";
 import { Overview } from "./views/overview.js";
-import { PumpView } from "./views/pump.js";
-import { GaugeView } from "./views/gauge.js";
+import { EquipmentView } from "./views/equipment.js";
 import { TestsView } from "./views/tests.js";
 import { HistoryView } from "./views/history.js";
 import { SettingsView } from "./views/settings.js";
+import { ChangePassword, LoginView, ReauthDialog } from "./views/login.js";
 import * as fmt from "./format.js";
 
 const TABS = [
   { key: "dashboard", label: "Dashboard" },
   { key: "overview", label: "Overview" },
-  { key: "pump", label: "Pump" },
-  { key: "gauge", label: "Gauge" },
+  { key: "equipment", label: "Equipment" },
   { key: "tests", label: "Process" },
   { key: "history", label: "History" },
   { key: "settings", label: "Settings" },
 ];
+
+// The pump and the gauge had tabs of their own. Old links and bookmarks land
+// on their sub-tab of Equipment.
+const MOVED = { pump: "equipment/pump", gauge: "equipment/gauge" };
+
+// A deliberate touch is reported at most this often: often enough that a
+// person using the panel never meets the idle prompt (lab/auth.py IDLE_S).
+const TOUCH_EVERY_MS = 60000;
+
+const NO_LIVE = { runId: null, samples: [], lastT: null, fullAt: 0 };
 
 function applyTheme(theme) {
   const root = document.documentElement;
@@ -41,11 +54,128 @@ function applyTheme(theme) {
   else root.setAttribute("data-theme", theme);
 }
 
+/** The hash is "#tab" or "#tab/detail": "#history/26" opens run 26. */
+function parseHash() {
+  let [head, sub] = location.hash.replace("#", "").split("/");
+  if (MOVED[head]) {
+    window.history.replaceState(null, "", `#${MOVED[head]}`);
+    [head, sub] = MOVED[head].split("/");
+  }
+  return { tab: head || "dashboard", sub: sub || "" };
+}
+
+/**
+ * The run in progress: the whole run once, decimated, then only the rows
+ * newer than the last one held -- one or two per poll instead of the whole
+ * run again. Reloaded once a minute so a long run stays decimated.
+ */
+async function fetchLive(held) {
+  const reload = held.runId === null || Date.now() - held.fullAt > 60000;
+  const payload = reload ? await api.liveRun(1500) : await api.liveSince(held.lastT ?? -1);
+  return { payload, reload };
+}
+
+function mergeLive(held, { payload, reload }) {
+  const rows = payload?.samples || [];
+  if (reload) {
+    return { runId: payload?.run_id ?? null, samples: rows,
+             lastT: rows.length ? rows[rows.length - 1].t : null, fullAt: Date.now() };
+  }
+  if (payload?.run_id !== held.runId) return NO_LIVE;   // a new run: start over
+  if (!rows.length) return held;                         // nothing new: no redraw
+  return { ...held, samples: held.samples.concat(rows), lastT: rows[rows.length - 1].t };
+}
+
+/** Who holds control of the rig, and the one button that changes it. */
+function ControlChip({ control, me, onTake, onRelease, onTakeOver }) {
+  if (!control?.enabled || !me || me.kind === "device") return null;
+  if (control.held && control.mine) {
+    return html`
+      <span class="chip-group">
+        <${Pill} tone="good" title="You may move the hardware">You have control<//>
+        <button class="small" onClick=${onRelease}>Release</button>
+      </span>`;
+  }
+  if (control.held) {
+    return html`
+      <span class="chip-group">
+        <${Pill} tone="warn" title=${`Since ${fmt.clock(control.since)}`}>
+          ${control.holder} has control<//>
+        ${me.can?.admin && html`
+          <button class="small" onClick=${onTakeOver}>Take over</button>`}
+      </span>`;
+  }
+  if (me.can?.operate) {
+    return html`<button class="small" onClick=${onTake}
+                        title="Nobody is driving the rig. Acting takes control too.">
+      Take control</button>`;
+  }
+  return null;
+}
+
+/** Who is looking: a person, a paired tablet, or nobody (accounts off). */
+function UserChip({ me, onSignIn, onSignOut, onAccount }) {
+  if (!me) return null;
+  if (me.kind === "local") {
+    return html`<${Pill} tone="crit"
+      title="The server was started with --no-auth: anyone who reaches it can drive the rig">
+      accounts off<//>`;
+  }
+  if (me.kind === "device") {
+    return html`
+      <span class="chip-group">
+        <span class="small muted">${me.name} · watching</span>
+        <button class="small primary" onClick=${onSignIn}>Sign in</button>
+      </span>`;
+  }
+  return html`
+    <span class="chip-group">
+      <button class="ghost small user-name" onClick=${onAccount} title="My account">
+        <strong>${me.name}</strong>
+        <span class="muted">· ${me.role}${me.idle ? " · idle" : ""}</span>
+      </button>
+      <button class="small" onClick=${onSignOut}>Sign out</button>
+    </span>`;
+}
+
+/** Why the controls on this page are greyed out, when they are. */
+function WatchingNotice({ me, control, onReauth, onTakeOver }) {
+  if (!me || me.kind === "local" || me.must_change) return null;
+  if (me.kind === "device") {
+    return html`<${Banner}>This tablet only watches. A person signs in on it to
+      act, and is signed out again after a quarter of an hour without a touch.<//>`;
+  }
+  if (me.role === "viewer") {
+    return html`<${Banner}>You are a viewer here: everything is visible, nothing
+      can be changed. To operate the rig, ask for it under${" "}
+      <a href="#settings">Settings → My account</a>.<//>`;
+  }
+  if (me.idle) {
+    return html`
+      <${Banner} tone="warn">
+        <strong>Watching only.</strong> Nothing was touched for a while, so the
+        controls wait for your password.
+        <button class="small" style="margin-left:10px" onClick=${onReauth}>
+          Enter password</button>
+      <//>`;
+  }
+  if (control?.enabled && control.held && !control.mine) {
+    return html`
+      <${Banner}>
+        <strong>${control.holder} has control of the rig</strong> since${" "}
+        ${fmt.clock(control.since)}. Make safe, stopping a run without powering
+        down, and acknowledging alarms stay open to you.
+        ${me.can?.admin && html`
+          <button class="small" style="margin-left:10px" onClick=${onTakeOver}>
+            Take over</button>`}
+      <//>`;
+  }
+  return null;
+}
+
 function App() {
-  // The hash is "#tab" or "#tab/detail" -- "#history/26" opens run 26, so a
-  // run can be linked to directly.
-  const tabOf = () => location.hash.replace("#", "").split("/")[0] || "dashboard";
-  const [tab, setTab] = useState(tabOf);
+  const [where, setWhere] = useState(parseHash);
+  const tab = where.tab;
   const [state, setState] = useState(null);
   const [live, setLive] = useState(null);
   const [error, setError] = useState(null);
@@ -54,66 +184,185 @@ function App() {
   const [stopping, setStopping] = useState(false);
   const [poweringDown, setPoweringDown] = useState(false);
   const [securing, setSecuring] = useState(false);
+  const [takingOver, setTakingOver] = useState(false);
   const [toasts, notify, dismiss] = useToasts();
   const [tick, setTick] = useState(0);
 
-  // A ref, not state: the poll loop reads it without needing to be rebuilt
-  // every time a run starts or stops.
+  // Accounts: the sessions this browser holds, whether the sign-in page is
+  // up, and whether the server wants the password again.
+  const [held, setHeld] = useState(sessionTokens);
+  const [needLogin, setNeedLogin] = useState(false);
+  const [showLogin, setShowLogin] = useState(false);
+  const [reauth, setReauth] = useState(false);
+  const [ping, setPing] = useState(null);
+
+  // Refs, not state: the poll loop and the touch listener read them without
+  // being rebuilt every time they change.
   const runningRef = useRef(false);
+  const liveRef = useRef(NO_LIVE);
+  const stateRef = useRef(null);
+  const touchRef = useRef({ last: Date.now(), sent: 0 });
+  stateRef.current = state;
 
   useEffect(() => { applyTheme(settings().theme); }, [tick]);
 
   useEffect(() => {
-    const onHash = () => setTab(tabOf());
+    const onHash = () => setWhere(parseHash());
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
   const navigate = useCallback((key) => {
     location.hash = key;
-    setTab(key);
+    setWhere(parseHash());
   }, []);
 
-  // --- polling ------------------------------------------------------------
+  // --- accounts -------------------------------------------------------------
+
+  useEffect(() => { api.ping().then(setPing).catch(() => {}); }, [held]);
+
+  useEffect(() => onSessionChange((next) => {
+    setHeld({ ...next });
+    setNeedLogin(false);
+    setShowLogin(false);
+    setTick((t) => t + 1);              // poll now, as whoever this is
+    // The on-screen keyboard leaves the page scrolled to wherever the
+    // sign-in form was; whoever arrives starts at the top.
+    window.scrollTo(0, 0);
+  }), []);
+
+  useEffect(() => onAuthProblem((problem) => {
+    if (problem.reauth) setReauth(true);
+    if (problem.mustChange) setTick((t) => t + 1);   // `me` says so; the page asks
+  }), []);
+
+  const signOut = useCallback(async (message) => {
+    try { await api.logout(); } catch { /* the session may already be gone */ }
+    setPersonSession(null);
+    if (message) notify(message, "ok");
+  }, []);
+
+  // A deliberate touch keeps a person's session able to act. Reported at
+  // most once a minute, and only while it still can: once idle, only the
+  // password wakes it, so a stranger's tap on an abandoned tablet does not.
+  useEffect(() => {
+    const touched = () => {
+      const now = Date.now();
+      touchRef.current.last = now;
+      const me = stateRef.current?.me;
+      if (me?.kind === "person" && !me.idle && now - touchRef.current.sent > TOUCH_EVERY_MS) {
+        touchRef.current.sent = now;
+        api.touch().catch(() => {});
+      }
+    };
+    window.addEventListener("pointerdown", touched, { passive: true });
+    window.addEventListener("keydown", touched);
+    return () => {
+      window.removeEventListener("pointerdown", touched);
+      window.removeEventListener("keydown", touched);
+    };
+  }, []);
+
+  // On a paired tablet a person who walks away is signed out altogether, and
+  // the tablet goes back to watching. On a personal phone the session stays,
+  // watching, and asks for the password before acting (the server's rule).
+  const signOutIfAbandoned = (me) => {
+    const tokens = sessionTokens();
+    if (!tokens.device || !tokens.person || me?.kind !== "person") return;
+    if (Date.now() - touchRef.current.last > (me.idle_after_s || 900) * 1000) {
+      signOut("Signed out after a quarter of an hour without a touch. The tablet keeps watching.");
+    }
+  };
+
+  // --- polling --------------------------------------------------------------
   useEffect(() => {
     let cancelled = false;
     let timer = null;
+    let inFlight = false;
+    const schedule = (ms) => {
+      if (!cancelled) timer = setTimeout(poll, ms);
+    };
 
     const poll = async () => {
+      // A hidden page has nothing to draw, so it fetches nothing either -- a
+      // phone in a pocket must not drain its battery polling. Coming back
+      // into view polls at once.
+      if (cancelled || inFlight || document.hidden) return;
+      inFlight = true;
       try {
-        const next = await api.state();
+        const wantLive = runningRef.current;
+        const [next, applyOthers, liveResult] = await Promise.all([
+          api.state(),
+          pollParticipants(),
+          wantLive ? fetchLive(liveRef.current).catch(() => null) : null,
+        ]);
         if (cancelled) return;
+        // Everything in one synchronous block: Preact redraws once.
         setState(next);
         setError(null);
+        applyOthers();
         runningRef.current = !!next.run?.running;
-
-        // The live sample buffer is only worth fetching while something is
-        // recording; otherwise it is an empty array every two seconds. The
-        // whole run comes back, decimated with every extreme kept, so the
-        // charts show the run from its first sample rather than its last
-        // half hour.
-        if (runningRef.current) {
-          try {
-            const samples = await api.liveRun(1500);
-            if (!cancelled) setLive(samples);
-          } catch { /* the state poll already reported any outage */ }
-        } else if (!cancelled) {
-          setLive(null);
+        if (!runningRef.current) {
+          if (liveRef.current !== NO_LIVE) {
+            liveRef.current = NO_LIVE;
+            setLive(null);
+          }
+        } else if (liveResult) {
+          const merged = mergeLive(liveRef.current, liveResult);
+          if (merged !== liveRef.current) {
+            liveRef.current = merged;
+            setLive({ samples: merged.samples });
+          }
         }
+        signOutIfAbandoned(next.me);
+        schedule(Math.max(500, settings().pollMs));
       } catch (problem) {
-        if (!cancelled) setError(problem.message);
-      } finally {
-        if (!cancelled) {
-          timer = setTimeout(poll, Math.max(500, settings().pollMs));
+        if (cancelled) return;
+        if (problem instanceof AuthError && problem.login) {
+          // The person's session is gone. A tablet falls back to watching
+          // at once; with nothing to fall back to, the sign-in page.
+          const tokens = sessionTokens();
+          if (tokens.person || tokens.device) {
+            schedule(0);
+          } else {
+            setNeedLogin(true);
+            setState(null);
+          }
+          return;
         }
+        setError(problem.message);
+        schedule(Math.max(500, settings().pollMs));
+      } finally {
+        inFlight = false;
       }
     };
 
+    const onVisible = () => {
+      if (!document.hidden && !cancelled) {
+        clearTimeout(timer);
+        poll();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
     poll();
-    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [tick]);
 
   // --- commands -----------------------------------------------------------
+
+  /** A refused request: the password dialog has already opened if that is why. */
+  const fail = (problem) => {
+    if (problem instanceof AuthError) {
+      if (problem.reauth) notify("Enter your password, then try again.", "error");
+      else if (problem.login) notify("Sign in to do that.", "error");
+      return;
+    }
+    notify(problem.message, "error");
+  };
 
   /** Put a hardware action in front of the operator before sending it. */
   const ask = useCallback((device, action, label, reason, value, options = {}) => {
@@ -138,7 +387,7 @@ function App() {
       }
       return result;
     } catch (problem) {
-      notify(problem.message, "error");
+      fail(problem);
       return { ok: false, error: problem.message };
     } finally {
       setBusy(false);
@@ -172,30 +421,40 @@ function App() {
       ask("gauge", action, label, reason, value, options),
     [ask]);
 
-  const startRun = async (body) => {
+  /** One request with the panel busy, a toast for the outcome. */
+  const perform = async (call, success) => {
     setBusy(true);
     try {
-      const result = await api.startRun(body);
-      if (result.ok) notify(`Started run ${result.run.id}.`, "ok");
-      else notify(result.error, "error");
+      const result = await call();
+      if (result.ok) {
+        if (success) notify(typeof success === "function" ? success(result) : success, "ok");
+      } else {
+        notify(result.error, "error");
+      }
+      return result;
     } catch (problem) {
-      notify(problem.message, "error");
+      fail(problem);
+      return null;
     } finally {
       setBusy(false);
     }
   };
 
-  const acknowledgeStep = async () => {
-    setBusy(true);
-    try {
-      const result = await api.acknowledgeStep();
-      if (result.ok) notify("Step confirmed — the run continues.", "ok");
-      else notify(result.error, "error");
-    } catch (problem) {
-      notify(problem.message, "error");
-    } finally {
-      setBusy(false);
-    }
+  const startRun = (body) => perform(() => api.startRun(body),
+                                     (result) => `Started run ${result.run.id}.`);
+
+  const acknowledgeStep = () => perform(() => api.acknowledgeStep(),
+                                        "Step confirmed — the run continues.");
+
+  const takeControl = async (force = false) => {
+    const result = await perform(() => api.takeControl(force),
+                                 force ? "You took control of the rig." : "You have control of the rig.");
+    if (result?.ok) setTick((t) => t + 1);
+  };
+
+  const releaseControl = async () => {
+    const result = await perform(() => api.releaseControl(), "Control released.");
+    if (result?.ok) setTick((t) => t + 1);
   };
 
   // Keeping the vacuum is the first answer for every procedure: it leaves
@@ -229,20 +488,13 @@ function App() {
   const finishStop = async (choice) => {
     setStopping(false);
     const shutdown = choice === "shutdown";
-    setBusy(true);
-    try {
-      const result = await api.stopRun(
+    await perform(
+      () => api.stopRun(
         shutdown ? "stopped by the operator, powering the pump down"
                  : "stopped by the operator, chamber left under vacuum",
-        shutdown);
-      if (!result.ok) notify(result.error, "error");
-      else if (shutdown) notify("Stopping the run, then powering down…", "ok");
-      else notify("Stopping the run. The pump keeps running.", "ok");
-    } catch (problem) {
-      notify(problem.message, "error");
-    } finally {
-      setBusy(false);
-    }
+        shutdown),
+      shutdown ? "Stopping the run, then powering down…"
+               : "Stopping the run. The pump keeps running.");
   };
 
   // --- render -------------------------------------------------------------
@@ -260,7 +512,7 @@ function App() {
       await api.acknowledgeAlarms(id);
       setTick((t) => t + 1);          // poll again now rather than in 2 s
     } catch (problem) {
-      notify(problem.message, "error");
+      fail(problem);
     }
   };
 
@@ -269,27 +521,12 @@ function App() {
   // switched off or a person wants it now.
   const makeSafe = async () => {
     setSecuring(false);
-    setBusy(true);
-    try {
-      const result = await api.securePump("Make safe, from the panel");
-      if (result.ok) notify("Making the pump safe: motor off, fault cleared, forevacuum pump on…", "ok");
-      else notify(result.error, "error");
-    } catch (problem) {
-      notify(problem.message, "error");
-    } finally {
-      setBusy(false);
-    }
+    await perform(() => api.securePump("Make safe, from the panel"),
+                  "Making the pump safe: motor off, fault cleared, forevacuum pump on…");
   };
 
-  const cancelPowerDown = async () => {
-    try {
-      const result = await api.cancelShutdown();
-      if (result.ok) notify("Power-down cancelled. The backing pump keeps running.", "ok");
-      else notify(result.error, "error");
-    } catch (problem) {
-      notify(problem.message, "error");
-    }
-  };
+  const cancelPowerDown = () => perform(
+    () => api.cancelShutdown(), "Power-down cancelled. The backing pump keeps running.");
 
   useAlarmSignals(state?.alarms);
 
@@ -298,17 +535,31 @@ function App() {
   // running, then stop the station. The server owns the sequence.
   const powerDown = async () => {
     setPoweringDown(false);
-    setBusy(true);
-    try {
-      const result = await api.shutdownPump("requested from the pump page");
-      if (result.ok) notify("Powering the pump down…", "ok");
-      else notify(result.error, "error");
-    } catch (problem) {
-      notify(problem.message, "error");
-    } finally {
-      setBusy(false);
-    }
+    await perform(() => api.shutdownPump("requested from the pump page"),
+                  "Powering the pump down…");
   };
+
+  // The sign-in page: nobody is signed in, or a person is signing in on a
+  // paired tablet (who can go back to watching).
+  if (needLogin || showLogin) {
+    return html`
+      <div class="wrap">
+        <${LoginView} ping=${ping}
+                      onSignedIn=${() => { setNeedLogin(false); setShowLogin(false); }}
+                      onCancel=${showLogin && !needLogin ? () => setShowLogin(false) : null} />
+        <${Toasts} items=${toasts} onDismiss=${dismiss} />
+      </div>`;
+  }
+
+  const me = state?.me;
+  const control = state?.control;
+  // What the operator may press. Anything that moves hardware needs an
+  // operator who is not idle and either holds control or finds it free (the
+  // first action takes it). What makes the rig safer needs only the first.
+  const canOperate = !!me?.can?.operate;
+  const controlFree = !control?.enabled || !control.held || control.mine;
+  const locked = busy || !canOperate || !controlFree;
+  const safeLocked = busy || !canOperate;
 
   const run = state?.run;
   // Reported whether or not a run is live: a power-down outlives the run
@@ -319,44 +570,62 @@ function App() {
   const shutdown = run?.shutdown;
   const stationOn = state?.devices?.pump?.setpoints?.PumpgStatn === true;
   const showShutdown = shutdown && (shutdown.active || !stationOn);
+  const instruments = state
+    ? (state.order || Object.keys(state.devices || {}))
+      .map((key) => state.devices?.[key]?.label).filter(Boolean).join(" · ")
+    : "";
+  const chamberName = state?.chamber?.name || ping?.chamber?.name;
+  const notice = (tab === "equipment" || tab === "tests") && html`
+    <${WatchingNotice} me=${me} control=${control} onReauth=${() => setReauth(true)}
+                       onTakeOver=${() => setTakingOver(true)} />`;
+
   const body = () => {
     if (!state && error) {
       return html`
         <${Banner} tone="crit">
           <strong>Not connected.</strong> ${error}
           <div class="small" style="margin-top:8px">
-            Set the controller address under
+            Set the controller address under${" "}
             <a href="#settings" onClick=${() => navigate("settings")}>Settings</a>
-            if the server is on another machine.
+            ${" "}if the server is on another machine.
           </div>
         <//>`;
     }
     if (!state) return html`<div class="boot">Connecting…</div>`;
 
+    if (me?.must_change) {
+      return html`
+        <section class="card narrow">
+          <h2>Choose your own password</h2>
+          <${ChangePassword} forced=${true} notify=${notify}
+                             onDone=${() => setTick((t) => t + 1)} />
+        </section>`;
+    }
+
     switch (tab) {
       case "dashboard":
         return html`<${DashboardView} state=${state} live=${live} />`;
-      case "pump":
-        return html`<${PumpView} state=${state} onCommand=${pumpCommand}
-                                 onWriteParam=${writeParam} busy=${busy}
-                                 onShutdown=${() => setPoweringDown(true)}
-                                 onSecure=${() => setSecuring(true)}
-                                 notify=${notify}
-                                 shutdown=${shutdown} />`;
-      case "gauge":
-        return html`<${GaugeView} state=${state} onCommand=${gaugeCommand}
-                                  busy=${busy} />`;
+      case "equipment":
+        return html`<${EquipmentView} state=${state} sub=${where.sub}
+          onSelect=${(key) => navigate(`equipment/${key}`)}
+          pumpProps=${{ state, onCommand: pumpCommand, onWriteParam: writeParam,
+                        busy: locked, safeBusy: safeLocked, notify, shutdown,
+                        onShutdown: () => setPoweringDown(true),
+                        onSecure: () => setSecuring(true) }}
+          gaugeProps=${{ state, onCommand: gaugeCommand, busy: locked }} />`;
       case "tests":
         return html`<${TestsView} state=${state} live=${live} onStart=${startRun}
-                                  onStop=${stopRun} busy=${busy}
+                                  onStop=${stopRun} busy=${locked} stopBusy=${safeLocked}
                                   onAcknowledge=${acknowledgeStep} />`;
       case "history":
         return html`<${HistoryView} notify=${notify} state=${state} />`;
       case "settings":
         return html`<${SettingsView} state=${state} notify=${notify}
+                                     onSignOut=${() => signOut("Signed out.")}
                                      onSettingsChanged=${() => setTick((t) => t + 1)} />`;
       default:
-        return html`<${Overview} state=${state} live=${live} onStop=${stopRun}
+        return html`<${Overview} state=${state} live=${live}
+                                 onStop=${canOperate ? stopRun : null}
                                  onNavigate=${navigate} />`;
     }
   };
@@ -367,11 +636,17 @@ function App() {
         <div class="brand">
           <h1>Vacuum Lab Control</h1>
           <span class="sub">
-            TC 600 turbopump · TPG gauge controller
+            ${chamberName ? `${chamberName} · ` : ""}${instruments}
             ${state ? ` · up ${fmt.duration(state.uptime_s)}` : ""}
           </span>
         </div>
         <div class="top-actions">
+          <${ControlChip} control=${control} me=${me}
+                          onTake=${() => takeControl(false)} onRelease=${releaseControl}
+                          onTakeOver=${() => setTakingOver(true)} />
+          <${UserChip} me=${me} onSignIn=${() => setShowLogin(true)}
+                       onSignOut=${() => signOut("Signed out.")}
+                       onAccount=${() => navigate("settings")} />
           <button class="ghost small" onClick=${cycleTheme}
                   title=${`Theme: ${theme}`}>
             ${theme === "auto" ? "Auto" : theme === "light" ? "Light" : "Dark"}
@@ -387,13 +662,17 @@ function App() {
             ${entry.key === "tests" && run?.running
               ? html`<span class="badge pill accent"><span class="dot" />live</span>`
               : null}
+            ${entry.key === "settings" && me?.waiting > 0
+              ? html`<span class="badge pill warn" title="Waiting for an admin">${me.waiting}</span>`
+              : null}
           </button>`)}
       </nav>
 
       ${error && state && html`
         <${Banner} tone="warn">Lost contact with the server: ${error}<//>`}
 
-      <${AlarmBar} alarms=${state?.alarms} onAcknowledge=${acknowledgeAlarms} busy=${busy} />
+      <${AlarmBar} alarms=${state?.alarms} onAcknowledge=${acknowledgeAlarms}
+                   busy=${safeLocked} />
 
       ${showShutdown && html`
         <${Banner} tone=${shutdown.active ? "warn"
@@ -403,18 +682,22 @@ function App() {
                     : "Power-down stopped:"}</strong> ${shutdown.message}
           ${shutdown.active && shutdown.rotor_hz != null
             ? ` Rotor at ${Math.round(shutdown.rotor_hz)} Hz.` : ""}
-          ${shutdown.active && html`
+          ${shutdown.active && canOperate && html`
             <button class="small" style="margin-left:10px" onClick=${cancelPowerDown}>
               Cancel — keep the backing pump running</button>`}
         <//>`}
+
+      ${notice}
 
       ${body()}
 
       <${Choose} open=${stopping}
         title="Stop the run"
         body=${html`<p>The recording ends either way and everything measured
-          so far is kept. What should the pump do?</p>`}
-        options=${stopOptions()}
+          so far is kept. What should the pump do?</p>
+          ${!controlFree && html`<p class="small muted">${control.holder} has
+            control, so only keeping the vacuum is open to you.</p>`}`}
+        options=${controlFree ? stopOptions() : stopOptions().slice(0, 1)}
         onChoose=${finishStop} onCancel=${() => setStopping(false)} />
 
       <${Confirm} open=${securing}
@@ -436,6 +719,15 @@ function App() {
           chamber is left under whatever vacuum it holds.</p>`}
         onCancel=${() => setPoweringDown(false)} onConfirm=${powerDown} />
 
+      <${Confirm} open=${takingOver}
+        title=${`Take control from ${control?.holder || "the operator"}?`}
+        tone="danger" confirmLabel="Take over"
+        body=${html`<p>${control?.holder || "They"} can no longer move the
+          hardware until they take control back. Make safe and stopping a run
+          stay open to them. The takeover is logged under your name.</p>`}
+        onCancel=${() => setTakingOver(false)}
+        onConfirm=${() => { setTakingOver(false); takeControl(true); }} />
+
       <${Confirm} open=${!!pending}
         title=${pending?.label || "Confirm"}
         tone=${/off|stop|delete/i.test(pending?.action || "") ? "danger" : "primary"}
@@ -443,16 +735,23 @@ function App() {
         body=${html`
           <p>${pending?.reason ||
             "This changes what the hardware is doing right now."}</p>`}
-        extra=${pending?.reason ? html`
+        extra=${pending?.reason && me?.can?.override ? html`
           <label class="check">
             <input type="checkbox" checked=${pending.override}
                    onChange=${(e) => setPending({ ...pending,
                                                   override: e.target.checked })} />
             <span>Override the interlock
               <div class="help">Only when you know why the rule does not apply.
-                Overrides are logged.</div></span>
-          </label>` : null}
+                Overrides are logged under your name.</div></span>
+          </label>`
+          : pending?.reason ? html`
+            <p class="small muted">Only an admin can override an interlock.</p>`
+          : null}
         onCancel=${cancelPending} onConfirm=${confirmPending} />
+
+      <${ReauthDialog} open=${reauth} me=${me}
+        onDone=${() => { setReauth(false); notify("Welcome back. The controls are yours again.", "ok"); setTick((t) => t + 1); }}
+        onCancel=${() => setReauth(false)} />
 
       <${Toasts} items=${toasts} onDismiss=${dismiss} />
     </div>`;

@@ -100,9 +100,11 @@ class Supervisor:
 
     # --- alarms -------------------------------------------------------------
 
-    def _log(self, level: str, message: str, detail: dict | None = None) -> None:
+    def _log(self, level: str, message: str, detail: dict | None = None,
+             user: str | None = None) -> None:
         try:
-            self.db.add_event(self.engine.run_id(), level, message, detail)
+            self.db.add_event(self.engine.run_id(), level, message, detail,
+                              user=user)
         except Exception:
             pass
 
@@ -146,7 +148,8 @@ class Supervisor:
         for title in cleared:
             self._log("info", f"Cleared: {title}")
 
-    def acknowledge(self, which="all") -> dict:
+    def acknowledge(self, which="all", user=None) -> dict:
+        """`user` is whoever acknowledged (lab/auth.py's Principal), or None."""
         count = 0
         with self._lock:
             for alarm in self._alarms:
@@ -155,10 +158,13 @@ class Supervisor:
                 if which == "all" or alarm["id"] == which:
                     alarm["acknowledged"] = True
                     alarm["acknowledged_at"] = time.time()
+                    alarm["acknowledged_by"] = getattr(user, "name", None)
                     count += 1
         if count:
-            self._log("action", f"Operator acknowledged {count} alarm"
-                                f"{'s' if count != 1 else ''}")
+            who = getattr(user, "name", None) or "Operator"
+            self._log("action", f"{who} acknowledged {count} alarm"
+                                f"{'s' if count != 1 else ''}",
+                      user=getattr(user, "username", None))
         return {"ok": True, "acknowledged": count}
 
     def describe(self) -> dict:
@@ -169,10 +175,12 @@ class Supervisor:
         return {"alarms": unacknowledged, "recent": list(reversed(alarms))[:40],
                 "auto_recover": self.auto_recover, "recovering": self.recovering}
 
-    def set_auto_recover(self, on: bool) -> dict:
+    def set_auto_recover(self, on: bool, user=None) -> dict:
         self.auto_recover = bool(on)
         self._log("action", "Automatic fault recovery switched "
-                            + ("on" if on else "off") + " by the operator")
+                            + ("on" if on else "off") + " by "
+                            + (getattr(user, "name", None) or "the operator"),
+                  user=getattr(user, "username", None))
         return {"ok": True, "auto_recover": self.auto_recover}
 
     # --- watching -----------------------------------------------------------

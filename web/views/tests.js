@@ -13,7 +13,7 @@ import { RunCharts } from "../runcharts.js";
 import { useStored } from "../rigcharts.js";
 import { ActionList } from "../alarms.js";
 import * as A from "../analysis.js";
-import { api } from "../api.js";
+import { api, joinPoll } from "../api.js";
 import * as fmt from "../format.js";
 import * as status from "../status.js";
 
@@ -115,7 +115,10 @@ function Actuators({ actuators }) {
     </div>`;
 }
 
-function LiveRun({ run, samples, events, onStop, onAcknowledge, busy, devices }) {
+// `busy` locks what needs control of the rig; `stopBusy` only the stop
+// button, which every operator may press whoever holds control.
+function LiveRun({ run, samples, events, onStop, onAcknowledge, busy, stopBusy,
+                   devices }) {
   const phases = run.phases || [];
   const index = phases.indexOf(run.phase);
   const share = phases.length > 1
@@ -136,7 +139,7 @@ function LiveRun({ run, samples, events, onStop, onAcknowledge, busy, devices })
                hint=${`${run.label} · ${run.mode === "auto" ? "automatic" : "guided"}` +
                       ` · started ${fmt.dateTime(run.run?.started_at)}`}
                actions=${html`
-                 <button class="danger" disabled=${busy} onClick=${onStop}>
+                 <button class="danger" disabled=${stopBusy ?? busy} onClick=${onStop}>
                    ${run.stopping ? "Stopping…" : "Stop run"}</button>`}>
         <div class="phases">
           ${phases.map((phase, position) => html`
@@ -169,11 +172,13 @@ function LiveRun({ run, samples, events, onStop, onAcknowledge, busy, devices })
     </div>`;
 }
 
-function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable = {} }) {
+function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable = {},
+                 me = null }) {
   const [name, setName] = useState("");
   const [chosen, setChosen] = useState("");
-  const [operator, setOperator] = useState(
-    () => localStorage.getItem("vacuum-lab-operator") || "");
+  // Whoever is signed in, unless they type somebody else's name: a student
+  // running a run for a supervisor. The account is recorded either way.
+  const [operator, setOperator] = useState(() => me?.name || "");
   const [notes, setNotes] = useState("");
   const [config, setConfig] = useState({});
 
@@ -193,7 +198,6 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
   if (!procedure) return html`<${Empty}>The server published no procedures.<//>`;
 
   const start = () => {
-    localStorage.setItem("vacuum-lab-operator", operator);
     onStart({
       procedure: procedure.name,
       name: name || procedure.label,
@@ -316,33 +320,40 @@ function AfterRun({ last, state, onDismiss }) {
     return () => { cancelled = true; clearInterval(timer); };
   }, [last.id]);
 
-  // Everything the rig recorded since the run ended, kept up to date.
+  // Everything the rig recorded since the run ended, kept up to date -- on
+  // the panel's own poll, so it redraws with everything else (api.js).
   useEffect(() => {
     let cancelled = false;
-    let timer = null;
     let newest = null;
     let rows = [];
-    const tick = async () => {
-      try {
-        const payload = newest === null
-          ? await api.history(Math.max(60, (state?.server_time || Date.now() / 1000)
-                                             - last.ended_at + 10), 1500)
-          : await api.history(0, 2000, newest);
-        if (payload.ok) {
-          const fresh = A.historySamples(payload).filter((r) => r.at > last.ended_at);
-          if (fresh.length) {
-            rows = rows.concat(fresh.filter((r) => newest === null || r.at > newest));
-            newest = rows[rows.length - 1].at;
-            if (!cancelled) setAfter(rows);
-          } else if (newest === null) {
-            newest = last.ended_at;
-          }
-        }
-      } catch { /* the main poll reports an outage */ }
-      if (!cancelled) timer = setTimeout(tick, 2000);
+    let pending = null;
+    const load = () => (newest === null
+      ? api.history(Math.max(60, (state?.server_time || Date.now() / 1000)
+                                 - last.ended_at + 10), 1500)
+      : api.history(0, 2000, newest));
+    const fetch = () => {
+      if (pending) return Promise.resolve({ skip: true });
+      pending = load().finally(() => { pending = null; });
+      return pending;
     };
-    tick();
-    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+    const apply = (result) => {
+      // An outage is the main poll's to report.
+      if (cancelled || result.status !== "fulfilled") return;
+      const payload = result.value;
+      if (payload?.skip || !payload?.ok) return;
+      const fresh = A.historySamples(payload).filter((r) => r.at > last.ended_at);
+      if (fresh.length) {
+        rows = rows.concat(fresh.filter((r) => newest === null || r.at > newest));
+        newest = rows[rows.length - 1].at;
+        setAfter(rows);
+      } else if (newest === null) {
+        newest = last.ended_at;
+      }
+    };
+    fetch().then((value) => apply({ status: "fulfilled", value }),
+                 (reason) => apply({ status: "rejected", reason }));
+    const leave = joinPoll({ fetch, apply });
+    return () => { cancelled = true; leave(); };
   }, [last.id]);
 
   const samples = useMemo(() => stored.concat(after.map((r) => ({
@@ -392,7 +403,8 @@ function AfterRun({ last, state, onDismiss }) {
     </div>`;
 }
 
-export function TestsView({ state, live, onStart, onStop, onAcknowledge, busy }) {
+export function TestsView({ state, live, onStart, onStop, onAcknowledge, busy,
+                            stopBusy }) {
   const [procedures, setProcedures] = useState([]);
   const [events, setEvents] = useState([]);
   const [dismissed, setDismissed] = useStored("vacuum-lab-dismissed-run", null);
@@ -419,7 +431,7 @@ export function TestsView({ state, live, onStart, onStop, onAcknowledge, busy })
     return html`<${LiveRun} run=${run} samples=${live?.samples || []}
                             events=${events} onStop=${onStop}
                             onAcknowledge=${onAcknowledge} busy=${busy}
-                            devices=${state?.devices} />`;
+                            stopBusy=${stopBusy} devices=${state?.devices} />`;
   }
 
   // The run that just ended stays on screen, live, until it is dismissed.
@@ -439,7 +451,8 @@ export function TestsView({ state, live, onStart, onStop, onAcknowledge, busy })
   return html`<${Setup} procedures=${procedures} onStart=${onStart}
                         busy=${busy} blocked=${blocked}
                         actuators=${state?.actuators || []}
-                        unavailable=${state?.unavailable || {}} />`;
+                        unavailable=${state?.unavailable || {}}
+                        me=${state?.me} />`;
 }
 
 export { ResultSummary, EventLog };

@@ -16,7 +16,11 @@ Either instrument can be left out (`--no-pump`, `--no-gauge`) and the panel
 still starts, reporting the missing one as offline. That matters during
 bring-up: a gauge that is not wired yet must not stop you driving the pump.
 Starting the turbopump is the exception -- that is gated on the chamber
-pressure, so with no gauge it is refused until an operator overrides it.
+pressure, so with no gauge it is refused until an admin overrides it.
+
+Everybody signs in (lab/auth.py). The first account, the chamber's owner,
+is made on this machine -- `./tools/users.py owner NAME` -- and approves
+everyone else's sign-up from Settings -> People.
 """
 
 from __future__ import annotations
@@ -28,8 +32,8 @@ from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lab import (alarms, api, db as dbmod, discovery, gauge, history,  # noqa: E402
-                 process, pump, registry, runs)
+from lab import (alarms, api, auth, db as dbmod, discovery, gauge,  # noqa: E402
+                 history, process, pump, registry, runs)
 
 
 def build(args) -> api.Application:
@@ -111,7 +115,7 @@ def build(args) -> api.Application:
 
     database = dbmod.Database(args.db)
     engine = runs.RunEngine(database, devices, hardware=hardware,
-                            equipment=equipment)
+                            equipment=equipment, chamber=args.chamber_id)
     # The chart recorder for the pump and gauge pages: the last day of the
     # whole rig, kept whether or not a run is recording. Memory only.
     recorder = history.History(devices, hardware).start()
@@ -120,9 +124,17 @@ def build(args) -> api.Application:
     supervisor = alarms.Supervisor(
         devices, engine, database,
         auto_recover=not args.no_auto_recovery).start()
-    return api.Application(devices, database, engine, token=args.token,
+    # Who may watch and who may drive, per chamber. Sessions outlive a
+    # restart -- they are in the database -- so a deploy does not sign every
+    # tablet out; the expired ones are swept here.
+    accounts = auth.Auth(database, args.chamber_id, enabled=not args.no_auth)
+    database.purge_sessions()
+    return api.Application(devices, database, engine, auth=accounts,
                            history=recorder, supervisor=supervisor,
-                           finder=finder)
+                           finder=finder,
+                           chamber={"id": args.chamber_id,
+                                    "name": args.chamber_name},
+                           allow=api.parse_networks(args.allow_from))
 
 
 def main() -> int:
@@ -156,8 +168,20 @@ def main() -> int:
                         help=f"run database (default {dbmod.default_path()})")
     parser.add_argument("--port", type=int, default=8600)
     parser.add_argument("--bind", default="0.0.0.0")
-    parser.add_argument("--token", default=None,
-                        help="require this shared token on API calls")
+    parser.add_argument("--chamber-id", default="chamber-1",
+                        help="this rig's identifier. Roles are granted per "
+                             "chamber, so keep it once accounts exist")
+    parser.add_argument("--chamber-name", default="Chamber 1",
+                        help="the name the panel shows for this rig")
+    parser.add_argument("--allow-from", default="",
+                        help="comma-separated networks allowed to reach the "
+                             "panel at all, e.g. 192.168.50.0/24. Loopback is "
+                             "always allowed (the tablet on its USB cable). "
+                             "Default: any address")
+    parser.add_argument("--no-auth", action="store_true",
+                        help="switch accounts off: anyone who reaches the port "
+                             "is the owner. For the simulator on a laptop, "
+                             "never for the lab")
     parser.add_argument("--no-port-search", action="store_true",
                         help="use exactly the ports given; never probe other "
                              "ports for the instruments")
@@ -166,12 +190,17 @@ def main() -> int:
                              "the pump safe automatically (motor off, fault "
                              "acknowledged, forevacuum pump kept on)")
     args = parser.parse_args()
+    try:
+        api.parse_networks(args.allow_from)
+    except ValueError as exc:
+        parser.error(f"--allow-from: {exc}")
 
     application = build(args)
     api.Handler.app = application
 
     httpd = ThreadingHTTPServer((args.bind, args.port), api.Handler)
-    print(f"Vacuum lab panel on http://{args.bind}:{args.port}/")
+    print(f"Vacuum lab panel for {args.chamber_name} ({args.chamber_id}) "
+          f"on http://{args.bind}:{args.port}/")
     for device in application.registry:
         print(f"  {device.label}: {device.port}")
     print(f"  database: {application.db.path}")
@@ -185,10 +214,18 @@ def main() -> int:
         print("  (mark it installed in Settings -> Rig equipment once it is)")
     if args.no_gauge and not args.no_pump:
         print("  NO GAUGE: the chamber pressure is unknown, so starting the")
-        print("  turbopump will be refused until you override it deliberately.")
-    if not args.token:
-        print("  NO TOKEN SET: anyone who can reach this port can start and")
-        print("  stop the pump. Pass --token to require a shared secret.")
+        print("  turbopump will be refused until an admin overrides it.")
+    if args.no_auth:
+        print("  ACCOUNTS OFF (--no-auth): anyone who can reach this port can")
+        print("  start and stop the pump. For the simulator, not the lab.")
+    elif not application.auth.status().get("owner"):
+        print("  NO OWNER YET: nobody can sign in until one exists. On this")
+        print("  machine: ./tools/users.py owner YOURNAME"
+              + (f" --db {args.db}" if args.db else "")
+              + (f" --chamber {args.chamber_id}"
+                 if args.chamber_id != "chamber-1" else ""))
+    if args.allow_from:
+        print(f"  reachable only from: {args.allow_from} (and loopback)")
 
     try:
         httpd.serve_forever()
