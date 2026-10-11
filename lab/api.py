@@ -105,8 +105,10 @@ class Application:
             "devices": self.registry.snapshot(),
             "order": self.registry.keys(),
             "run": self.engine.status(),
-            "actuators": self.engine.hardware.describe(),
+            "actuators": self.engine.actuators(),
             "automatic_ready": self.engine.hardware.automatic_ready,
+            # Procedures this rig cannot run, and what each is missing.
+            "unavailable": self.engine.unavailable(),
             "alarms": self.supervisor.describe() if self.supervisor else None,
             "ports": {"search": bool(self.finder and self.finder.enabled),
                       "devices": self.registry.descriptors()},
@@ -302,7 +304,9 @@ class Handler(BaseHTTPRequestHandler):
             "/api/devices": lambda: self._json(
                 {"ok": True, "devices": self.app.registry.descriptors()}),
             "/api/procedures": lambda: self._json(
-                {"ok": True, "procedures": runs.catalogue()}),
+                {"ok": True, "procedures": self.app.engine.catalogue()}),
+            "/api/equipment": lambda: self._json(
+                {"ok": True, "equipment": self.app.engine.equipment_report()}),
             "/api/trends": lambda: self._json(self.app.trends()),
             "/api/stats": lambda: self._json(
                 {"ok": True, "stats": self.app.db.stats(),
@@ -321,7 +325,7 @@ class Handler(BaseHTTPRequestHandler):
                 else {"ok": False, "error": "port search is not available"}),
             "/api/actuators": lambda: self._json(
                 {"ok": True,
-                 "actuators": self.app.engine.hardware.describe(),
+                 "actuators": self.app.engine.actuators(),
                  "automatic_ready": self.app.engine.hardware.automatic_ready,
                  "missing": self.app.engine.hardware.missing()}),
         }.get(route)
@@ -378,6 +382,15 @@ class Handler(BaseHTTPRequestHandler):
             which = payload.get("id", "all")
             self._json(self.app.supervisor.acknowledge(
                 which if which == "all" else int(which)))
+            return
+        if route == "/api/equipment":
+            # Moves nothing, but changes which procedures may run: confirmed.
+            if not payload.get("confirm"):
+                self._json({"ok": False, "error": "changing the rig's equipment "
+                                                  "needs confirm"}, 400)
+                return
+            self._json(self.app.engine.set_equipment(
+                str(payload.get("key", "")), bool(payload.get("installed"))))
             return
         if route == "/api/supervisor":
             if not payload.get("confirm"):

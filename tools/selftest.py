@@ -230,6 +230,33 @@ def test_analysis() -> None:
           stats["first"] == 3.0 and stats["last"] == 2.0)
 
 
+def test_cold_cathode_interlock() -> None:
+    """The gauge on the rig answers "CO9", not "PKR": the rule must still bite."""
+    print("\nCold-cathode interlock")
+    service = gaugemod.GaugeService("gauge", "/dev/null-gauge")
+
+    def snap(mbar):
+        return {"readings": [{"channel": 1, "valid": True, "mbar": mbar}]}
+
+    def refused(identifier, mbar):
+        service._identity = {"gauges": [{"channel": 1, "identifier": identifier}]}
+        try:
+            service._check_sensor_on(1, snap(mbar))
+        except gaugemod.GaugeInterlock:
+            return True
+        return False
+
+    check("the rig's CO9 (a PKR 251) is not struck at 4e2 mbar",
+          refused("CO9", 412.0))
+    check("nor just above the 1e-2 mbar limit", refused("CO9", 2.0e-2))
+    check("it may be switched on below the limit", not refused("CO9", 1.0e-3))
+    check("the published names still count", refused("PKR", 412.0)
+          and refused("IKR9", 1.0))
+    check("a Pirani is never held back", not refused("TPR", 412.0))
+    check("CO9 is described as what it is",
+          "PKR 251" in tpg.commands.describe_gauge("CO9"))
+
+
 def test_process() -> None:
     print("\nProcess hardware")
     from lab import process
@@ -328,6 +355,61 @@ def field_default_mismatches() -> dict[str, list[str]]:
             if key in published and published[key] != fallback
         ]
     return out
+
+
+def test_equipment() -> None:
+    """A procedure whose hardware is not on the rig is switched off."""
+    print("\nRig equipment")
+    from lab import process, registry as reg
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "equipment.json")
+        hardware = process.ProcessHardware()
+        equipment = process.Equipment(path, default=False, hardware=hardware)
+        check("nothing counts as installed until somebody says so",
+              equipment.missing(["gas", "heater"]) ==
+              [process.EQUIPMENT["gas"], process.EQUIPMENT["heater"]])
+
+        database = dbmod.Database(os.path.join(directory, "eq.db"))
+        engine = runs.RunEngine(database, reg.Registry(), hardware=hardware,
+                                equipment=equipment)
+        refused = engine.start("deposition", {})
+        check("a deposition is refused while its hardware is not installed",
+              refused["ok"] is False and "not installed" in refused["error"]
+              and "gate valve" in refused["error"], refused.get("error", "")[:60])
+        check("so are the leak test and the bake-out",
+              engine.start("rate_of_rise", {})["ok"] is False
+              and engine.start("bakeout", {})["ok"] is False)
+        check("a refused procedure creates no run", database.runs(limit=5) == [])
+
+        listed = {entry["name"]: entry for entry in engine.catalogue()}
+        check("the catalogue marks what cannot run, and why",
+              listed["deposition"]["available"] is False
+              and len(listed["deposition"]["missing"]) == 4
+              and listed["full_vacuum"]["available"] is True)
+        check("a pump-only procedure may run unattended with manual actuators",
+              listed["full_vacuum"]["automatic_ready"] is True
+              and listed["base_calibration"]["automatic_ready"] is True)
+        check("the panel's state lists only the procedures that cannot run",
+              sorted(engine.unavailable()) == ["bakeout", "deposition",
+                                               "rate_of_rise"])
+
+        result = engine.set_equipment("gate", True)
+        check("marking the gate valve installed enables the leak test",
+              result["ok"] and "rate_of_rise" not in engine.unavailable())
+        check("the change is in the rig's log",
+              any("Gate valve marked installed" in e["message"]
+                  for e in database.events(limit=5)))
+        check("and survives a restart",
+              process.Equipment(path).installed("gate") is True
+              and process.Equipment(path).installed("magnetron") is False)
+
+        from tools import fake_actuators, fake_tpg
+        fake_actuators.attach(hardware, fake_tpg.Chamber())
+        check("a driven actuator is installed by definition",
+              equipment.installed("magnetron")
+              and equipment.set("magnetron", False)["ok"] is False)
+        database.close()
 
 
 def test_deposition_engine() -> None:
@@ -1331,7 +1413,15 @@ def test_discovery(pump_port: str, gauge_port: str) -> None:
         service = devices.add(pumpmod.PumpService("pump", "/dev/no-such-port"))
         service.SEARCH_AFTER_S = 0.5
         service.SEARCH_EVERY_S = 1.0
-        service.finder = discovery.Finder(devices, memory, enabled=True)
+        # Only the simulators' ports: on the lab PC the default search
+        # reaches /dev/tc600, and the real pump answers there.
+        simulated = [{"device": gauge_port, "serial_number": ""},
+                     {"device": pump_port, "serial_number": ""}]
+        service.finder = discovery.Finder(
+            devices, memory, enabled=True, udev_names={},
+            ports=lambda exclude=(): [p for p in simulated
+                                      if discovery.real(p["device"])
+                                      not in {discovery.real(x) for x in exclude}])
         try:
             moved = wait_until(lambda: service.snapshot().get("connected"), 30)
             check("a silent instrument is found on another port and reconnected",
@@ -1361,8 +1451,10 @@ def main() -> int:
     try:
         test_pump(pump_port)
         test_gauge(gauge_port)
+        test_cold_cathode_interlock()
         test_analysis()
         test_process()
+        test_equipment()
         test_deposition_engine()
         test_database()
         test_history_and_charts()

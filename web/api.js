@@ -140,6 +140,10 @@ export const api = {
   ports: (kind = "all", includePhantom = false) =>
     get(`/api/ports?kind=${encodeURIComponent(kind)}${includePhantom ? "&all=1" : ""}`),
   actuators: () => get("/api/actuators"),
+  // What is physically on the rig; a procedure needing what is not is off.
+  equipment: () => get("/api/equipment"),
+  setEquipment: (key, installed) =>
+    post("/api/equipment", { key, installed: !!installed, confirm: true }),
   // What answers on every free port: probed with read-only queries.
   portSurvey: () => get("/api/ports/survey"),
   setPortSearch: (enabled) => post("/api/ports/searching", { enabled: !!enabled }),

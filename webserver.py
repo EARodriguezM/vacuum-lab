@@ -40,6 +40,16 @@ def build(args) -> api.Application:
     # four start manual: recipes prompt the operator instead of driving them.
     # Attach a driver here as each is connected -- nothing else changes.
     hardware = process.ProcessHardware()
+    database_path = args.db or dbmod.default_path()
+    data_dir = os.path.dirname(os.path.abspath(database_path))
+
+    # Which of that is on the rig at all, and the pump's heater: set from the
+    # Settings page, kept beside the database. Nothing counts as installed
+    # until somebody says so, and a procedure needing what is not there is
+    # switched off. The simulator has everything.
+    equipment = process.Equipment(
+        None if args.simulate else os.path.join(data_dir, "equipment.json"),
+        default=bool(args.simulate), hardware=hardware)
 
     if args.simulate:
         # Everything in this process, deliberately: the simulated actuators
@@ -59,9 +69,7 @@ def build(args) -> api.Application:
     # there -- or the value is "auto" -- every free port is probed with
     # read-only queries. Simulated ptys are given explicitly and not searched.
     search = not args.no_port_search and not args.simulate
-    database_path = args.db or dbmod.default_path()
-    memory = discovery.PortMemory(
-        os.path.join(os.path.dirname(os.path.abspath(database_path)), "ports.json"))
+    memory = discovery.PortMemory(os.path.join(data_dir, "ports.json"))
     if not args.simulate:
         print("Looking for the instruments:")
 
@@ -102,7 +110,8 @@ def build(args) -> api.Application:
         pump_service.attach_pressure(gauge_service)
 
     database = dbmod.Database(args.db)
-    engine = runs.RunEngine(database, devices, hardware=hardware)
+    engine = runs.RunEngine(database, devices, hardware=hardware,
+                            equipment=equipment)
     # The chart recorder for the pump and gauge pages: the last day of the
     # whole rig, kept whether or not a run is recording. Memory only.
     recorder = history.History(devices, hardware).start()
@@ -169,6 +178,11 @@ def main() -> int:
     print(f"  interlocks: the turbopump may not start above "
           f"{pump.TURBO_START_MAX_MBAR:.0E} mbar; the station may not stop "
           f"until {pump.STOP_DWELL_SECONDS:.0f}s after the rotor reads 0 Hz")
+    absent = application.engine.unavailable()
+    if absent:
+        names = [runs.CATALOGUE[name].label for name in absent]
+        print(f"  switched off, equipment not installed: {', '.join(names)}")
+        print("  (mark it installed in Settings -> Rig equipment once it is)")
     if args.no_gauge and not args.no_pump:
         print("  NO GAUGE: the chamber pressure is unknown, so starting the")
         print("  turbopump will be refused until you override it deliberately.")

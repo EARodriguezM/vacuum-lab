@@ -651,9 +651,11 @@ class PumpService(DeviceService):
         2. **Acknowledge the fault.** A latched fault holds the station in
            its fault state; clearing it is what lets the forevacuum pump run.
         3. **Station on.** The pumping station is what runs the forevacuum
-           pump on this rig. Switching it off is also what makes the TC 600
-           vent the chamber (PM 0504 BE: factory automatic venting below
-           50 % speed), so after a fault it is kept on, never switched off.
+           pump. Switched off, it leaves a coasting rotor without backing and
+           lets the chamber leak back up through the stopped pumps, so after
+           a fault it is kept on, never switched off. (This rig has no vent
+           valve -- EnableVent off, confirmed 2026-10-09 -- so a station-off
+           does not vent it; with one, the factory setting would.)
 
         Every step is a "safe direction" command that the interlocks never
         refuse. Returns what was done, so the caller can log it and the panel

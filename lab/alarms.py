@@ -306,7 +306,8 @@ class Supervisor:
             self.clear("rotor_held")
 
         # 4. The station switched off, and not by this panel. That stops the
-        #    forevacuum pump and, with the factory venting setting, vents.
+        #    forevacuum pump: a turning rotor loses its backing, and the
+        #    chamber leaks back up through the stopped pumps.
         station = setpoints.get("PumpgStatn") is True
         was_on = prev.get("setpoints", {}).get("PumpgStatn") is True
         if was_on and not station:

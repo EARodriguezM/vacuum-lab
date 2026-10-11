@@ -258,10 +258,15 @@ class Finder:
     """
 
     def __init__(self, registry, memory: PortMemory | None = None,
-                 enabled: bool = True):
+                 enabled: bool = True, ports=candidate_ports, udev_names=None):
         self.registry = registry
         self.memory = memory or PortMemory(None)
         self.enabled = enabled
+        # Where to look. The selftest narrows both to its simulators' ports:
+        # on the lab PC the defaults reach the real instruments, and a test
+        # finding the real pump by itself is a test talking to the rig.
+        self.ports = ports
+        self.udev_names = UDEV_NAMES if udev_names is None else udev_names
         self._lock = threading.Lock()
         #: The last report: what each port said, when.
         self.last_report: dict | None = None
@@ -277,8 +282,8 @@ class Finder:
             return None
         with self._lock:
             exclude = self.owned_ports(except_service=service)
-            candidates = candidate_ports(exclude=exclude)
-            order = ([service.port, UDEV_NAMES.get(kind, "")]
+            candidates = self.ports(exclude=exclude)
+            order = ([service.port, self.udev_names.get(kind, "")]
                      + self.memory.preferred(kind, candidates)
                      + [c["device"] for c in candidates])
             excluded = {real(p) for p in exclude}
@@ -303,7 +308,7 @@ class Finder:
         with self._lock:
             owned = {real(service.port): service for service in self.registry
                      if service.port}
-            ports = candidate_ports()
+            ports = self.ports()
             rows = []
             for port in ports:
                 owner = owned.get(real(port["device"]))

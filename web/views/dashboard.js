@@ -64,6 +64,8 @@ const PHASE_HELP = {
 /** The deposition route, shown when idle so the sequence is always in view. */
 const ROUTE = ["rough", "crossover", "spinup", "basepressure", "backfill",
                "presputter", "deposit", "recover"];
+/** The steps only a deposition takes -- the ones its hardware is for. */
+const DEPOSITION_ONLY = ["backfill", "presputter", "deposit", "recover"];
 
 function countdown(seconds) {
   if (!finite(seconds)) return "—";
@@ -148,13 +150,14 @@ function Explain({ on, children }) {
 
 // --- the guide: what is happening, what happens next -------------------------
 
-function Stepper({ phases, current, title }) {
+function Stepper({ phases, current, title, off = [] }) {
   const index = phases.indexOf(current);
   return html`
     <ol class="stepper" aria-label=${title}>
       ${phases.map((phase, position) => html`
-        <li key=${phase} class=${position < index ? "done" : position === index ? "now"
-                                  : position === index + 1 ? "next" : ""}>
+        <li key=${phase} title=${off.includes(phase) ? "needs equipment not installed yet" : null}
+            class=${off.includes(phase) ? "off" : position < index ? "done" : position === index ? "now"
+                    : position === index + 1 ? "next" : ""}>
           <span class="step-mark" aria-hidden="true">
             ${position < index ? "✓" : position + 1}</span>
           <span class="step-name">${fmt.phaseLabel(phase)}</span>
@@ -218,8 +221,14 @@ function nextStep(run, config, samples, pump) {
   }
 }
 
-/** Where the rig physically is, when no run is driving it. */
-function idleStage(pump, gaugeState, pressure) {
+/**
+ * Where the rig physically is, when no run is driving it.
+ *
+ * "Station on" is the drive's flag, not proof of roughing: on 2026-10-09 the
+ * station read on with the backing pump off and the chamber open. So the
+ * pressure has to be seen falling before this says the chamber is roughing.
+ */
+function idleStage(pump, gaugeState, pressure, rate) {
   const s = pump?.status || {};
   const sp = pump?.setpoints || {};
   const speed = Number(s.ActualSpd) || 0;
@@ -236,7 +245,12 @@ function idleStage(pump, gaugeState, pressure) {
     if (finite(pressure) && pressure <= limit) {
       return { stage: "crossover", text: `Roughed to ${fmt.pressure(pressure, 2)} mbar: the turbopump may be started (Pump tab), or a recipe can take over.` };
     }
-    return { stage: "rough", text: "The backing pump is roughing the chamber; the turbopump is off." };
+    if (finite(rate) && rate < -0.5) {
+      return { stage: "rough", text: "The backing pump is roughing the chamber; the turbopump is off." };
+    }
+    return { stage: null, text: finite(rate)
+      ? "The station is on, but the pressure is not falling: is the backing pump running, and the chamber closed?"
+      : "The station is on and the turbopump is off." };
   }
   if (nominal && speed >= 0.95 * nominal) {
     return { stage: "basepressure", text: `The turbopump is at full speed and the chamber at ${finite(pressure) ? `${fmt.pressure(pressure, 2)} mbar` : "an unknown pressure"}.` };
@@ -288,7 +302,8 @@ function Guide({ state, samples, config, explain }) {
   }
 
   const last = run?.last;
-  const where = idleStage(pump, gaugeState, pressure);
+  const where = idleStage(pump, gaugeState, pressure, A.latestRate(samples));
+  const depositionOff = state?.unavailable?.deposition;
   const recent = last && last.ended_at && (state?.server_time || Date.now() / 1000) - last.ended_at < 12 * 3600;
   return html`
     <section class="guide card">
@@ -305,7 +320,12 @@ function Guide({ state, samples, config, explain }) {
           <a href=${`#history/${last.id}`}>Open its record</a>
         </div>`}
       <div class="guide-label">The deposition route${where.stage ? " — the rig is here" : ""}</div>
-      <${Stepper} phases=${ROUTE} current=${where.stage} title="The deposition route" />
+      <${Stepper} phases=${ROUTE} current=${where.stage} title="The deposition route"
+                  off=${depositionOff ? DEPOSITION_ONLY : []} />
+      ${depositionOff && html`
+        <p class="guide-off">From argon backfill on, the route needs hardware that is not on
+          the rig yet — ${depositionOff.map((name) => name.toLowerCase()).join(", ")} — so deposition
+          is switched off. Pumping to base pressure works today. <a href="#settings">Rig equipment</a></p>`}
       ${explain && html`<p class="explain">Each step needs the one before it: the turbopump
         cannot start until the backing pump has roughed the chamber, and a plasma needs argon
         at the working pressure. A recipe walks the rig through them and checks every limit on
@@ -445,7 +465,7 @@ function VacuumScale({ pressure, atmosphere, marks, explain }) {
         backing pump alone reaches the rough range; the turbopump may only start below the
         crossover and takes the chamber into high vacuum. Sputtering then lets argon back in
         to the working pressure — four decades up from base — and the turbopump must not be
-        asked to carry much more gas than its limit with the gate open.</p>`}
+        asked to carry much more gas than its limit.</p>`}
     </div>`;
 }
 
@@ -667,7 +687,7 @@ export function DashboardView({ state, live }) {
   const marks = [
     { value: Math.min(Number(config.crossover_mbar) || crossover, crossover),
       label: "turbopump may start", tone: "muted" },
-    { value: 1e-2, label: "pump's gas limit, gate open", tone: "warn" },
+    { value: 1e-2, label: "turbopump's gas limit", tone: "warn" },
     { value: run?.procedure === "deposition" ? Number(config.working_mbar) : 5e-3,
       label: run?.procedure === "deposition" ? "this run's working pressure" : "typical working pressure",
       tone: "accent" },
@@ -687,7 +707,10 @@ export function DashboardView({ state, live }) {
   const gate = actuator("gate");
   const shutter = actuator("shutter");
   const plasmaOn = (magnetron?.actual || 0) > 0;
-  const shown = (a) => (a ? (a.available || a.confirmed ? a.display : a.pending ? `asked: ${a.pending}` : "—") : "—");
+  const shown = (a) => (!a ? "—" : a.installed === false ? html`<span class="muted">not installed</span>`
+    : a.available || a.confirmed ? a.display : a.pending ? `asked: ${a.pending}` : "—");
+  const notInstalled = actuators.filter((a) => a.installed === false).length;
+  const manualCount = actuators.filter((a) => a.installed !== false && !a.available).length;
 
   return html`
     <div class=${`dashboard${wall ? " is-wall" : ""}`}>
@@ -790,9 +813,10 @@ export function DashboardView({ state, live }) {
             <dt>Argon</dt><dd class="num">${shown(gas)}</dd>
             <dt>Gate valve</dt><dd class="num">${shown(gate)}</dd>
           </dl>
-          <div class="stat-foot">${actuators.length && actuators.every((a) => a.available)
-            ? "all under software control"
-            : `${actuators.filter((a) => !a.available).length} manual — a guided run asks you to do them`}</div>
+          <div class="stat-foot">${notInstalled
+            ? html`${notInstalled === actuators.length ? "Not on the rig yet" : `${notInstalled} not installed`} — deposition is switched off. <a href="#settings">Rig equipment</a>`
+            : manualCount ? `${manualCount} manual — a guided run asks you to do them`
+            : "all under software control"}</div>
           <${Explain} on=${explain}>Argon is let in, the magnetron strikes a plasma that
             sputters the target, and the shutter decides whether the sample is being coated.<//>
         <//>

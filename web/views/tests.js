@@ -152,9 +152,10 @@ function LiveRun({ run, samples, events, onStop, onAcknowledge, busy, devices })
         </div>
       <//>
 
-      ${run.actuators?.length > 0 && html`
+      ${(run.requires || []).length > 0 && html`
         <${Card} title="Process hardware">
-          <${Actuators} actuators=${run.actuators} />
+          <${Actuators} actuators=${(run.actuators || [])
+            .filter((a) => run.requires.includes(a.key))} />
         <//>`}
 
       <${RunCharts} run=${run.run} procedure=${run.procedure}
@@ -168,20 +169,26 @@ function LiveRun({ run, samples, events, onStop, onAcknowledge, busy, devices })
     </div>`;
 }
 
-function Setup({ procedures, onStart, busy, blocked, actuators = [] }) {
+function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable = {} }) {
   const [name, setName] = useState("");
-  const [chosen, setChosen] = useState(procedures[0]?.name || "");
+  const [chosen, setChosen] = useState("");
   const [operator, setOperator] = useState(
     () => localStorage.getItem("vacuum-lab-operator") || "");
   const [notes, setNotes] = useState("");
   const [config, setConfig] = useState({});
 
-  const procedure = procedures.find((p) => p.name === chosen) || procedures[0];
-  const manual = actuators.filter((a) => !a.available).map((a) => a.label);
+  // Opens on the first procedure this rig can run.
+  const procedure = procedures.find((p) => p.name === chosen)
+    || procedures.find((p) => !unavailable[p.name]) || procedures[0];
+  const absent = unavailable[procedure?.name] || [];
+  // Only the actuators this procedure moves: a pump-down asks for none.
+  const manual = actuators.filter((a) => (procedure?.requires || []).includes(a.key)
+                                         && a.installed !== false && !a.available)
+    .map((a) => a.label);
 
   useEffect(() => {
     if (procedure) setConfig(defaultConfig(procedure.fields));
-  }, [chosen]);
+  }, [procedure?.name]);
 
   if (!procedure) return html`<${Empty}>The server published no procedures.<//>`;
 
@@ -200,7 +207,15 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [] }) {
     <div class="grid" style="gap:16px">
       ${blocked && html`<${Banner} tone="warn">${blocked}<//>`}
 
-      ${manual.length > 0 && html`
+      ${absent.length > 0 && html`
+        <${Banner} tone="warn">
+          <strong>Switched off — not installed on the rig yet:</strong>
+          ${" "}${absent.join(", ")}. You can read what this procedure does, but it
+          cannot run until that is in place. Then mark it installed in
+          ${" "}<a href="#settings">Settings → Rig equipment</a>.
+        <//>`}
+
+      ${absent.length === 0 && manual.length > 0 && html`
         <${Banner} tone="warn">
           <strong>Not wired up yet:</strong> ${manual.join(", ")}.
           A guided run will stop and ask you to do each of these by hand.
@@ -209,10 +224,15 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [] }) {
 
       <${Card} title="Choose a procedure">
         <div class="row">
-          ${procedures.map((entry) => html`
-            <button key=${entry.name}
-                    class=${entry.name === chosen ? "primary" : ""}
-                    onClick=${() => setChosen(entry.name)}>${entry.label}</button>`)}
+          ${procedures.map((entry) => {
+            const off = unavailable[entry.name];
+            return html`
+              <button key=${entry.name}
+                      class=${`${entry.name === procedure.name ? "primary" : ""}${off ? " unavailable" : ""}`}
+                      title=${off ? `Switched off: needs ${off.join(", ")}` : entry.description}
+                      onClick=${() => setChosen(entry.name)}>
+                ${entry.label}${off ? html` <span class="off-tag">not installed</span>` : null}</button>`;
+          })}
         </div>
         <p class="hint">${procedure.description}</p>
         <div class="phases">
@@ -252,12 +272,13 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [] }) {
 
       <${Card}>
         <div class="row">
-          <button class="primary" disabled=${busy} onClick=${start}>
+          <button class="primary" disabled=${busy || absent.length > 0} onClick=${start}>
             Start ${procedure.label.toLowerCase()}
           </button>
           <span class="small muted">
-            The run drives the hardware through the same interlocks as the
-            manual controls — it holds no override.
+            ${absent.length > 0
+              ? "Switched off until its equipment is installed."
+              : "The run drives the hardware through the same interlocks as the manual controls — it holds no override."}
           </span>
         </div>
       <//>
@@ -417,7 +438,8 @@ export function TestsView({ state, live, onStart, onStop, onAcknowledge, busy })
 
   return html`<${Setup} procedures=${procedures} onStart=${onStart}
                         busy=${busy} blocked=${blocked}
-                        actuators=${state?.actuators || []} />`;
+                        actuators=${state?.actuators || []}
+                        unavailable=${state?.unavailable || {}} />`;
 }
 
 export { ResultSummary, EventLog };

@@ -200,7 +200,7 @@ function App() {
 
   // Keeping the vacuum is the first answer for every procedure: it leaves
   // the forevacuum pump running, and a power-down switches the station off,
-  // which on this drive also vents the chamber (factory automatic venting).
+  // after which nothing pumps the chamber and it leaks back up.
   // Powering down stays one click away for the end of the day.
   const stopOptions = () => {
     const keep = {
@@ -213,8 +213,8 @@ function App() {
       label: "Stop the run and power the pump down",
       description: "Switches the turbopump motor off, waits for the rotor to "
         + "coast to a stop with the backing pump still running, then stops "
-        + "the station. Takes several minutes; the chamber only comes back "
-        + "up to air pressure if you vent it.",
+        + "the station. Takes several minutes. Afterwards nothing pumps the "
+        + "chamber, so it slowly leaks back up towards air pressure.",
     };
     return [keep, down];
   };

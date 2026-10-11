@@ -27,7 +27,10 @@ from .registry import DeviceService
 COLD_CATHODE_LIMIT_MBAR = 1.0e-2
 
 #: Gauge identifiers whose discharge is pressure-sensitive in that way.
-COLD_CATHODE_PREFIXES = ("IKR", "PKR", "PBR", "IMR")
+#: "CO" is how the real TPG 252 A names the rig's PKR 251 ("CO9"). Until
+#: 2026-10-10 it was missing here, so this interlock never applied to the one
+#: gauge the rig has -- matching on the published names alone is not enough.
+COLD_CATHODE_PREFIXES = ("IKR", "PKR", "PBR", "IMR", "CO")
 
 
 class GaugeInterlock(Exception):

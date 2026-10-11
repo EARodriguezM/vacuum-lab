@@ -108,6 +108,10 @@ GAUGE_TYPES = {
     "CMR": "capacitive",
     "IMR": "Pirani + hot cathode",
     "PBR": "FullRange, Pirani + Bayard-Alpert",
+    # What the real TPG 252 A (firmware BG509727-C) calls the gauge on the rig,
+    # whose label reads Pfeiffer PKR 251 (no. PTR26002x) -- a FullRange
+    # Pirani + cold cathode head. Confirmed from the label, 2026-10-10.
+    "CO9": "FullRange, Pirani + cold cathode (PKR 251)",
     # Confirmed on the real TPG 252 A (firmware BG509727-C): an empty channel
     # answers "noSe", not the "noSEn" the family documentation shows.
     "noSe": "no sensor",

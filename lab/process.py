@@ -23,10 +23,17 @@ port and a polling thread. A gate valve driven from a relay on the TPG's
 switching output has no port of its own, and a needle valve has no electrical
 existence at all. What they share is "a thing the recipe sets and reads",
 which is all this abstracts.
+
+Manual is not the same as absent. `Equipment` records which of these -- and
+the pump's heater -- are physically on the rig at all: a recipe that needs
+something that is not there is switched off, guided or not, because no
+operator can turn a valve that is not bolted to the chamber.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 
@@ -266,12 +273,17 @@ class ProcessHardware:
 
     @property
     def automatic_ready(self) -> bool:
-        """Whether a recipe could run with no human in the loop."""
+        """Whether every actuator is driven: any recipe could run unattended."""
         return all(a.available for a in self._all.values())
 
-    def missing(self) -> list[str]:
-        """Actuators a fully automatic run would need and does not have."""
-        return [a.label for a in self._all.values() if not a.available]
+    def missing(self, keys=None) -> list[str]:
+        """Actuators an automatic run would need and does not have.
+
+        All four, or only those in `keys` -- what one recipe uses. A recipe
+        that moves none of them can run unattended with all four manual.
+        """
+        return [a.label for a in self._all.values()
+                if not a.available and (keys is None or a.key in keys)]
 
     def describe(self) -> list[dict]:
         return [a.describe() for a in self._all.values()]
@@ -315,3 +327,101 @@ class ProcessHardware:
             except ActuatorError as exc:
                 if log:
                     log("error", f"Could not make {actuator.label} safe: {exc}")
+
+
+# --- what is on the rig at all -------------------------------------------------
+
+#: Equipment a procedure may need beyond the pump and the gauge, keyed as
+#: procedures name it in `requires`. The first four are the actuators above;
+#: the heater is the pump's own accessory, on the drive's HEAT/TMS output.
+EQUIPMENT = {
+    "gas": "Argon gas line",
+    "gate": "Gate valve",
+    "magnetron": "Magnetron with its power supply",
+    "shutter": "Substrate shutter",
+    "heater": "Pump heater on the HEAT/TMS output",
+}
+
+
+class Equipment:
+    """What is physically on the rig -- which is not the same as what is wired.
+
+    Each piece of process hardware is in one of three states, and the panel
+    needs all three:
+
+        not installed   not on the rig: a recipe that needs it cannot run,
+                        guided or automatic
+        manual          there, but nothing drives it: a guided run asks the
+                        operator, an automatic one refuses
+        driven          a driver is attached and the software moves it
+
+    A driven actuator is installed by definition. Everything else is the
+    lab's to say -- the code cannot see whether a magnetron is bolted to the
+    chamber -- so it is set from the Settings page and kept in a small JSON
+    file next to the database, where it survives restarts and deploys.
+    """
+
+    def __init__(self, path: str | None = None, default: bool = False,
+                 hardware: ProcessHardware | None = None):
+        self.path = path
+        self.hardware = hardware
+        self._lock = threading.Lock()
+        self._installed = {key: bool(default) for key in EQUIPMENT}
+        if path and os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    stored = json.load(handle)
+                for key, value in stored.items():
+                    if key in EQUIPMENT:
+                        self._installed[key] = bool(value)
+            except (OSError, ValueError, AttributeError):
+                pass    # a damaged file falls back to the defaults
+
+    def driven(self, key: str) -> bool:
+        if self.hardware is None:
+            return False
+        try:
+            return self.hardware.get(key).available
+        except ActuatorError:
+            return False
+
+    def installed(self, key: str) -> bool:
+        if key not in EQUIPMENT:
+            return True
+        return self.driven(key) or self._installed[key]
+
+    def missing(self, keys) -> list[str]:
+        """The labels of whatever in `keys` is not on the rig."""
+        return [EQUIPMENT[key] for key in keys if not self.installed(key)]
+
+    def set(self, key: str, installed: bool) -> dict:
+        if key not in EQUIPMENT:
+            return {"ok": False, "error": f"no equipment named {key!r}"}
+        if not installed and self.driven(key):
+            return {"ok": False, "error": f"{EQUIPMENT[key]} is under software "
+                                          "control, so it is installed"}
+        with self._lock:
+            self._installed[key] = bool(installed)
+            error = self._save()
+        result = {"ok": True, "equipment": self.describe()}
+        if error:
+            result["warning"] = f"kept until the server restarts: {error}"
+        return result
+
+    def _save(self) -> str | None:
+        if not self.path:
+            return None
+        try:
+            temporary = self.path + ".tmp"
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(self._installed, handle, indent=2)
+            os.replace(temporary, self.path)
+        except OSError as exc:
+            return f"could not save {self.path}: {exc}"
+        return None
+
+    def describe(self) -> list[dict]:
+        return [{"key": key, "label": label, "installed": self.installed(key),
+                 "driven": self.driven(key)}
+                for key, label in EQUIPMENT.items()]
+

@@ -143,6 +143,11 @@ class Procedure:
     #: Pressure above which the run aborts, or None for no ceiling.
     pressure_ceiling: float | None = None
 
+    #: Equipment beyond the pump and the gauge that this procedure cannot do
+    #: without -- keys of `process.EQUIPMENT`. While any of it is not
+    #: installed the procedure is listed but refused, guided or automatic.
+    requires: tuple[str, ...] = ()
+
     #: Whether the operator stopping this run counts as completing it. False
     #: for procedures with an ending of their own -- stopping a deposition
     #: half way through really is an abort. True only where there is no
@@ -384,6 +389,8 @@ class RateOfRise(Procedure):
 
     name = "rate_of_rise"
     label = "Rate of rise / leak test"
+    # Isolating the chamber from the pump is closing the gate valve.
+    requires = ("gate",)
     description = ("With the chamber isolated, fits the pressure rise against "
                    "time and reports the leak rate.")
     phases = ("settle", "measuring", "done")
@@ -504,6 +511,8 @@ class Bakeout(Procedure):
 
     name = "bakeout"
     label = "Bake-out / TMS profile"
+    # With nothing on the HEAT/TMS output, the heating phase can only time out.
+    requires = ("heater",)
     description = ("Ramps the pump's temperature management system to a "
                    "setpoint, soaks, then cools, logging pressure and "
                    "temperature throughout.")
@@ -649,9 +658,11 @@ class VacuumSequence(Procedure):
                                                 "anything not yet wired"},
                      {"value": AUTOMATIC, "label": "Automatic — refuse to "
                                                    "start unless fully wired"}],
-         "help": "Nothing is wired to the argon, gate valve, magnetron or "
-                 "shutter yet, so guided is the only mode that will run "
-                 "today."},
+         "help": "Automatic needs every step this procedure takes under "
+                 "software control. One that only pumps -- base calibration, "
+                 "full vacuum -- runs either way; a deposition stays guided "
+                 "until the argon, gate valve, magnetron and shutter are "
+                 "wired."},
         {"key": "crossover_mbar", "label": "Start the turbopump at",
          "type": "exponent", "default": DEFAULT_CROSSOVER_MBAR, "unit": "mbar",
          "help": "The forevacuum pump works alone until the chamber reaches "
@@ -1041,6 +1052,7 @@ class Deposition(VacuumSequence):
 
     name = "deposition"
     label = "Magnetron deposition (argon)"
+    requires = ("gas", "gate", "magnetron", "shutter")
     description = ("The full process: pump to base pressure, backfill with "
                    "argon, pre-sputter the target, then deposit for a set "
                    "time. Steps that are not wired up yet are prompted.")
@@ -1415,8 +1427,8 @@ class FullVacuum(VacuumSequence):
         """Leave the pump running unless the operator asked to power down.
 
         This used to power the rig down on every ending, errors included --
-        and switching the station off is also what makes the TC 600 vent the
-        chamber, so a fault at night meant a vented chamber in the morning.
+        and a station switched off stops the forevacuum pump, so a fault at
+        night meant a chamber that had leaked back up by the morning.
         Now only an operator who stops the run and chooses "power down" gets
         a power-down (the engine starts it from `stop()`). An ending on a
         fault is handled by the engine instead: motor off, fault cleared,
@@ -1468,11 +1480,23 @@ CATALOGUE: dict[str, type[Procedure]] = {
 }
 
 
+def not_installed(label: str, missing: list[str]) -> str:
+    """Why a procedure cannot start: what it needs that is not on the rig."""
+    plural = len(missing) > 1
+    names = [name[:1].lower() + name[1:] for name in missing]
+    listed = names[0] if not plural else f"{', '.join(names[:-1])} and {names[-1]}"
+    return (f"{label} needs the {listed}, which "
+            f"{'are' if plural else 'is'} not installed on this rig yet. Once "
+            f"{'they are' if plural else 'it is'} in place, mark "
+            f"{'them' if plural else 'it'} installed in Settings → Rig equipment.")
+
+
 def catalogue() -> list[dict]:
     """Describe every procedure, so the UI can build its forms from the API."""
     return [
         {"name": p.name, "label": p.label, "description": p.description,
-         "phases": list(p.phases), "fields": [dict(f) for f in p.fields]}
+         "phases": list(p.phases), "fields": [dict(f) for f in p.fields],
+         "requires": list(p.requires)}
         for p in CATALOGUE.values()
     ]
 
@@ -1502,10 +1526,16 @@ class RunEngine:
 
     def __init__(self, database: "dbmod.Database", registry,
                  hardware: "process.ProcessHardware | None" = None,
-                 pump_key: str = "pump", gauge_key: str = "gauge"):
+                 pump_key: str = "pump", gauge_key: str = "gauge",
+                 equipment: "process.Equipment | None" = None):
         self.db = database
         self.registry = registry
         self.hardware = hardware or process.ProcessHardware()
+        # What is on the rig at all. Without a record, everything is: that is
+        # the simulator, and the tests, where every actuator exists.
+        self.equipment = equipment or process.Equipment(default=True)
+        if self.equipment.hardware is None:
+            self.equipment.hardware = self.hardware
         self.pump_key = pump_key
         self.gauge_key = gauge_key
 
@@ -1700,6 +1730,52 @@ class RunEngine:
         value = pump.snapshot().get("identity", {}).get("NominalSpd")
         return value if isinstance(value, (int, float)) else None
 
+    # --- what this rig can run ---------------------------------------------
+
+    def catalogue(self) -> list[dict]:
+        """The procedures, each saying whether this rig can run it now."""
+        entries = catalogue()
+        for entry in entries:
+            requires = CATALOGUE[entry["name"]].requires
+            missing = self.equipment.missing(requires)
+            entry["available"] = not missing
+            entry["missing"] = missing
+            entry["automatic_ready"] = (not missing
+                                        and not self.hardware.missing(requires))
+        return entries
+
+    def unavailable(self) -> dict:
+        """Procedure name -> what it is missing, for those that cannot run."""
+        return {name: missing for name, procedure in CATALOGUE.items()
+                if (missing := self.equipment.missing(procedure.requires))}
+
+    def actuators(self) -> list[dict]:
+        return [{**described, "installed": self.equipment.installed(described["key"])}
+                for described in self.hardware.describe()]
+
+    def equipment_report(self) -> list[dict]:
+        rows = self.equipment.describe()
+        for row in rows:
+            row["used_by"] = [p.label for p in CATALOGUE.values()
+                              if row["key"] in p.requires]
+        return rows
+
+    def set_equipment(self, key: str, installed: bool) -> dict:
+        """Mark a piece of equipment installed or not, from the Settings page."""
+        procedure = self._procedure
+        if (not installed and procedure is not None and self._thread
+                and self._thread.is_alive() and key in procedure.requires):
+            return {"ok": False, "error": f"{procedure.label} is running and "
+                                          "uses it; stop the run first"}
+        result = self.equipment.set(key, installed)
+        if result.get("ok"):
+            label = process.EQUIPMENT[key]
+            # The rig's log, not a run's: this is not something a run did.
+            self.db.add_event(None, "action", f"Rig equipment: {label} marked "
+                              f"{'installed' if installed else 'not installed'}")
+            result["equipment"] = self.equipment_report()
+        return result
+
     # --- logging ----------------------------------------------------------
 
     def log(self, level: str, message: str, detail: dict | None = None) -> None:
@@ -1717,6 +1793,10 @@ class RunEngine:
             if procedure_name not in CATALOGUE:
                 return {"ok": False,
                         "error": f"unknown procedure {procedure_name!r}"}
+            absent = self.equipment.missing(CATALOGUE[procedure_name].requires)
+            if absent:
+                return {"ok": False, "error": not_installed(
+                    CATALOGUE[procedure_name].label, absent)}
             # A power-down still bringing the rotor to rest must not run
             # alongside a new recipe: it would stop the station whenever the
             # rotor reached 0 Hz, in the middle of the new run. That is what
@@ -1742,7 +1822,7 @@ class RunEngine:
             self.mode = GUIDED if str(config.get("mode", GUIDED)) != AUTOMATIC \
                 else AUTOMATIC
             if self.mode == AUTOMATIC:
-                missing = self.hardware.missing()
+                missing = self.hardware.missing(procedure.requires)
                 if missing:
                     return {"ok": False, "error":
                             "automatic mode needs every actuator under "
@@ -2004,7 +2084,8 @@ class RunEngine:
             "stopping": self._stop.is_set(),
             "mode": self.mode,
             "prompt": self._prompt,
-            "actuators": self.hardware.describe(),
+            "requires": list(procedure.requires),
+            "actuators": self.actuators(),
             "shutdown": self._shutdown,
             "secure": self._secure,
             "last": self._last,

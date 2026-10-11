@@ -514,6 +514,8 @@ button.tiny { font-size:11.5px; padding:2px 8px; min-height:24px; }
                   font-weight:650; }
 .stepper li.now .step-mark { background:var(--accent-ink); color:var(--accent); }
 .stepper li.next { border-style:dashed; border-color:var(--accent); color:var(--ink-soft); }
+.stepper li.off { border-style:dotted; color:var(--ink-faint); opacity:.7; }
+.guide-off { margin:8px 0 0; font-size:13.5px; color:var(--ink-soft); }
 
 .dash-grid.four { grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); }
 .warn-text { color:var(--warn); font-weight:600; }
@@ -603,3 +605,11 @@ button.tiny { font-size:11.5px; padding:2px 8px; min-height:24px; }
 body.wall .wrap { max-width:none; padding:18px 28px; }
 body.wall .dashboard { font-size:17px; }
 body.wall .stat-value { font-size:clamp(40px,4.4vw,64px); }
+
+/* A procedure switched off because its equipment is not on the rig: still
+   listed and readable, visibly not startable. */
+button.unavailable { border-style:dashed; color:var(--ink-soft); }
+button.unavailable.primary { background:var(--accent-soft); color:var(--ink); border:1.5px dashed var(--accent); }
+.off-tag { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.04em;
+           color:var(--ink-faint); margin-left:4px; }
+

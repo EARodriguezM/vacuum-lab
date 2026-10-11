@@ -75,8 +75,10 @@ export function pumpSummary(pump) {
   if (station && !motor && speed === 0) {
     return {
       tone: "good",
-      headline: "Backing pump only",
-      detail: "The station is roughing. The turbopump motor is off.",
+      // The drive's station flag, not proof the backing pump runs: it read
+      // on with the backing pump off and the chamber open (2026-10-09).
+      headline: "Station on, turbopump off",
+      detail: "The pumping station is on and the turbopump motor is off.",
     };
   }
   // Below full speed with the motor on means one of two very different

@@ -106,6 +106,71 @@ function AutoPorts({ state, notify }) {
     <//>`;
 }
 
+/**
+ * What is physically on the rig. The software cannot see whether a magnetron
+ * is bolted to the chamber, so the lab says so here, and every procedure that
+ * needs something not installed is switched off -- listed on the Process tab
+ * with what it is waiting for, and refused by the server.
+ */
+function RigEquipment({ state, notify }) {
+  const [rows, setRows] = useState(null);
+  const [busy, setBusy] = useState("");
+  const unavailable = state?.unavailable || {};
+
+  const load = () => api.equipment().then((data) => setRows(data.equipment || []))
+    .catch((error) => notify(error.message, "error"));
+  useEffect(() => { load(); }, []);
+
+  const toggle = async (row) => {
+    const next = !row.installed;
+    const uses = row.used_by.length ? ` It is used by: ${row.used_by.join(", ")}.` : "";
+    const question = next
+      ? `Mark "${row.label}" as installed on the rig?${uses}`
+      : `Mark "${row.label}" as NOT installed? Procedures that need it will be switched off.${uses}`;
+    if (!window.confirm(question)) return;
+    setBusy(row.key);
+    try {
+      const result = await api.setEquipment(row.key, next);
+      if (!result.ok) throw new Error(result.error);
+      setRows(result.equipment);
+      notify(`${row.label}: ${next ? "installed" : "not installed"}.`
+             + (result.warning ? ` ${result.warning}` : ""), result.warning ? "error" : "ok");
+    } catch (error) {
+      notify(error.message, "error");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const off = Object.keys(unavailable).length;
+  return html`
+    <${Card} title="Rig equipment"
+      hint="What is physically on the rig besides the pump and the gauge. A procedure that needs something not installed is switched off — it stays listed on the Process tab with what it is waiting for. Installed but not wired means manual: a guided run asks you to do that step by hand. Kept on the server, so every browser sees the same.">
+      ${rows === null ? html`<${Empty}>Loading…<//>` : html`
+        <div class="scroll-x">
+          <table>
+            <thead><tr><th>Equipment</th><th>On the rig</th><th>Needed by</th><th></th></tr></thead>
+            <tbody>
+              ${rows.map((row) => html`
+                <tr key=${row.key}>
+                  <td>${row.label}</td>
+                  <td><${Pill} tone=${row.installed ? "good" : "idle"}>
+                    ${row.driven ? "installed, software-driven" : row.installed ? "installed" : "not installed"}<//></td>
+                  <td class="wrap-cell small">${row.used_by.length ? row.used_by.join(", ") : "—"}</td>
+                  <td>${!row.driven && html`
+                    <button class="small" disabled=${busy === row.key} onClick=${() => toggle(row)}>
+                      ${row.installed ? "Mark not installed" : "Mark installed"}</button>`}</td>
+                </tr>`)}
+            </tbody>
+          </table>
+        </div>
+        <p class="hint">${off
+          ? `Switched off for now: ${[...new Set(rows.filter((r) => !r.installed)
+              .flatMap((r) => r.used_by))].join("; ")}. Everything else needs only the pump and the gauge.`
+          : "Every procedure can run on this rig."}</p>`}
+    <//>`;
+}
+
 /** Pick which port an instrument is on: filter by attachment, then choose.
  *
  * Worth being a first-class control rather than a command-line flag on this
@@ -302,6 +367,8 @@ export function SettingsView({ state, onSettingsChanged, notify }) {
           <span class="small muted">Stored in this browser only.</span>
         </div>
       <//>
+
+      <${RigEquipment} state=${state} notify=${notify} />
 
       <${AutoPorts} state=${state} notify=${notify} />
 
