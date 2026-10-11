@@ -1683,6 +1683,16 @@ class RunEngine:
     def run_id(self) -> int | None:
         return self._run["id"] if self._run else None
 
+    def runner(self) -> str | None:
+        """The account that started the run in progress, or None.
+
+        lab/auth.py gives that person a longer idle limit while it goes.
+        """
+        run = self._run
+        if run is None or not (self._thread and self._thread.is_alive()):
+            return None
+        return run.get("started_by")
+
     def last_base_pressure(self, exclude_run: int | None = None) -> float | None:
         """Base pressure from the most recent completed calibration."""
         for record in self.db.runs(procedure="base_calibration",

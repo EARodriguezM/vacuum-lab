@@ -7,7 +7,7 @@
 
 import { html } from "../html.js";
 import { useEffect, useState } from "preact/hooks";
-import { Banner, Card, Empty, Pairs, Pill } from "../ui.js";
+import { Banner, Card, Confirm, Empty, Pairs, Pill } from "../ui.js";
 import { api, normaliseHost, settings, updateSettings } from "../api.js";
 import { MyAccount, People, Tablets } from "./people.js";
 import { beep } from "../alarms.js";
@@ -122,19 +122,29 @@ function AutoPorts({ state, notify, admin = true }) {
 function RigEquipment({ state, notify, admin = true }) {
   const [rows, setRows] = useState(null);
   const [busy, setBusy] = useState("");
+  // The question being asked, in the panel's own dialog: a browser's
+  // confirm() blocks the page and looks foreign on the kiosk tablet.
+  const [asking, setAsking] = useState(null);
   const unavailable = state?.unavailable || {};
 
   const load = () => api.equipment().then((data) => setRows(data.equipment || []))
     .catch((error) => notify(error.message, "error"));
   useEffect(() => { load(); }, []);
 
-  const toggle = async (row) => {
+  const toggle = (row) => {
     const next = !row.installed;
     const uses = row.used_by.length ? ` It is used by: ${row.used_by.join(", ")}.` : "";
-    const question = next
-      ? `Mark "${row.label}" as installed on the rig?${uses}`
-      : `Mark "${row.label}" as NOT installed? Procedures that need it will be switched off.${uses}`;
-    if (!window.confirm(question)) return;
+    setAsking({
+      row, next,
+      title: next ? `Mark ${row.label} installed?` : `Mark ${row.label} not installed?`,
+      question: next
+        ? `It counts as on the rig from now on.${uses}`
+        : `Procedures that need it will be switched off.${uses}`,
+    });
+  };
+
+  const apply = async ({ row, next }) => {
+    setAsking(null);
     setBusy(row.key);
     try {
       const result = await api.setEquipment(row.key, next);
@@ -177,6 +187,11 @@ function RigEquipment({ state, notify, admin = true }) {
           ? `Switched off for now: ${[...new Set(rows.filter((r) => !r.installed)
               .flatMap((r) => r.used_by))].join("; ")}. Everything else needs only the pump and the gauge.`
           : "Every procedure can run on this rig."}</p>`}
+      <${Confirm} open=${!!asking} title=${asking?.title}
+        tone=${asking?.next ? "primary" : "danger"}
+        confirmLabel=${asking?.next ? "Mark installed" : "Mark not installed"}
+        body=${html`<p>${asking?.question}</p>`}
+        onCancel=${() => setAsking(null)} onConfirm=${() => apply(asking)} />
     <//>`;
 }
 

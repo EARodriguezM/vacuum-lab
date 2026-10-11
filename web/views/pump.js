@@ -30,18 +30,30 @@ const OUT4_MODES = [
   { value: 1, label: "Sealing gas valve" },
 ];
 
-/** A button that refuses itself, with the interlock's own words as the reason. */
-function Guarded({ action, label, interlocks, onRun, tone = "", disabled }) {
+/**
+ * A button that refuses itself, with the interlock's own words as the reason.
+ *
+ * For an admin (`onOverride` given) a blocked button has a second one beside
+ * it: the deliberate way past the rule, through a dialog that quotes the rule
+ * and asks them to say they have checked the rig themselves. Nobody else is
+ * offered it, and the server refuses an override from anyone else anyway.
+ */
+function Guarded({ action, label, interlocks, onRun, tone = "", disabled, onOverride }) {
   const rule = interlocks?.[action];
   const blocked = rule && !rule.allowed;
   const reason = blocked
     ? `${rule.reason}${rule.wait ? ` (about ${rule.wait}s)` : ""}`
     : "";
   return html`
-    <button class=${tone} disabled=${disabled || blocked} title=${reason}
-            onClick=${() => onRun(action, label, reason)}>
-      ${label}${blocked && rule.wait ? html` <span class="muted">${rule.wait}s</span>` : null}
-    </button>`;
+    <span class="guarded">
+      <button class=${tone} disabled=${disabled || blocked} title=${reason}
+              onClick=${() => onRun(action, label, reason)}>
+        ${label}${blocked && rule.wait ? html` <span class="muted">${rule.wait}s</span>` : null}
+      </button>
+      ${blocked && onOverride && !disabled && html`
+        <button class="small danger" title="Admins only: send it despite the interlock"
+                onClick=${() => onOverride(action, label, reason)}>Override…</button>`}
+    </span>`;
 }
 
 /** The card's standing advice, quoting the server's own crossover pressure. */
@@ -470,7 +482,7 @@ function TemperaturePanel({ samples, pump }) {
 }
 
 export function PumpView({ state, onCommand, onWriteParam, busy, safeBusy,
-                           onShutdown, onSecure, notify, shutdown }) {
+                           onShutdown, onSecure, notify, shutdown, onOverride }) {
   const pump = state?.devices?.pump;
   const [accessories, setAccessories] = useState(null);
   const [speed, setSpeed] = useState("");
@@ -516,13 +528,17 @@ export function PumpView({ state, onCommand, onWriteParam, busy, safeBusy,
       <${Card} title="Station and turbopump" hint=${stationHint(interlocks)}>
         <div class="row">
           <${Guarded} action="on" label="Start pumping station" tone="primary"
-                      interlocks=${interlocks} onRun=${onCommand} disabled=${busy} />
+                      interlocks=${interlocks} onRun=${onCommand} disabled=${busy}
+                      onOverride=${onOverride} />
           <${Guarded} action="off" label="Stop pumping station" tone="danger"
-                      interlocks=${interlocks} onRun=${onCommand} disabled=${busy} />
+                      interlocks=${interlocks} onRun=${onCommand} disabled=${busy}
+                      onOverride=${onOverride} />
           <${Guarded} action="motor_on" label="Start turbopump"
-                      interlocks=${interlocks} onRun=${onCommand} disabled=${busy} />
+                      interlocks=${interlocks} onRun=${onCommand} disabled=${busy}
+                      onOverride=${onOverride} />
           <${Guarded} action="motor_off" label="Stop turbopump"
-                      interlocks=${interlocks} onRun=${onCommand} disabled=${busy} />
+                      interlocks=${interlocks} onRun=${onCommand} disabled=${busy}
+                      onOverride=${onOverride} />
         </div>
         <div class="row">
           <button disabled=${busy}

@@ -19,6 +19,7 @@ Three conventions run through it:
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import mimetypes
@@ -70,6 +71,32 @@ PUBLIC_POSTS = ("/api/login", "/api/signup", "/api/pair")
 
 #: GETs that need more than watching.
 ADMIN_GETS = ("/api/ports/survey",)
+
+#: The largest request body accepted. Every real one is a few hundred bytes;
+#: without a cap, anyone on the network could make the server allocate
+#: whatever a Content-Length claims, before any password is checked.
+MAX_BODY_BYTES = 64 * 1024
+
+
+def web_build(root: str = WEB_ROOT) -> str:
+    """A short fingerprint of the panel's files, taken at startup.
+
+    Served with every state poll. A panel that sees it change -- the files
+    were deployed under it -- reloads itself, so a tablet on the wall does
+    not run last week's page against this week's server.
+    """
+    digest = hashlib.sha1()
+    for folder, subfolders, files in sorted(os.walk(root)):
+        subfolders.sort()
+        for name in sorted(files):
+            path = os.path.join(folder, name)
+            try:
+                info = os.stat(path)
+            except OSError:
+                continue
+            digest.update(f"{os.path.relpath(path, root)}:{info.st_size}:"
+                          f"{info.st_mtime_ns};".encode())
+    return digest.hexdigest()[:12]
 
 
 def parse_networks(text: str | None) -> list:
@@ -162,6 +189,8 @@ class Application:
         #: Finds the instruments' ports by asking, or None.
         self.finder = finder
         self.started_at = time.time()
+        #: Fingerprint of web/ when this server started (see web_build).
+        self.build = web_build()
         self._export_dir = tempfile.mkdtemp(prefix="vacuum-lab-export-")
 
     # --- composed views ---------------------------------------------------
@@ -171,6 +200,7 @@ class Application:
         principal = principal or authmod.LOCAL
         return {
             "ok": True,
+            "build": self.build,
             "chamber": self.chamber,
             "me": self.auth.me(principal),
             "control": self.auth.control(principal),
@@ -228,6 +258,10 @@ class Handler(BaseHTTPRequestHandler):
     """One request. `app` is attached to the class at startup."""
 
     server_version = "vacuum-lab/3.0"
+    #: Seconds a connection may sit silent before it is dropped: a client
+    #: that opens connections and sends nothing must not hold a thread each
+    #: for ever. Applies per read or write, not to a whole download.
+    timeout = 30
     app: Application
     #: Whoever sent this request, once it has been resolved.
     principal: "authmod.Principal | None" = None
@@ -395,12 +429,28 @@ class Handler(BaseHTTPRequestHandler):
             return default
         return value if value == value else default      # NaN is no value
 
-    def _body(self) -> dict:
+    def _body(self) -> dict | None:
+        """The JSON object in the request, or None once a refusal is sent.
+
+        A negative length would read until the client hangs up, and a huge
+        one would allocate whatever it claims: both are refused before a
+        byte is read. A body that is not a JSON object reads as empty.
+        """
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            return json.loads(self.rfile.read(length) or b"{}")
+        except (TypeError, ValueError):
+            length = -1
+        if length < 0:
+            self._json({"ok": False, "error": "bad Content-Length"}, 400)
+            return None
+        if length > MAX_BODY_BYTES:
+            self._json({"ok": False, "error": "request too large"}, 413)
+            return None
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
         except (ValueError, TypeError):
             return {}
+        return payload if isinstance(payload, dict) else {}
 
     # --- verbs ------------------------------------------------------------
 
@@ -424,10 +474,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/ping":
+            # Open to anyone on the network, so it says only what a sign-in
+            # page and the kiosk need -- not which serial port is which.
             self._json({"ok": True, "service": "vacuum-lab",
-                        "devices": self.app.registry.descriptors(),
                         "chamber": self.app.chamber,
-                        "auth": self.app.auth.status()})
+                        "auth": self.app.auth.status(),
+                        "build": self.app.build})
             return
 
         principal = self._principal()
@@ -515,6 +567,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._reachable():
             return
         payload = self._body()
+        if payload is None:
+            return
 
         if route in PUBLIC_POSTS:
             self._public_post(route, payload)

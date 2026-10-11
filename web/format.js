@@ -51,19 +51,26 @@ export function elapsed(seconds) {
   return rm ? `${h}h${String(rm).padStart(2, "0")}` : `${h}h`;
 }
 
+// Built once, used for every timestamp on the page. `toLocaleTimeString`
+// with options builds a new Intl formatter on each call, and on the kiosk
+// tablet that was the largest JavaScript cost in a profile of the idle
+// Dashboard (2026-10-10). Same output, a fraction of the work.
+const CLOCK = new Intl.DateTimeFormat([], {
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+});
+const DATE_TIME = new Intl.DateTimeFormat([], {
+  year: "numeric", month: "short", day: "2-digit",
+  hour: "2-digit", minute: "2-digit",
+});
+
 export function clock(epochSeconds) {
   if (!epochSeconds) return "—";
-  return new Date(epochSeconds * 1000).toLocaleTimeString([], {
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-  });
+  return CLOCK.format(new Date(epochSeconds * 1000));
 }
 
 export function dateTime(epochSeconds) {
   if (!epochSeconds) return "—";
-  return new Date(epochSeconds * 1000).toLocaleString([], {
-    year: "numeric", month: "short", day: "2-digit",
-    hour: "2-digit", minute: "2-digit",
-  });
+  return DATE_TIME.format(new Date(epochSeconds * 1000));
 }
 
 export function bytes(count) {

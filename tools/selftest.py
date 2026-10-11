@@ -1309,6 +1309,7 @@ def test_accounts() -> None:
     The registry is empty on purpose: a 404 "no device" means the request
     got past every permission check, which is what is being asked.
     """
+    import http.client
     import json as jsonmod
     import sqlite3
     import urllib.error
@@ -1380,7 +1381,29 @@ def test_accounts() -> None:
             check("the ping stays open and says what it is (the kiosk needs it)",
                   code == 200 and ping.get("service") == "vacuum-lab"
                   and ping.get("auth") == {"enabled": True, "owner": False})
+            check("the ping does not list the serial ports",
+                  "devices" not in ping and bool(ping.get("build")))
             check("no session, no state", call("/api/state")[0] == 401)
+
+            # Bodies are refused before they are read: no size the client
+            # claims is allocated, and a negative length never blocks.
+            def raw_post(length_header, data=b"{}"):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1],
+                                                        timeout=10)
+                connection.putrequest("POST", "/api/login")
+                connection.putheader("Content-Type", "application/json")
+                connection.putheader("Content-Length", length_header)
+                connection.endheaders()
+                connection.send(data)
+                status = connection.getresponse().status
+                connection.close()
+                return status
+            check("a body claiming more than 64 KB is refused unread",
+                  raw_post(str(10 ** 9)) == 413)
+            check("a negative Content-Length is refused, not waited on",
+                  raw_post("-1") == 400)
+            check("a JSON body that is not an object reads as empty, not a crash",
+                  call("/api/signup", [1, 2, 3])[0] == 400)
             check("no session, no command", call("/api/command", command)[0] == 401)
 
             authmod.bootstrap_owner(database, "chamber-1", "owner", "owner-pass-1", "Olga")
@@ -1437,6 +1460,33 @@ def test_accounts() -> None:
             check("Ana has lost it", call("/api/command", command, ana)[0] == 409)
             call("/api/control/release", {}, owner)
 
+            # One account on two screens is still one controller: acting on
+            # the second never moves control; pressing Take control does.
+            second = login("ana", "ana-pass-1")
+            call("/api/command", command, ana)
+            code, body = call("/api/command", command, second)
+            check("the same account on another screen cannot act implicitly",
+                  code == 409 and body.get("same_user") is True, f"{code}")
+            state = call("/api/state", token=second)[1]
+            check("and is told it is its own account holding control",
+                  state["control"].get("same_user") is True)
+            check("an explicit Take control moves it without an admin",
+                  call("/api/control/take", {}, second)[0] == 200
+                  and call("/api/command", command, second)[0] == 404
+                  and call("/api/command", command, ana)[0] == 409)
+            call("/api/control/release", {}, second)
+            call("/api/logout", {}, second)
+
+            # The person whose run is going may watch longer before the
+            # password is asked again.
+            accounts.runner = lambda: "ana"
+            check("whoever's run is going gets the longer idle limit",
+                  call("/api/me", token=ana)[1]["me"]["idle_after_s"]
+                  == round(authmod.RUN_IDLE_S)
+                  and call("/api/me", token=owner)[1]["me"]["idle_after_s"]
+                  == round(authmod.IDLE_S))
+            accounts.runner = None
+
             # Control lapses once the holder's polling stops.
             saved = authmod.LEASE_S
             authmod.LEASE_S = 0.3
@@ -1452,6 +1502,11 @@ def test_accounts() -> None:
                     "UPDATE sessions SET active_at = active_at - 3600 WHERE user_id=?",
                     (ana_id,))
                 database._db.commit()
+            # The server times touches on the monotonic clock while it runs;
+            # age those too, as an hour away from the tablet would.
+            for row in database.sessions(ana_id):
+                if row["token_hash"] in accounts._touched:
+                    accounts._touched[row["token_hash"]] -= 3600
             code, body = call("/api/command", command, ana)
             check("an idle session must give its password again", code == 401
                   and body.get("reauth") is True)

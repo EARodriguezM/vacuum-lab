@@ -126,19 +126,22 @@ function logTimeTicks(low, high) {
   return ticks;
 }
 
+// Tick labels are formatted on every redraw, so their formatters are built
+// once (see format.js: per-call formatters were the tablet's top JS cost).
+const TICK_SECONDS = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const TICK_MINUTES = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" });
+const TICK_DAY_TIME = new Intl.DateTimeFormat([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+const TICK_DAY = new Intl.DateTimeFormat([], { month: "short", day: "numeric" });
+
 function formatTick(value, kind, step = 60) {
   switch (kind) {
     case "clock": {
       const date = new Date(value * 1000);
-      return step < 60
-        ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
-        : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      return step < 60 ? TICK_SECONDS.format(date) : TICK_MINUTES.format(date);
     }
     case "date": {
       const date = new Date(value * 1000);
-      return step < 86400
-        ? date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
-        : date.toLocaleDateString([], { month: "short", day: "numeric" });
+      return step < 86400 ? TICK_DAY_TIME.format(date) : TICK_DAY.format(date);
     }
     case "elapsed":
       return elapsedTick(value, step);
@@ -167,8 +170,7 @@ function elapsedTick(value, step) {
 export function formatX(value, kind) {
   switch (kind) {
     case "clock":
-      return new Date(value * 1000).toLocaleTimeString([], {
-        hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      return fmt.clock(value);
     case "date":
       return fmt.dateTime(value);
     case "elapsed":

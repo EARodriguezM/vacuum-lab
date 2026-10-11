@@ -86,6 +86,47 @@ function mergeLive(held, { payload, reload }) {
   return { ...held, samples: held.samples.concat(rows), lastT: rows[rows.length - 1].t };
 }
 
+/**
+ * The deliberate way past an interlock, for an admin only.
+ *
+ * It quotes the rule's own words and will not send until the admin ticks
+ * that they have checked the rig themselves. The server refuses an override
+ * from anyone below admin whatever this dialog does, and logs every one
+ * under the name of who sent it.
+ */
+function OverrideDialog({ request, onCancel, onConfirm }) {
+  const [sure, setSure] = useState(false);
+  useEffect(() => { setSure(false); }, [request]);
+  useEffect(() => {
+    if (!request) return undefined;
+    const onKey = (event) => { if (event.key === "Escape") onCancel(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [request, onCancel]);
+  if (!request) return null;
+  return html`
+    <div class="overlay" onClick=${(e) => e.target === e.currentTarget && onCancel()}>
+      <div class="dialog" role="dialog" aria-modal="true">
+        <h2>Override: ${request.label}</h2>
+        <div class="small">
+          <p><strong>The interlock refuses this:</strong> ${request.reason}</p>
+          <p>Overriding sends it anyway. Do it only when you have looked at the
+            rig yourself and know why the rule does not apply right now. It is
+            recorded under your name.</p>
+        </div>
+        <label class="check">
+          <input type="checkbox" checked=${sure} onChange=${(e) => setSure(e.target.checked)} />
+          <span>I have checked the chamber and the pump myself.</span>
+        </label>
+        <div class="actions">
+          <button onClick=${onCancel}>Cancel</button>
+          <button class="danger" disabled=${!sure} onClick=${onConfirm}>
+            Override and send</button>
+        </div>
+      </div>
+    </div>`;
+}
+
 /** Who holds control of the rig, and the one button that changes it. */
 function ControlChip({ control, me, onTake, onRelease, onTakeOver }) {
   if (!control?.enabled || !me || me.kind === "device") return null;
@@ -94,6 +135,16 @@ function ControlChip({ control, me, onTake, onRelease, onTakeOver }) {
       <span class="chip-group">
         <${Pill} tone="good" title="You may move the hardware">You have control<//>
         <button class="small" onClick=${onRelease}>Release</button>
+      </span>`;
+  }
+  if (control.held && control.same_user) {
+    // This account, on another screen: moving it is the account's own call.
+    return html`
+      <span class="chip-group">
+        <${Pill} tone="warn" title=${`Since ${fmt.clock(control.since)}`}>
+          You have control on another screen<//>
+        ${me.can?.operate && html`
+          <button class="small" onClick=${onTake}>Take control here</button>`}
       </span>`;
   }
   if (control.held) {
@@ -185,6 +236,8 @@ function App() {
   const [poweringDown, setPoweringDown] = useState(false);
   const [securing, setSecuring] = useState(false);
   const [takingOver, setTakingOver] = useState(false);
+  // A command an interlock refused, which an admin may choose to override.
+  const [overriding, setOverriding] = useState(null);
   const [toasts, notify, dismiss] = useToasts();
   const [tick, setTick] = useState(0);
 
@@ -202,6 +255,8 @@ function App() {
   const liveRef = useRef(NO_LIVE);
   const stateRef = useRef(null);
   const touchRef = useRef({ last: Date.now(), sent: 0 });
+  // The server's fingerprint of the panel's files, as first seen.
+  const buildRef = useRef(null);
   stateRef.current = state;
 
   useEffect(() => { applyTheme(settings().theme); }, [tick]);
@@ -297,6 +352,21 @@ function App() {
           wantLive ? fetchLive(liveRef.current).catch(() => null) : null,
         ]);
         if (cancelled) return;
+        // New files on the server: this page is out of date. Reload now,
+        // unless somebody is in the middle of something -- a dialog open or
+        // a field being typed in -- in which case at the next poll.
+        if (next.build) {
+          if (!buildRef.current) {
+            buildRef.current = next.build;
+          } else if (next.build !== buildRef.current) {
+            const typing = ["INPUT", "TEXTAREA", "SELECT"]
+              .includes(document.activeElement?.tagName);
+            if (!typing && !document.querySelector(".overlay")) {
+              location.reload();
+              return;
+            }
+          }
+        }
         // Everything in one synchronous block: Preact redraws once.
         setState(next);
         setError(null);
@@ -370,18 +440,23 @@ function App() {
       return send(device, action, value, false);
     }
     return new Promise((resolve) => {
-      setPending({ device, action, label, reason, value, resolve, override: false });
+      setPending({ device, action, label, reason, value, resolve });
     });
   }, []);
 
-  const send = async (device, action, value, override) => {
+  const send = async (device, action, value, override, label) => {
     setBusy(true);
     try {
       const result = await api.command(device, action, value, { override });
       if (result.ok) {
-        notify(`${fmt.titleCase(action)} sent.`, "ok");
+        notify(`${fmt.titleCase(action)} sent${override ? " — interlock overridden" : ""}.`, "ok");
       } else if (result.interlock) {
         notify(`Refused: ${result.error}`, "error");
+        // An admin is offered the deliberate way past it; nobody else is.
+        if (!override && stateRef.current?.me?.can?.override) {
+          setOverriding({ device, action, value, reason: result.error,
+                          label: label || fmt.titleCase(action) });
+        }
       } else {
         notify(result.error || "The command failed.", "error");
       }
@@ -398,8 +473,14 @@ function App() {
     const request = pending;
     setPending(null);
     const result = await send(request.device, request.action, request.value,
-                              request.override);
+                              false, request.label);
     request.resolve?.(result);
+  };
+
+  const confirmOverride = async () => {
+    const request = overriding;
+    setOverriding(null);
+    await send(request.device, request.action, request.value, true, request.label);
   };
 
   const cancelPending = () => {
@@ -611,7 +692,11 @@ function App() {
           pumpProps=${{ state, onCommand: pumpCommand, onWriteParam: writeParam,
                         busy: locked, safeBusy: safeLocked, notify, shutdown,
                         onShutdown: () => setPoweringDown(true),
-                        onSecure: () => setSecuring(true) }}
+                        onSecure: () => setSecuring(true),
+                        onOverride: me?.can?.override
+                          ? (action, label, reason) => setOverriding(
+                            { device: "pump", action, label, reason })
+                          : null }}
           gaugeProps=${{ state, onCommand: gaugeCommand, busy: locked }} />`;
       case "tests":
         return html`<${TestsView} state=${state} live=${live} onStart=${startRun}
@@ -735,19 +820,10 @@ function App() {
         body=${html`
           <p>${pending?.reason ||
             "This changes what the hardware is doing right now."}</p>`}
-        extra=${pending?.reason && me?.can?.override ? html`
-          <label class="check">
-            <input type="checkbox" checked=${pending.override}
-                   onChange=${(e) => setPending({ ...pending,
-                                                  override: e.target.checked })} />
-            <span>Override the interlock
-              <div class="help">Only when you know why the rule does not apply.
-                Overrides are logged under your name.</div></span>
-          </label>`
-          : pending?.reason ? html`
-            <p class="small muted">Only an admin can override an interlock.</p>`
-          : null}
         onCancel=${cancelPending} onConfirm=${confirmPending} />
+
+      <${OverrideDialog} request=${overriding}
+        onCancel=${() => setOverriding(null)} onConfirm=${confirmOverride} />
 
       <${ReauthDialog} open=${reauth} me=${me}
         onDone=${() => { setReauth(false); notify("Welcome back. The controls are yours again.", "ok"); setTick((t) => t + 1); }}

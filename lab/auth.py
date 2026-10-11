@@ -30,7 +30,17 @@ hands on the rig. After IDLE_S without a touch, a person's session keeps
 watching but may not act until the password is typed again; on a paired
 tablet the panel signs them out altogether and falls back to the tablet's
 own session. The server enforces the first part, so a panel that never
-signs anyone out still cannot act on a stale session.
+signs anyone out still cannot act on a stale session. The person whose run
+is going gets RUN_IDLE_S instead: a deposition is mostly watching, and its
+guided steps must not each start with a password.
+
+**Clocks.** Everything kept in memory -- control, the idle timer, password
+throttling, pairing codes -- is timed with `time.monotonic()`. A Raspberry Pi
+has no clock battery and boots with the wrong time until the network
+corrects it; measured on the wall clock, that correction could make control
+outlive its holder by hours. The wall clock is used only for what must
+survive a restart: session expiry and the last-touch time stored with each
+session.
 
 **Paired tablets.** A tablet on the wall must keep showing the rig -- and keep
 sounding its alarms -- with nobody signed in. An admin pairs it once with a
@@ -60,6 +70,8 @@ RANK = {role: index for index, role in enumerate(ROLES)}
 
 #: A person's session may act only this long after their last touch.
 IDLE_S = 15 * 60
+#: ...and this long for the person whose run is going (decided 2026-10-11).
+RUN_IDLE_S = 60 * 60
 #: How long a person stays signed in at all, watching, from signing in.
 SESSION_S = 7 * 24 * 3600
 #: Control lapses this long after the holder's panel stops polling.
@@ -157,7 +169,10 @@ class Principal:
     kind: str                   # person | device | local
     role: str
     session: str | None         # the token's hash; None with accounts off
-    active_at: float
+    #: Seconds since this session's last deliberate touch.
+    inactive_s: float = 0.0
+    #: How long it may go untouched and still act (IDLE_S or RUN_IDLE_S).
+    idle_limit: float = IDLE_S
     must_change: bool = False
 
     @property
@@ -167,20 +182,18 @@ class Principal:
     def at_least(self, role: str) -> bool:
         return self.rank >= RANK[role]
 
-    def idle(self, now: float | None = None) -> bool:
+    def idle(self) -> bool:
         """Whether this session must give its password again before acting."""
-        return (self.kind == "person"
-                and (now or time.time()) - self.active_at > IDLE_S)
+        return self.kind == "person" and self.inactive_s > self.idle_limit
 
-    def may_operate(self, now: float | None = None) -> bool:
+    def may_operate(self) -> bool:
         return (self.kind in ("person", "local") and self.at_least("operator")
-                and not self.idle(now) and not self.must_change)
+                and not self.idle() and not self.must_change)
 
 
 #: Every request, when the server runs with --no-auth. It is the owner, never
 #: idle, and has nobody to share control with.
-LOCAL = Principal(0, "local", "Operator", "local", "owner", None,
-                  float("inf"))
+LOCAL = Principal(0, "local", "Operator", "local", "owner", None)
 
 
 class Throttle:
@@ -202,7 +215,7 @@ class Throttle:
         self._failures: dict[str, tuple[int, float]] = {}
 
     def wait(self, *keys: str) -> float:
-        now = time.time()
+        now = time.monotonic()
         longest = 0.0
         with self._lock:
             for key in keys:
@@ -214,7 +227,7 @@ class Throttle:
         return max(0.0, longest)
 
     def fail(self, *keys: str) -> None:
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
             for key in keys:
                 count, last = self._failures.get(key, (0, 0.0))
@@ -242,18 +255,39 @@ def refusal(error: str, status: int, **extra) -> dict:
 class Auth:
     """Accounts, sessions, roles and control for one chamber."""
 
-    def __init__(self, database, chamber: str, enabled: bool = True):
+    def __init__(self, database, chamber: str, enabled: bool = True,
+                 idle_s: float = IDLE_S, run_idle_s: float = RUN_IDLE_S,
+                 runner=None):
         self.db = database
         self.chamber = chamber
         self.enabled = enabled
+        #: How long a person may go untouched and still act, and how long
+        #: when the run that is going is theirs (webserver.py --idle-minutes,
+        #: --run-idle-minutes).
+        self.idle_s = idle_s
+        self.run_idle_s = run_idle_s
+        #: Returns the username that started the run in progress, or None.
+        self.runner = runner
         self.throttle = Throttle()
         self._lock = threading.RLock()
         self._control: dict | None = None
         self._pairing: dict[str, tuple[int, float]] = {}
         self._signups: dict[str, list[float]] = {}
+        #: Session hash -> monotonic time of its last deliberate touch, and of
+        #: the last time that touch was also written to the database.
+        self._touched: dict[str, float] = {}
+        self._written: dict[str, float] = {}
         self._dummy: str | None = None
 
     # --- sessions -----------------------------------------------------------
+
+    def idle_limit(self, username: str) -> float:
+        """How long `username` may go untouched: longer while their run goes."""
+        try:
+            running = self.runner() if self.runner else None
+        except Exception:
+            running = None
+        return self.run_idle_s if running and running == username else self.idle_s
 
     def resolve(self, token: str | None, address: str = "") -> Principal | None:
         """The principal behind a session token, or None if it is not valid."""
@@ -280,10 +314,30 @@ class Auth:
                 return None
         if now - row["seen_at"] > 60:
             self.db.touch_session(hashed, seen_at=now, address=address or None)
+        # Since the last touch: from memory when this process saw it, which
+        # no clock correction can stretch; from the database only after a
+        # restart, and never negative.
+        touched = self._touched.get(hashed)
+        inactive = (time.monotonic() - touched if touched is not None
+                    else max(0.0, now - row["active_at"]))
         return Principal(user["id"], user["username"],
                          user["display_name"] or user["username"], user["kind"],
-                         role, hashed, row["active_at"],
+                         role, hashed, inactive,
+                         self.idle_limit(user["username"]),
                          bool(user["must_change"]))
+
+    def _touch(self, session: str, write: bool = False) -> None:
+        """Record a deliberate touch: in memory always, in the database at
+        most every ACTIVE_WRITE_S (or at once, with `write`)."""
+        mono = time.monotonic()
+        self._touched[session] = mono
+        if write or mono - self._written.get(session, 0.0) > ACTIVE_WRITE_S:
+            self._written[session] = mono
+            self.db.touch_session(session, active_at=time.time())
+
+    def _forget(self, session: str | None) -> None:
+        self._touched.pop(session, None)
+        self._written.pop(session, None)
 
     def mark_active(self, principal: Principal) -> bool:
         """Count a deliberate action as a touch, unless the session is idle.
@@ -294,11 +348,9 @@ class Auth:
         """
         if principal.kind != "person" or principal.idle():
             return False
-        now = time.time()
-        if now - principal.active_at > ACTIVE_WRITE_S:
-            self.db.touch_session(principal.session, active_at=now)
-            principal.active_at = now
-            self._refresh_holder(principal)
+        self._touch(principal.session)
+        principal.inactive_s = 0.0
+        self._refresh_holder(principal)
         return True
 
     def login(self, username: str, password: str, address: str = "",
@@ -331,15 +383,19 @@ class Auth:
             return refusal("This account has no role in this chamber. Ask an "
                            "admin.", 403)
         token = new_token()
-        self.db.create_session(token_hash(token), user["id"],
-                               time.time() + SESSION_S, address, agent)
+        hashed = token_hash(token)
+        self.db.create_session(hashed, user["id"], time.time() + SESSION_S,
+                               address, agent)
         self.db.update_user(user["id"], last_login_at=time.time())
+        # Signing in is a touch; the new row already carries the time.
+        self._touched[hashed] = self._written[hashed] = time.monotonic()
         return {"ok": True, "token": token, "me": self.me(self.resolve(token))}
 
     def logout(self, principal: Principal) -> dict:
         if principal.session:
             self.release(principal, quiet=True)
             self.db.delete_session(principal.session)
+            self._forget(principal.session)
         return {"ok": True}
 
     def reauth(self, principal: Principal, password: str) -> dict:
@@ -356,9 +412,9 @@ class Auth:
             self.throttle.fail(key)
             return refusal("Wrong password.", 401)
         self.throttle.clear(key)
-        now = time.time()
-        self.db.touch_session(principal.session, active_at=now)
-        principal.active_at = now
+        self._touch(principal.session, write=True)
+        principal.inactive_s = 0.0
+        self._refresh_holder(principal)
         return {"ok": True, "me": self.me(principal)}
 
     def change_password(self, principal: Principal, current: str,
@@ -391,7 +447,7 @@ class Auth:
         """Ask for an account. It does nothing until an admin approves it."""
         if not self.enabled:
             return refusal("Accounts are switched off on this server.", 400)
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
             recent = [t for t in self._signups.get(address, []) if now - t < 3600]
             if len(recent) >= SIGNUPS_PER_HOUR:
@@ -422,16 +478,19 @@ class Auth:
 
     def me(self, principal: Principal) -> dict:
         """What the panel needs to know about whoever is looking at it."""
-        now = time.time()
+        person = principal.kind == "person"
         described = {
             "username": principal.username, "name": principal.name,
             "kind": principal.kind, "role": principal.role,
             "rank": principal.rank, "must_change": principal.must_change,
-            "idle": principal.idle(now), "idle_after_s": IDLE_S,
-            "idle_in_s": (None if principal.kind != "person" else
-                          max(0, round(IDLE_S - (now - principal.active_at)))),
+            "idle": principal.idle(),
+            # None, never infinity, for a tablet or with accounts off: JSON
+            # has no infinity and the panel would fail to parse the reply.
+            "idle_after_s": round(principal.idle_limit) if person else None,
+            "idle_in_s": (max(0, round(principal.idle_limit - principal.inactive_s))
+                          if person else None),
             "can": {
-                "operate": principal.may_operate(now),
+                "operate": principal.may_operate(),
                 "admin": principal.at_least("admin")
                 and principal.kind in ("person", "local"),
                 "override": principal.at_least("admin")
@@ -450,22 +509,33 @@ class Auth:
     # --- control ------------------------------------------------------------
 
     def _holder(self, now: float | None = None) -> dict | None:
-        """The current controller, or None once the lease has lapsed."""
-        now = now or time.time()
+        """The current controller, or None once the lease has lapsed.
+
+        Monotonic throughout: the lease lapses LEASE_S after the holder's
+        polling stops, or when their session goes idle, whatever the wall
+        clock does meanwhile.
+        """
+        now = now or time.monotonic()
         holder = self._control
         if holder is None:
             return None
-        if now - holder["renewed"] > LEASE_S or now - holder["active_at"] > IDLE_S:
+        if now - holder["renewed"] > LEASE_S or now > holder["idle_at"]:
             self._control = None
             return None
         return holder
+
+    @staticmethod
+    def _idle_at(principal: Principal, now: float) -> float:
+        """When this session will go idle, on the monotonic clock."""
+        return now + max(0.0, principal.idle_limit - principal.inactive_s)
 
     def _refresh_holder(self, principal: Principal) -> None:
         with self._lock:
             holder = self._holder()
             if holder and holder["session"] == principal.session:
-                holder["renewed"] = time.time()
-                holder["active_at"] = principal.active_at
+                now = time.monotonic()
+                holder["renewed"] = now
+                holder["idle_at"] = self._idle_at(principal, now)
 
     def renew(self, principal: Principal) -> None:
         """Called on every request: the holder's own polling keeps control."""
@@ -480,14 +550,27 @@ class Auth:
             if holder is None:
                 return {"enabled": True, "held": False, "mine": False,
                         "lease_s": LEASE_S}
+            mine = bool(principal and principal.session
+                        and holder["session"] == principal.session)
             return {"enabled": True, "held": True, "holder": holder["name"],
                     "username": holder["username"], "since": holder["since"],
-                    "mine": bool(principal and principal.session
-                                 and holder["session"] == principal.session),
+                    "mine": mine,
+                    # The same account, on another screen: "Take control
+                    # here" moves it without needing an admin.
+                    "same_user": bool(principal and not mine
+                                      and holder["user_id"] == principal.user_id),
                     "lease_s": LEASE_S}
 
-    def take(self, principal: Principal, force: bool = False) -> dict:
-        """Take control of the rig: free, lapsed, already ours, or by force."""
+    def take(self, principal: Principal, force: bool = False,
+             explicit: bool = True) -> dict:
+        """Take control of the rig: free, lapsed, already ours, or by force.
+
+        `explicit` is a person pressing Take control. An action that only
+        *needs* control (ensure_control) takes it when it is free, never
+        from another screen -- not even one signed in to the same account.
+        Otherwise two tablets sharing a login would hand control back and
+        forth on every press, which is two controllers in all but name.
+        """
         if not self.enabled:
             return {"ok": True, "control": self.control(principal)}
         if principal.kind != "person":
@@ -499,10 +582,15 @@ class Auth:
         if principal.idle():
             return refusal("Your session has been idle. Enter your password to "
                            "act again.", 401, reauth=True)
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
             holder = self._holder(now)
             previous = None
+            if (holder and holder["session"] != principal.session
+                    and holder["user_id"] == principal.user_id and not explicit):
+                return refusal("This account has control on another screen. "
+                               "Press Take control here first.", 409,
+                               holder=holder["name"], same_user=True)
             if holder and holder["user_id"] != principal.user_id:
                 if not (force and principal.at_least("admin")):
                     return refusal(
@@ -516,8 +604,9 @@ class Auth:
             self._control = {
                 "session": principal.session, "user_id": principal.user_id,
                 "username": principal.username, "name": principal.name,
-                "since": now if changed else holder["since"],
-                "renewed": now, "active_at": principal.active_at,
+                # Wall time, only to show "since 11:12 PM".
+                "since": time.time() if changed else holder["since"],
+                "renewed": now, "idle_at": self._idle_at(principal, now),
             }
         if previous:
             self._log(principal, "warning",
@@ -530,7 +619,7 @@ class Auth:
         """None if this principal may move hardware now; else the refusal."""
         if not self.enabled:
             return None
-        result = self.take(principal)
+        result = self.take(principal, explicit=False)
         return None if result.get("ok") else result
 
     def release(self, principal: Principal, quiet: bool = False) -> dict:
@@ -581,7 +670,7 @@ class Auth:
 
     def _issue_code(self, user_id: int) -> str:
         code = new_code()
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
             self._pairing = {k: v for k, v in self._pairing.items()
                              if v[1] > now and v[0] != user_id}
@@ -601,7 +690,8 @@ class Auth:
         hashed = token_hash(normalise_code(code))
         with self._lock:
             entry = self._pairing.pop(hashed, None)
-        user = self.db.user(entry[0]) if entry and entry[1] > time.time() else None
+        valid = entry is not None and entry[1] > time.monotonic()
+        user = self.db.user(entry[0]) if valid else None
         if not user or user["kind"] != "device" or user["status"] != "active":
             self.throttle.fail(key)
             return refusal("That code is wrong or has expired. Ask an admin "
@@ -629,9 +719,11 @@ class Auth:
     def users_report(self, actor: Principal) -> dict:
         if not self._admin(actor):
             return refusal("Managing accounts needs the admin role.", 403)
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
-            pairing = {v[0]: v[1] for v in self._pairing.values() if v[1] > now}
+            # Shown as a wall-clock time; kept on the monotonic one.
+            pairing = {v[0]: time.time() + (v[1] - now)
+                       for v in self._pairing.values() if v[1] > now}
         people, tablets = [], []
         for user in self.db.users(self.chamber):
             entry = self._public(user)

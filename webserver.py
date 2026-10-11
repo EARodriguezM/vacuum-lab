@@ -127,7 +127,10 @@ def build(args) -> api.Application:
     # Who may watch and who may drive, per chamber. Sessions outlive a
     # restart -- they are in the database -- so a deploy does not sign every
     # tablet out; the expired ones are swept here.
-    accounts = auth.Auth(database, args.chamber_id, enabled=not args.no_auth)
+    accounts = auth.Auth(database, args.chamber_id, enabled=not args.no_auth,
+                         idle_s=args.idle_minutes * 60,
+                         run_idle_s=args.run_idle_minutes * 60,
+                         runner=engine.runner)
     database.purge_sessions()
     return api.Application(devices, database, engine, auth=accounts,
                            history=recorder, supervisor=supervisor,
@@ -178,6 +181,12 @@ def main() -> int:
                              "panel at all, e.g. 192.168.50.0/24. Loopback is "
                              "always allowed (the tablet on its USB cable). "
                              "Default: any address")
+    parser.add_argument("--idle-minutes", type=float, default=15,
+                        help="a person must type their password again to act "
+                             "after this long without touching the panel")
+    parser.add_argument("--run-idle-minutes", type=float, default=60,
+                        help="the same, for the person whose run is going: a "
+                             "deposition is mostly watching")
     parser.add_argument("--no-auth", action="store_true",
                         help="switch accounts off: anyone who reaches the port "
                              "is the owner. For the simulator on a laptop, "

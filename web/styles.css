@@ -646,3 +646,16 @@ nav.tabs.subtabs button { font-size:13.5px; padding:8px 12px; min-height:40px;
 
 details > summary { cursor:pointer; color:var(--ink-soft); padding:4px 0; }
 details[open] > summary { margin-bottom:10px; }
+
+/* Fingers, not a mouse pointer: the kiosk tablet and phones. Anything that
+   is tapped gets at least 40 px (the tablet's own guidance); the compact
+   sizes above stay for a mouse, where they read better. */
+@media (pointer: coarse) {
+  button.small, button.ghost, .btn.small, .segmented button { min-height:40px; }
+  button.tiny { min-height:36px; padding:4px 10px; }
+  nav.tabs button { min-height:44px; }
+  label.check input[type=checkbox] { width:20px; height:20px; }
+}
+
+/* An interlocked button and, for an admin, the deliberate way past it. */
+.guarded { display:inline-flex; gap:6px; align-items:center; }

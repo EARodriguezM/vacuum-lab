@@ -235,6 +235,11 @@ class Database:
         self._db.row_factory = sqlite3.Row
         with self._lock:
             self._db.execute("PRAGMA journal_mode=WAL")
+            # NORMAL, not the default FULL: with WAL it cannot corrupt the
+            # file, and on power loss only the last commits can go missing.
+            # FULL syncs every commit -- every sample, every event -- which
+            # on a Raspberry Pi's SD card means wear and write stalls.
+            self._db.execute("PRAGMA synchronous=NORMAL")
             self._db.execute("PRAGMA foreign_keys=ON")
             self._db.executescript(SCHEMA)
             self._migrate()
