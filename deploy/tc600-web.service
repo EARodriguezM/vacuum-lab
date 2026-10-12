@@ -41,6 +41,11 @@ ExecStart=/usr/bin/python3 /home/esarodriguezm/tc600-control/webserver.py \
     --port 8600
 Restart=on-failure
 RestartSec=5
+# A stop or restart ends a run in progress first, with its clean-up, and lets
+# a make-safe sequence finish: up to 45 s for those, 75 s for the whole
+# shutdown (Application.CLOSE_BUDGET_S). This is how long systemd waits
+# before killing it, so keep it above that.
+TimeoutStopSec=90
 
 [Install]
 WantedBy=multi-user.target

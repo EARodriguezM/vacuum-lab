@@ -50,9 +50,9 @@ function Guarded({ action, label, interlocks, onRun, tone = "", disabled, onOver
               onClick=${() => onRun(action, label, reason)}>
         ${label}${blocked && rule.wait ? html` <span class="muted">${rule.wait}s</span>` : null}
       </button>
-      ${blocked && onOverride && !disabled && html`
-        <button class="small danger" title="Admins only: send it despite the interlock"
-                onClick=${() => onOverride(action, label, reason)}>Override…</button>`}
+      ${blocked && onOverride && !disabled && rule.rule && html`
+        <button class="small danger" title="Admins only: waive this one rule and send it"
+                onClick=${() => onOverride(action, label, reason, rule.rule)}>Override…</button>`}
     </span>`;
 }
 
@@ -201,6 +201,11 @@ function Accessories({ data, busy, onWrite, reload }) {
     </div>`;
 }
 
+/** What acknowledging does, said wherever it can be pressed. */
+const ACK_NOTE = "Switches the turbopump motor off first, then clears the drive's "
+  + "fault, so the rotor cannot restart into whatever tripped it. Make safe does "
+  + "the same and also keeps the forevacuum pump running.";
+
 const GAS_MODES = { 0: "heavy gases (argon)", 1: "light gases", 2: "helium" };
 const VENT_MODE_NAMES = { 0: "controlled venting (delayed)", 1: "no venting", 2: "venting on" };
 const BKP_MODE_NAMES = { 0: "continuous", 1: "intermittent", 2: "delayed" };
@@ -266,8 +271,7 @@ function FaultsCard({ pump, alarms, busy, safeBusy, canAdmin = true, onCommand,
                 onClick=${onSecure}
                 title="Motor off, fault acknowledged, forevacuum pump on">Make safe now</button>
         <button disabled=${busy || !fault}
-                onClick=${() => onCommand("ack", "Acknowledge fault",
-                  "Acknowledging only clears the drive's fault. If the turbopump motor is still switched on, the drive will try to restart it — use Make safe instead to switch it off first.")}>
+                onClick=${() => onCommand("ack", "Acknowledge fault", ACK_NOTE)}>
           Acknowledge only</button>
         <span class=${`pill ${auto ? "good" : "warn"}`}>
           <span class="dot" />automatic recovery ${auto ? "on" : "off"}</span>
@@ -548,7 +552,7 @@ export function PumpView({ state, onCommand, onWriteParam, busy, safeBusy,
               fmt.integer(setpoints.StdbySVal)}%)`}
           </button>
           <button disabled=${busy || !fault}
-                  onClick=${() => onCommand("ack", "Acknowledge fault")}>
+                  onClick=${() => onCommand("ack", "Acknowledge fault", ACK_NOTE)}>
             Acknowledge fault
           </button>
           <button class="danger"

@@ -20,7 +20,7 @@ import tpg
 from tpg import commands as tpg_commands
 from tpg import protocol as tpg_protocol
 
-from .registry import DeviceService
+from .registry import DeviceService, waived_rules
 
 #: Cold-cathode and FullRange gauges must not be struck above this pressure.
 #: 1e-2 mbar is the conventional ceiling for a Penning discharge.
@@ -34,11 +34,15 @@ COLD_CATHODE_PREFIXES = ("IKR", "PKR", "PBR", "IMR", "CO")
 
 
 class GaugeInterlock(Exception):
-    """Raised when a gauge command is refused because of the process state."""
+    """Raised when a gauge command is refused because of the process state.
 
-    def __init__(self, reason: str):
+    `rule` is the refusing rule's id, which an admin's override names.
+    """
+
+    def __init__(self, reason: str, rule: str | None = None):
         super().__init__(reason)
         self.reason = reason
+        self.rule = rule
 
 
 class GaugeService(DeviceService):
@@ -54,6 +58,9 @@ class GaugeService(DeviceService):
         self.baudrate = baudrate
         self.channels = channels
         self.timeout = timeout
+        #: The slower reads, one per cycle in turn, and their last answers.
+        self._turn = 0
+        self._extras: dict = {}
         super().__init__(key, port, baudrate=baudrate, channels=channels,
                          **options)
 
@@ -109,24 +116,38 @@ class GaugeService(DeviceService):
                 return self.offline(str(exc))
 
             if not self._identity:
-                try:
-                    self._identity = unit.identify()
-                except tpg_protocol.TpgError:
-                    self._identity = {}
+                self._extras.clear()        # a new link may be another unit
 
-            extras: dict = {}
-            for name, reader in (("sensors", unit.sensor_state),
-                                 ("setpoints", unit.setpoint_status)):
+            # Until every part of the identity has answered, ask again each
+            # cycle. One lost reply to TID used to leave the gauge types out
+            # until the next reconnect -- and with them the cold-cathode rule.
+            if not self._identity_complete():
                 try:
-                    extras[name] = reader()
-                except (tpg_protocol.TpgError, ValueError, IndexError):
-                    extras[name] = []
+                    found = unit.identify()
+                except tpg_protocol.TpgError:
+                    found = {}
+                except (serial.SerialException, OSError) as exc:
+                    self.drop()
+                    return self.offline(str(exc))
+                self._identity = {**self._identity, **found}
+
+            # The gauges' on/off state and the switching functions, one of
+            # the two per cycle: neither is a pressure, and every exchange
+            # added here is one more the pressure waits behind.
+            self._turn = (self._turn + 1) % 2
+            name, reader = (("sensors", unit.sensor_state),
+                            ("setpoints", unit.setpoint_status))[self._turn]
+            try:
+                self._extras[name] = reader()
+            except (tpg_protocol.TpgError, ValueError, IndexError):
+                self._extras[name] = []
 
             return self.online(
                 readings=readings,
                 unit=self._identity.get("unit"),
                 baudrate=self.baudrate,
-                **extras,
+                sensors=self._extras.get("sensors", []),
+                setpoints=self._extras.get("setpoints", []),
             )
 
     def sample_fields(self, snap: dict) -> dict:
@@ -154,33 +175,63 @@ class GaugeService(DeviceService):
                   if r.get("valid") and isinstance(r.get("mbar"), (int, float))]
         return min(values) if values else None
 
-    def _gauge_identifier(self, channel: int) -> str:
-        for entry in self._identity.get("gauges", []):
+    #: What a complete identity holds: the firmware, which gauge is on each
+    #: channel, and the unit the readings are in.
+    IDENTITY = ("firmware", "gauges", "unit")
+
+    def _identity_complete(self) -> bool:
+        return all(self._identity.get(name) for name in self.IDENTITY)
+
+    def _gauge_identifier(self, channel: int) -> str | None:
+        """What is on `channel`, or None while the controller has not said."""
+        for entry in self._identity.get("gauges") or []:
             if entry.get("channel") == channel:
                 return str(entry.get("identifier", ""))
-        return ""
+        return None
 
-    def _check_sensor_on(self, channel: int, snap: dict) -> None:
-        identifier = self._gauge_identifier(channel).upper()
-        if not any(identifier.startswith(p) for p in COLD_CATHODE_PREFIXES):
-            return
+    def _check_sensor_on(self, channel: int, snap: dict,
+                         waive=frozenset()) -> list[str]:
+        """Refuse striking a cold cathode it is not safe to strike; return
+        the waived rules that would have refused."""
+        identifier = self._gauge_identifier(channel)
+        # A gauge that has not been identified is taken for a cold cathode:
+        # the rule exists for the case nobody has checked, and an unknown
+        # gauge is that case.
+        if identifier and not any(
+                identifier.upper().startswith(p) for p in COLD_CATHODE_PREFIXES):
+            return []
+        what = (f"channel {channel} is a cold-cathode gauge" if identifier
+                else f"the gauge on channel {channel} has not been identified "
+                     f"yet, so it is treated as a cold-cathode gauge,")
         pressure = self.best_pressure(snap)
         if pressure is None:
+            if "cold_cathode_unknown" in waive:
+                return ["cold_cathode_unknown"]
             raise GaugeInterlock(
-                f"channel {channel} is a cold-cathode gauge and no other "
-                "channel is reading, so the chamber pressure is unknown. "
-                "Switch it on from the front panel if you are sure.")
+                f"{what} and no other channel is reading, so the chamber "
+                "pressure is unknown. Switch it on from the front panel if "
+                "you are sure.", rule="cold_cathode_unknown")
         if pressure > COLD_CATHODE_LIMIT_MBAR:
+            if "cold_cathode_pressure" in waive:
+                return ["cold_cathode_pressure"]
             raise GaugeInterlock(
-                f"the chamber is at {pressure:.2E} mbar. A cold-cathode gauge "
-                f"must not be struck above {COLD_CATHODE_LIMIT_MBAR:.0E} mbar "
-                "-- the discharge will not stabilise and the electrodes "
-                "sputter.")
+                f"the chamber is at {pressure:.2E} mbar and {what}. A "
+                f"cold-cathode gauge must not be struck above "
+                f"{COLD_CATHODE_LIMIT_MBAR:.0E} mbar -- the discharge will not "
+                "stabilise and the electrodes sputter.",
+                rule="cold_cathode_pressure")
+        return []
 
     # --- commands ---------------------------------------------------------
 
-    def command(self, action: str, value=None, override: bool = False) -> dict:
+    def command(self, action: str, value=None, override=None) -> dict:
+        """Carry out `action`; `override` names the rules to waive."""
         payload = value if isinstance(value, dict) else {"value": value}
+        try:
+            waive = waived_rules(override)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        used: list[str] = []
 
         with self.lock:
             try:
@@ -198,8 +249,9 @@ class GaugeService(DeviceService):
                 elif action in ("sensor_on", "sensor_off"):
                     channel = int(payload.get("channel", 1))
                     turning_on = action == "sensor_on"
-                    if turning_on and not override:
-                        self._check_sensor_on(channel, self.snapshot())
+                    if turning_on:
+                        used = self._check_sensor_on(channel, self.snapshot(),
+                                                     waive)
                     result = unit.set_sensor(channel, turning_on)
 
                 elif action in ("degas_on", "degas_off"):
@@ -232,7 +284,8 @@ class GaugeService(DeviceService):
                     return {"ok": False, "error": f"unknown action {action!r}"}
 
             except GaugeInterlock as stop:
-                return {"ok": False, "error": stop.reason, "interlock": True}
+                return {"ok": False, "error": stop.reason, "interlock": True,
+                        "rule": stop.rule}
             except tpg_protocol.NakError as exc:
                 return {"ok": False, "error": f"{exc}. The unit may be "
                                               "keylocked, or the model may not "
@@ -248,7 +301,7 @@ class GaugeService(DeviceService):
 
         self.note_success()
         return {"ok": True, "action": action, "result": result,
-                "overridden": bool(override)}
+                "overridden": used}
 
     def details(self) -> dict:
         """Everything the gauge page needs but the fast poll does not carry."""

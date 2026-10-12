@@ -20,10 +20,17 @@ statuses at the right pressures, which is what makes the status handling in
 
 `set_pumping()` links it to the pump simulator: tools/selftest.py feeds the
 fake TC 600's rotor speed in, so the two simulators model one rig.
+
+`FAULTS` makes it fail on demand -- silent, acknowledging without answering,
+a frozen reading, refused or unanswered mnemonics -- and can switch it to the
+rig's own layout: one PKR 251 FullRange gauge on channel 1, which the real
+unit calls "CO9", and nothing on channel 2 ("noSe"). `reset()` undoes all of
+it between tests.
 """
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 import sys
@@ -150,6 +157,14 @@ GAUGES = [
     {"id": "IKR9", "low": 1.0e-9, "high": 1.0e-2},  # cold cathode
 ]
 
+#: The rig's own: a PKR 251 FullRange head on channel 1, which the real
+#: TPG 252 A identifies as "CO9", and an empty channel 2, which it calls
+#: "noSe". Selected with FAULTS["layout"] = "rig".
+RIG_GAUGES = [
+    {"id": "CO9", "low": 5.0e-9, "high": 1000.0},
+    {"id": "noSe", "absent": True},
+]
+
 #: Mnemonics this fake firmware does not implement, so the NAK path and the
 #: capability probe both get exercised. Matches what the real TPG 252 A
 #: refuses, which notably includes degas and the third and fourth switching
@@ -157,13 +172,55 @@ GAUGES = [
 UNIMPLEMENTED = {"RSX", "NAD", "COR", "DGS", "SCX", "SP3", "SP4",
                  "DCB", "DCC", "DCD", "DCS", "HDL", "SP5", "SP6"}
 
+#: Faults to inject. Empty is a healthy controller.
+#:
+#:   silent    True: answer nothing at all
+#:   ack_only  True: acknowledge every mnemonic but never send its data
+#:   frozen    a pressure in mbar, reported whatever the chamber does
+#:   drop      {mnemonic: n}  no answer to the next n of it (-1: every one)
+#:   nak       {mnemonic: n}  refuse the next n of it
+#:   layout    "rig": the rig's own gauges (see RIG_GAUGES)
+FAULTS: dict = {}
+
+#: The state as the controller starts, for `reset()`.
+_INITIAL = copy.deepcopy(STATE)
+
+
+def reset() -> None:
+    """A healthy controller on a chamber at atmosphere again."""
+    STATE.clear()
+    STATE.update(copy.deepcopy(_INITIAL))
+    FAULTS.clear()
+    # The same object, re-initialised: fake_rig and the tests hold it.
+    CHAMBER.__init__()
+
+
+def gauges() -> list[dict]:
+    """The gauges fitted now: the classic pair, or the rig's own."""
+    return RIG_GAUGES if FAULTS.get("layout") == "rig" else GAUGES
+
+
+def _take(kind: str, mnemonic: str) -> bool:
+    """Whether fault `kind` spoils this mnemonic, using one count up."""
+    counts = FAULTS.get(kind) or {}
+    left = counts.get(mnemonic)
+    if not left:
+        return False
+    if left > 0:
+        counts[mnemonic] = left - 1
+    return True
+
 
 def measure(channel: int) -> tuple[int, float]:
     """One channel's (status, value), in whatever unit the controller is set to."""
-    gauge = GAUGES[channel]
+    gauge = gauges()[channel]
+    if gauge.get("absent"):
+        return 5, 0.0                                   # no sensor
     if STATE["sensors"][channel] != 2:
         return 4, 0.0                                   # sensor off
     pressure = CHAMBER.pressure
+    if FAULTS.get("frozen") is not None:
+        pressure = float(FAULTS["frozen"])
     if pressure < gauge["low"]:
         return 1, _convert(gauge["low"])
     if pressure > gauge["high"]:
@@ -178,6 +235,8 @@ def _convert(mbar: float) -> float:
 
 def auto_strike() -> None:
     """Model the controller's own auto-on for the cold cathode gauge."""
+    if gauges() is RIG_GAUGES:
+        return          # a FullRange head hands over inside itself
     if CHAMBER.pressure < 5.0e-3 and STATE["sensors"][1] == 1:
         STATE["sensors"][1] = 2
     elif CHAMBER.pressure > 1.0e-2 and STATE["sensors"][1] == 2:
@@ -196,7 +255,7 @@ def handle(line: str) -> str | None:
         return STATE["firmware"]
 
     if mnemonic == "TID":
-        return ",".join(g["id"] for g in GAUGES)
+        return ",".join(g["id"] for g in gauges())
 
     if mnemonic == "UNI":
         if args:
@@ -223,8 +282,11 @@ def handle(line: str) -> str | None:
                 code = int(raw)
                 if code in (1, 2):
                     STATE["sensors"][index] = code
-        # The real unit answers 3, not 2, for a gauge that is on and reading.
-        return ",".join("3" if s == 2 else str(s) for s in STATE["sensors"])
+        # The real unit answers 3, not 2, for a gauge that is on and reading;
+        # an empty channel cannot be switched at all.
+        return ",".join("0" if gauge.get("absent") else "3" if state == 2
+                        else str(state)
+                        for gauge, state in zip(gauges(), STATE["sensors"]))
 
     if mnemonic == "FIL":
         if args:
@@ -266,7 +328,8 @@ def handle(line: str) -> str | None:
             lower, _upper = STATE["setpoints"][number]
             # No channel association on this model; the switching functions
             # follow whichever channel is reading.
-            status, value = measure(1 if STATE["sensors"][1] == 2 else 0)
+            second = not gauges()[1].get("absent") and STATE["sensors"][1] == 2
+            status, value = measure(1 if second else 0)
             closed.append("1" if status == 0 and value < lower else "0")
         return ",".join(closed)
 
@@ -333,13 +396,18 @@ def serve(master: int, should_stop=None) -> None:
                 buffer.clear()
                 if not line.strip():
                     continue
-                answer = handle(line)
+                mnemonic = line.strip().split(",")[0].upper()
+                if FAULTS.get("silent") or _take("drop", mnemonic):
+                    pending = None
+                    continue
+                answer = None if _take("nak", mnemonic) else handle(line)
                 if answer is None:
                     _write(master, protocol.NAK + protocol.TERMINATOR)
                     pending = None
                 else:
                     _write(master, protocol.ACK + protocol.TERMINATOR)
-                    pending = answer
+                    # Acknowledged, and then nothing: the data never comes.
+                    pending = None if FAULTS.get("ack_only") else answer
                 continue
 
             buffer.append(byte)

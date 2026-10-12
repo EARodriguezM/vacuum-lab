@@ -57,6 +57,12 @@ class TPG:
         #: Cached unit code, so pressure reads do not cost an extra round trip
         #: each. Invalidated by `set_unit`.
         self._unit_code: int | None = None
+        # The gauge's FTDI adapter would otherwise hold each reply up to
+        # 16 ms; a port without low-latency mode only loses the speed.
+        try:
+            self.serial.set_low_latency_mode(True)
+        except (AttributeError, NotImplementedError, OSError, ValueError):
+            pass
         time.sleep(0.1)
         self.serial.reset_input_buffer()
         self.serial.reset_output_buffer()

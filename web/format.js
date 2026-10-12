@@ -89,7 +89,11 @@ export function titleCase(text) {
 /** Parse "1e-5", "1E-5", "0.00001" alike; returns null if unparseable. */
 export function parseExponent(text) {
   if (typeof text === "number") return text;
-  const value = Number(String(text).trim().replace(",", "."));
+  // An empty box is no number at all: Number("") is 0, and a cleared field
+  // sent as 0 was "no limit" to a timeout and "no ceiling" to a pressure.
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) return null;
+  const value = Number(trimmed.replace(",", "."));
   return Number.isFinite(value) ? value : null;
 }
 

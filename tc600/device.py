@@ -14,6 +14,12 @@ Two quirks of this particular chain are handled here:
    converter's behaviour is learned. A write request, however, is byte for byte
    identical to the reply it provokes, so echoes there are only skipped once
    the converter is known to loop back.
+
+A reply is also matched to its request by address and parameter number. A
+reply that arrives after its own exchange gave up lands in the next one, and
+taken as that one's answer it puts one parameter's value under another's
+name: a late speed of "001500" read as the error code is a drive fault that
+never happened.
 """
 
 from __future__ import annotations
@@ -111,6 +117,14 @@ class TC600:
                     f"({exc}); an HXSP-485 on this port would be unpowered",
                     file=sys.stderr,
                 )
+        # An FTDI adapter holds received bytes for up to 16 ms before passing
+        # them on; in low-latency mode, 1 ms. At 9600 baud that is a fifth of
+        # every exchange. A port without the mode -- a pty -- only loses the
+        # speed.
+        try:
+            self.serial.set_low_latency_mode(True)
+        except (AttributeError, NotImplementedError, OSError, ValueError):
+            pass
         time.sleep(0.1)
         self.serial.reset_input_buffer()
         self.serial.reset_output_buffer()
@@ -154,11 +168,13 @@ class TC600:
             self.serial.rts = self.rts_invert  # back to listening
 
     def _read_telegram(self, sent: bytes) -> bytes:
-        """Read one CR-terminated telegram, skipping any echo of `sent`."""
+        """Read the reply to `sent`, skipping any echo of it and stale replies."""
         deadline = time.monotonic() + (self.serial.timeout or 1.0) * 2
         buffer = bytearray()
         is_read = sent[3:5] == protocol.ACTION_READ.encode()
         saw_echo = False
+        # Address and parameter number, as sent: the reply carries both.
+        wanted = (sent[0:3], sent[5:8])
 
         while time.monotonic() < deadline:
             chunk = self.serial.read_until(TERMINATOR)
@@ -185,6 +201,13 @@ class TC600:
                     saw_echo = True
                     continue
 
+            # The answer to some earlier request, arriving after that exchange
+            # had given up -- or noise ending in a CR. Either way not this
+            # parameter's value.
+            text = frame.strip(b"\r\n")
+            if (text[0:3], text[5:8]) != wanted:
+                continue
+
             if is_read and not saw_echo:
                 self.echoes = False
             return frame
@@ -193,11 +216,18 @@ class TC600:
             f"no reply from address {self.address} within the read timeout"
         )
 
-    def _exchange(self, request: bytes) -> protocol.Reply:
-        """Send one telegram and return the parsed reply, retrying on noise."""
-        last_error: Exception | None = None
+    def _exchange(self, request: bytes,
+                  retries: int | None = None) -> protocol.Reply:
+        """Send one telegram and return the parsed reply, retrying on noise.
 
-        for attempt in range(self.retries + 1):
+        `retries` overrides the instance's own count for this exchange: the
+        sampler can afford to lose a reading, a command should not be lost to
+        one dropped reply.
+        """
+        last_error: Exception | None = None
+        retries = self.retries if retries is None else retries
+
+        for attempt in range(retries + 1):
             if attempt:
                 time.sleep(0.1)
             try:
@@ -211,33 +241,36 @@ class TC600:
                 last_error = exc
 
         raise type(last_error)(  # type: ignore[misc]
-            f"{last_error} (after {self.retries + 1} attempts)"
+            f"{last_error} (after {retries + 1} attempts)"
         ) from last_error
 
     # --- parameter access ------------------------------------------------
 
-    def read_raw(self, number: int) -> str:
+    def read_raw(self, number: int, retries: int | None = None) -> str:
         """Read a parameter and return its undecoded payload string."""
-        return self._exchange(protocol.build_read(self.address, number)).payload
+        return self._exchange(protocol.build_read(self.address, number),
+                              retries).payload
 
-    def write_raw(self, number: int, payload: str) -> str:
+    def write_raw(self, number: int, payload: str,
+                  retries: int | None = None) -> str:
         """Write an already-encoded payload and return what the pump echoes."""
-        return self._exchange(protocol.build_write(self.address, number, payload)).payload
+        return self._exchange(protocol.build_write(self.address, number, payload),
+                              retries).payload
 
-    def read(self, key: str | int):
+    def read(self, key: str | int, retries: int | None = None):
         """Read a known parameter by name or number, decoded to a Python value."""
         parameter = params.lookup(key)
         if not parameter.readable:
             raise ValueError(f"{parameter.name} (P{parameter.number}) is write-only")
-        return parameter.decode(self.read_raw(parameter.number))
+        return parameter.decode(self.read_raw(parameter.number, retries))
 
-    def write(self, key: str | int, value):
+    def write(self, key: str | int, value, retries: int | None = None):
         """Write a known parameter by name or number, encoding `value` for it."""
         parameter = params.lookup(key)
         if not parameter.writable:
             raise ValueError(f"{parameter.name} (P{parameter.number}) is read-only")
         payload = parameter.encode(value)
-        echoed = self.write_raw(parameter.number, payload)
+        echoed = self.write_raw(parameter.number, payload, retries)
         # The pump echoes the accepted value; decode it so callers see reality.
         try:
             return parameter.decode(echoed)

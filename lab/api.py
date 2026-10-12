@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, urlparse
 from . import auth as authmod
 from . import db as dbmod
 from . import discovery, export, history, runs, trends
-from .pump import GUARDED
+from .pump import GUARDED, OPERATOR_WRITES
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB_ROOT = os.path.join(os.path.dirname(HERE), "web")
@@ -192,6 +192,46 @@ class Application:
         #: Fingerprint of web/ when this server started (see web_build).
         self.build = web_build()
         self._export_dir = tempfile.mkdtemp(prefix="vacuum-lab-export-")
+
+    #: The longest an orderly shutdown may take, all of it. Below the unit's
+    #: TimeoutStopSec (90 s), so systemd never kills the process in the
+    #: middle of a clean-up or a make-safe sequence.
+    CLOSE_BUDGET_S = 75.0
+    #: Of it, what is kept for after the run: the supervisor's last look, a
+    #: recovery that look starts, and the last records.
+    CLOSE_RESERVE_S = 30.0
+
+    def close(self, budget: float | None = None) -> None:
+        """Shut down in order: the run first -- its clean-up needs the
+        instruments -- then the watchers, the instruments and the store,
+        all of it within `budget` seconds."""
+        budget = budget or self.CLOSE_BUDGET_S
+        deadline = time.monotonic() + budget
+        try:
+            # The run's clean-up and a make-safe it starts get all but the
+            # reserve -- 45 s of the 75.
+            self.engine.close(
+                deadline=deadline - min(self.CLOSE_RESERVE_S, budget * 0.4))
+        finally:
+            if self.supervisor is not None:
+                self.supervisor.close(deadline=deadline)
+                # Its thread is stopped now, so one last look of its own:
+                # the run that just ended gets its alarm and its record.
+                try:
+                    self.supervisor.check()
+                except Exception:
+                    pass
+                # ...and a recovery that look started is let finish.
+                self.supervisor.close(deadline=deadline)
+            # The supervisor's last records, queued while the run ended.
+            try:
+                self.engine._flush(runs.within(5.0, deadline))
+            except Exception:
+                pass
+            if self.history is not None:
+                self.history.close()
+            self.registry.close()
+            self.db.close()
 
     # --- composed views ---------------------------------------------------
 
@@ -402,16 +442,28 @@ class Handler(BaseHTTPRequestHandler):
             return auth.ensure_control(principal)
         return None
 
+    def _record(self, run_id, level: str, message: str,
+                detail: dict | None = None, user: str | None = None) -> None:
+        """Write one event; a failure is said on stderr, never raised. The
+        hardware has already moved by the time most of these are written:
+        a full SD card must cost the record, not the panel its answer."""
+        try:
+            self.app.db.add_event(run_id, level, message, detail, user=user)
+        except Exception as exc:
+            # Counted with the run's own failed writes: the `storage` alarm
+            # puts it on screen, not only in the system log.
+            note = getattr(self.app.engine, "note_write_failure", None)
+            if note is not None:
+                note(exc, message)
+            else:
+                sys.stderr.write(f"  !! could not record ({exc}): {message}\n")
+
     def _audit(self, message: str, level: str = "action",
                detail: dict | None = None) -> None:
         """Put an action in the rig's record under the name of who took it."""
         who = self.principal or authmod.LOCAL
-        try:
-            self.app.db.add_event(self.app.engine.run_id(), level,
-                                  f"{who.name}: {message}", detail,
-                                  user=who.username)
-        except Exception:
-            pass
+        self._record(self.app.engine.run_id(), level, f"{who.name}: {message}",
+                     detail, user=who.username)
 
     def _query(self) -> dict:
         return parse_qs(urlparse(self.path).query)
@@ -893,7 +945,13 @@ class Handler(BaseHTTPRequestHandler):
         if view == "state":
             self._json({"ok": True, "device": device.snapshot()})
         elif view == "accessories" and hasattr(device, "accessories"):
-            self._json(device.accessories())
+            # What this person may write: the panel greys out the rest.
+            report = device.accessories()
+            who = self.principal or authmod.LOCAL
+            if report.get("ok") and not who.at_least("admin"):
+                report["writable"] = sorted(set(report.get("writable", []))
+                                            & OPERATOR_WRITES)
+            self._json(report)
         elif view == "details" and hasattr(device, "details"):
             self._json(device.details())
         elif view == "diagnostics" and hasattr(device, "diagnostics"):
@@ -992,17 +1050,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False,
                             "error": "deleting a run needs confirm"}, 400)
                 return
-            record = self.app.db.run(run_id)
-            deleted = self.app.db.delete_run(run_id)
-            if deleted:
-                # Kept in the rig's log, not the run's, which is now gone.
-                who = self.principal or authmod.LOCAL
-                self.app.db.add_event(
-                    None, "warning",
-                    f"{who.name}: deleted run {run_id} "
-                    f"({(record or {}).get('name', '?')})", user=who.username)
-            self._json({"ok": deleted,
-                        "error": None if deleted else f"no run {run_id}"})
+            outcome = self.app.engine.delete_run(run_id)
+            if not outcome.get("ok"):
+                self._json({"ok": False, "error": outcome.get("error")},
+                           outcome.get("code", 400))
+                return
+            # Kept in the rig's log, not the run's, which is now gone -- with
+            # what it still owed, which nothing will try again.
+            record = outcome.get("record") or {}
+            who = self.principal or authmod.LOCAL
+            owed = (record.get("result") or {}).get("cleanup_pending") is True
+            self._record(
+                None, "warning",
+                f"{who.name}: deleted run {run_id} ({record.get('name', '?')})"
+                + (f", whose clean-up ({record.get('procedure')}) had not "
+                   f"succeeded; it will not be tried again" if owed else ""),
+                user=who.username)
+            self._json({"ok": True, "error": None})
         else:
             self._json({"ok": False, "error": f"no action {action!r}"}, 404)
 
@@ -1025,16 +1089,56 @@ class Handler(BaseHTTPRequestHandler):
         key = str(payload.get("device", "pump"))
         action = str(payload.get("action", ""))
         who = self.principal or authmod.LOCAL
-        override = bool(payload.get("override"))
+        raw = payload.get("override")
+        overriding = raw not in (None, False)
 
         # Bypassing a safety rule is an admin's call, whoever holds control.
         # Checked first, so the answer never depends on anything else.
-        if override and not who.at_least("admin"):
+        if overriding and not who.at_least("admin"):
             self._json({"ok": False, "interlock": True,
                         "error": "Only an admin may override an interlock. "
                                  "Ask one, or deal with what the interlock "
                                  "is refusing."}, 403)
             return
+        # An override names the rules it waives -- one, or the few that stood
+        # in the way of the same command -- with the admin's reason in their
+        # own words and their word that they checked the rig:
+        # `{"rules": [...], "reason": ..., "checked": true}` ("rule" for one).
+        # `true` alone -- "waive whatever is in the way" -- is refused.
+        rules: list[str] = []
+        if overriding:
+            named = (raw.get("rules") or [raw.get("rule")]
+                     if isinstance(raw, dict) else [])
+            rules = [str(r) for r in (named if isinstance(named, list)
+                                      else [named]) if r]
+            if not rules:
+                self._json({"ok": False, "error": "An override names the rules "
+                                                  "it waives: {rules, reason, "
+                                                  "checked}."}, 400)
+                return
+            if raw.get("checked") is not True:
+                self._json({"ok": False, "error": "An override needs the "
+                                                  "confirmation that the rig "
+                                                  "was checked in person."}, 400)
+                return
+            reason = raw.get("reason")
+            if not isinstance(reason, str) or len(reason.strip()) < 3:
+                self._json({"ok": False, "error": "An override needs the reason "
+                                                  "it is safe, in your own "
+                                                  "words."}, 400)
+                return
+        # The drive's own protections and settings are an admin's to change;
+        # an operator keeps the pump's heater, for a bake-out.
+        if action == "param":
+            name = str((payload.get("value") or {}).get("name", ""))
+            if name not in OPERATOR_WRITES and not who.at_least("admin"):
+                self._json({"ok": False,
+                            "error": f"{name} is one of the drive's own "
+                                     f"protections or settings, which only an "
+                                     f"admin may change. An operator may "
+                                     f"switch the pump's heater and set its "
+                                     f"temperature."}, 403)
+                return
         if key not in self.app.registry:
             self._json({"ok": False, "error": f"no device named {key!r}"}, 404)
             return
@@ -1044,26 +1148,52 @@ class Handler(BaseHTTPRequestHandler):
                                  f"confirm"}, 400)
             return
 
-        if override:
-            sys.stderr.write(f"  !! INTERLOCK OVERRIDDEN for {key}.{action} "
-                             f"by {who.username} at {self.address_string()}\n")
-            self.app.db.add_event(
-                self.app.engine.run_id(), "warning",
-                f"{who.name}: interlock overridden for {key}.{action}",
-                {"from": self.address_string(), "value": payload.get("value")},
-                user=who.username)
-
         device = self.app.registry.get(key)
-        result = device.command(action, payload.get("value"), override)
+        result = device.command(action, payload.get("value"), rules or None)
+        waived = result.get("overridden") or []
+
+        # Logged twice, under the admin's name, with the rule and the reason
+        # they were shown -- and only when the rule really stood in the way.
+        if waived:
+            sys.stderr.write(f"  !! INTERLOCK OVERRIDDEN for {key}.{action} "
+                             f"(rule {', '.join(waived)}) by {who.username} at "
+                             f"{self.address_string()}\n")
+            self._record(
+                self.app.engine.run_id(), "warning",
+                f"{who.name}: interlock overridden for {key}.{action}: "
+                f"{', '.join(waived)}",
+                {"from": self.address_string(), "value": payload.get("value"),
+                 "rules": rules, "waived": waived,
+                 "reason": str(raw.get("reason", ""))[:500],
+                 "refusal": str(raw.get("refusal", ""))[:500],
+                 "checked": True, "ok": bool(result.get("ok"))},
+                user=who.username)
+        elif overriding:
+            # Asked for, but that rule was not what stood in the way (or the
+            # command failed before it): recorded, so the attempt is not lost.
+            self._record(
+                self.app.engine.run_id(), "info",
+                f"{who.name}: asked to override {', '.join(rules)} for "
+                f"{key}.{action}; "
+                + ("not needed, nothing was waived" if result.get("ok") else
+                   f"refused: {result.get('error')}"),
+                {"from": self.address_string(), "rules": rules,
+                 "reason": str(raw.get("reason", ""))[:500]},
+                user=who.username)
 
         # Actions that change the hardware belong in the rig's narrative, so
         # a curve with a step in it can be explained months later -- and now
         # say who took them.
-        if result.get("ok") and (action in CONFIRM_REQUIRED or override):
+        if result.get("ok") and (action in CONFIRM_REQUIRED or waived):
             value = payload.get("value")
-            self._audit(f"{device.label}, {action.replace('_', ' ')}"
-                        + (f" {value}" if value is not None else "")
-                        + (" (interlock overridden)" if override else ""),
+            if action == "param" and isinstance(value, dict):
+                said = (f"{device.label}: {value.get('name')} changed from "
+                        f"{result.get('previous')!r} to {result.get('result')!r}")
+            else:
+                said = (f"{device.label}, {action.replace('_', ' ')}"
+                        + (f" {value}" if value is not None else ""))
+            self._audit(said + (" (interlock overridden)" if waived else ""),
                         detail={"device": key, "action": action, "value": value,
-                                "overridden": override})
+                                "previous": result.get("previous"),
+                                "overridden": waived})
         self._json(result)

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
 from http.server import ThreadingHTTPServer
 
@@ -86,7 +87,8 @@ def build(args) -> api.Application:
             pump_port = discovery.startup("tc600", args.serial, args.address,
                                           memory, search=search)["port"]
         pump_service = devices.add(
-            pump.PumpService("pump", pump_port, address=args.address))
+            pump.PumpService("pump", pump_port, address=args.address,
+                             settle=args.pump_settle_ms / 1000.0))
     if not args.no_gauge:
         gauge_port, gauge_baud = args.gauge, args.gauge_baud
         if not args.simulate:
@@ -149,6 +151,10 @@ def main() -> int:
                              "nothing answers there")
     parser.add_argument("--address", type=int, default=1,
                         help="RS-485 address of the TC 600")
+    parser.add_argument("--pump-settle-ms", type=float, default=30.0,
+                        help="pause after each telegram to the TC 600 before "
+                             "listening for its reply, for the RS-485 "
+                             "converter to turn round (default 30)")
     parser.add_argument("--gauge", default="auto",
                         help="serial port of the TPG gauge controller, or "
                              "'auto' to find it by asking each port")
@@ -236,17 +242,22 @@ def main() -> int:
     if args.allow_from:
         print(f"  reachable only from: {args.allow_from} (and loopback)")
 
+    # `systemctl stop` and `restart` send SIGTERM, which by default ends the
+    # process on the spot -- with a run's clean-up (the heater, the gas)
+    # never run. Treated like Ctrl-C instead: the run is ended properly.
+    def terminate(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, terminate)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nstopping...")
+        print("\nstopping...", flush=True)
     finally:
-        if application.supervisor is not None:
-            application.supervisor.close()
-        if application.history is not None:
-            application.history.close()
-        application.registry.close()
-        application.db.close()
+        # A second signal must not cut the clean-up short.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        application.close()
     return 0
 
 

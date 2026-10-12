@@ -1,9 +1,10 @@
 """TC 600 turbopump service: sampling, accessories, and process interlocks.
 
 The interlocks refuse commands that would sequence the backing pump and the
-turbopump in a damaging order. They can be overridden deliberately with
-`override=True`, because a safety rule with no escape hatch is its own hazard
-once something has already gone wrong -- but every override is logged.
+turbopump in a damaging order. Each refusal names its rule, and an admin can
+override that one rule deliberately -- `override="pressure_unknown"`, never a
+blanket `True` -- because a safety rule with no escape hatch is its own hazard
+once something has already gone wrong. Every override is logged.
 
 The turbopump gate is a **pressure**, not a timer. A turbopump started
 against a chamber that has not been roughed out cannot develop compression:
@@ -34,12 +35,23 @@ import serial
 
 from tc600 import device, params, protocol
 
-from .registry import DeviceService
+from .registry import DeviceService, waived_rules
 
 #: Actions that physically move the pump. The UI confirms them and the API
-#: refuses them unless the caller repeats that confirmation.
+#: refuses them unless the caller repeats that confirmation. Acknowledging a
+#: fault is one of them: the drive runs the rotor whenever the station and
+#: the motor are both on and no fault is latched, so clearing the fault is a
+#: way of starting the rotor.
 GUARDED = {"on", "off", "motor_on", "motor_off", "standby_on", "standby_off",
-           "speed", "param"}
+           "speed", "param", "ack"}
+
+#: An error code that means "no fault".
+NO_FAULT = ("", "000000", "000", "0")
+
+#: Attempts for a command's telegrams beyond the first. The sampler can lose a
+#: reading and take the next; a command lost to one dropped reply would leave
+#: the operator -- or a safety sequence -- believing it was refused.
+COMMAND_RETRIES = 2
 
 #: The accessory connectors, and the parameters behind them.
 ACCESSORY_VIEW = (
@@ -49,9 +61,16 @@ ACCESSORY_VIEW = (
     "OpModeBKP", "SwOnBKP", "SwOffBKP",
 )
 
-#: Parameters the panel may write. Deliberately narrower than "everything
-#: writable": the interface address, parameter-set selection and the service
-#: line are not things to expose behind a web button.
+#: Parameters an operator may write: the pump's heater, for a bake-out --
+#: on or off, and its setpoint (the user's decision, 2026-10-11). Everything
+#: else in ALLOWED_WRITES is one of the drive's own protections or its
+#: configuration, and is an admin's.
+OPERATOR_WRITES = {"Heating", "TMSHeatSVal"}
+
+#: Parameters the panel may write at all, admins included. Deliberately
+#: narrower than "everything writable": the interface address,
+#: parameter-set selection and the service line are not things to expose
+#: behind a web button.
 ALLOWED_WRITES = {
     "Heating", "TMSHeatSVal", "CfgOut4",
     "EnableVent", "VentMode", "VentSpd", "VentTime",
@@ -81,10 +100,24 @@ TURBO_START_MAX_MBAR = 8.0e-1
 #: stale 1e-3 mbar would authorise exactly the start the rule forbids.
 PRESSURE_MAX_AGE_S = 15.0
 
+#: A reading of the pump older than this is no basis for a decision that
+#: depends on what the pump is doing -- at least; a slow bus allows more, see
+#: `PumpService.stale_after`. A sampler that has stopped leaves a frozen "0 Hz"
+#: that would let the station stop under a rotor that is still turning.
+SNAPSHOT_MAX_AGE_S = 5.0
+#: ...and never more than this, however slow the bus has been.
+SNAPSHOT_MAX_AGE_CAP_S = 15.0
+
 #: After the rotor reaches zero, wait this long before the station may stop.
 #: A coasting rotor still needs backing, and "0 Hz" from the drive is also the
 #: point where a slow final coast is easiest to misread.
 STOP_DWELL_SECONDS = 20.0
+
+#: The stop dwell survives this many readings in a row without a speed. A
+#: reply lost here and there must not restart a 20 s wait for ever; a silence
+#: long enough that nobody knows what the rotor did must. Counted in readings
+#: rather than seconds, because a reading that lost a reply takes longer.
+STOP_GAP_READINGS = 3
 
 #: Venting is refused above this fraction of nominal speed.
 VENT_SPEED_LIMIT = 0.20
@@ -96,6 +129,7 @@ VENT_SPEED_LIMIT = 0.20
 #: TMH/TMU 071 P that the TC 600 drives:
 #:
 #:   * 24 VDC +-5 %                                  section 9, "Operating voltage"
+#:   * nominal rotation speed 1500 Hz (90 000 rpm)   section 9
 #:   * start-up time 2.5 min                         section 9
 #:   * switchpoint 80 % of nominal speed             section 4.4, "Switching outputs"
 #:   * gas-mode-0 power line, 60 W at 1500 Hz rising
@@ -115,6 +149,7 @@ RATINGS = {
     "source": "PM 0504 BE, section 9",
     "supply_v": 24.0,
     "supply_tolerance": 0.05,
+    "nominal_hz": 1500.0,
     "startup_s": 150.0,
     "switchpoint_fraction": 0.80,
     "power_line_full_w": 60.0,
@@ -195,12 +230,22 @@ DIAGNOSTIC_VIEW = (
 
 
 class Interlock(Exception):
-    """Raised when a command is refused because of process safety."""
+    """Raised when a command is refused because of process safety.
 
-    def __init__(self, reason: str, wait: float = 0.0):
+    `rule` is the refusing rule's stable id: what an admin's override names.
+    """
+
+    def __init__(self, reason: str, wait: float = 0.0, rule: str | None = None):
         super().__init__(reason)
         self.reason = reason
         self.wait = max(0.0, wait)
+        self.rule = rule
+
+
+def refused(stop: Interlock) -> dict:
+    """An interlock's refusal, as a command result."""
+    return {"ok": False, "error": stop.reason, "interlock": True,
+            "wait": stop.wait, "rule": stop.rule}
 
 
 class PumpService(DeviceService):
@@ -208,15 +253,53 @@ class PumpService(DeviceService):
 
     kind = "tc600"
     label = "TC 600 turbopump"
-    interval = 2.0
+    #: A period (see DeviceService.interval). The fast set below takes about
+    #: this long on the real bus, so the pump is read nearly back to back:
+    #: what the safety checks act on is never much more than a second old.
+    interval = 0.5
     probe_kind = "tc600"
 
+    #: What identifies the drive. Read until every field has answered, not
+    #: once: a reply lost at connect used to leave NominalSpd out for good.
+    IDENTITY = ("NominalSpd", "ElecName", "FwVersion", "HWVersion")
+    #: A field the firmware refuses (NO_DEF) is asked for again this seldom.
+    IDENTITY_RETRY_S = 60.0
+
+    #: Read every cycle: what the interlocks, the supervisor and a run's
+    #: safety checks decide on. Ten telegrams.
+    FAST = (("status", "ActualSpd"), ("status", "ErrorCode"),
+            ("status", "OvTempElec"), ("status", "OvTempPump"),
+            ("status", "DrvPower"), ("status", "DrvCurrent"),
+            ("status", "DrvVoltage"), ("status", "PumpAccel"),
+            ("setpoints", "MotorPump"), ("setpoints", "PumpgStatn"))
+    #: Read SLOW_PER_CYCLE of these each cycle, in turn: what changes rarely,
+    #: or that no safety check waits on. Each keeps its last value until it
+    #: is read again, for at most SLOW_KEEP_S -- then it is unknown.
+    SLOW = (("status", "SetRotSpd"), ("setpoints", "OpModeTMP"),
+            ("setpoints", "Standby"), ("status", "TMSActTemp"),
+            ("status", "SetSpdAtt"), ("status", "SpdSwPtAtt"),
+            ("setpoints", "SpdSVal"), ("setpoints", "StdbySVal"),
+            ("status", "TMSHeatSVal"), ("status", "Heating"),
+            ("status", "OpHrsPump"))
+    SLOW_PER_CYCLE = 2
+    SLOW_KEEP_S = 30.0
+
     def __init__(self, key: str, port: str, address: int = 1,
-                 timeout: float = 0.6, **options):
+                 timeout: float = 0.6, settle: float = 0.03, **options):
         self.address = address
         self.timeout = timeout
+        #: Pause after transmitting, for the converter to turn round. The
+        #: HXSP-485 has run at 30 ms; less is worth trying on the real one.
+        self.settle = settle
+        #: Values of the SLOW fields: {(group, name): (value, monotonic)}.
+        self._slow: dict[tuple[str, str], tuple[object, float]] = {}
+        self._slow_next = 0
         #: Interlock timers in time.monotonic() terms. None means "not yet".
         self._rotor_zero_since: float | None = None
+        #: Readings in a row without a speed, for the gap the dwell tolerates.
+        self._speed_unread = 0
+        #: Identity fields the firmware refused, and when to ask again.
+        self._identity_retry: dict[str, float] = {}
         #: Where the turbopump-start interlock reads chamber pressure from.
         #: None until a gauge is attached, and then the start is refused.
         self._pressure_source = None
@@ -282,11 +365,52 @@ class PumpService(DeviceService):
     def unlock_full_speed(self) -> None:
         self._full_speed_reason = None
 
+    # --- full speed ---------------------------------------------------------
+
+    def nominal_speed(self, snap: dict | None = None) -> float:
+        """The rotor's full speed in Hz -- never unknown.
+
+        The drive's own NominalSpd (P315) once it has answered it. Until
+        then: the speed it is driving at, if it says it is in final-speed
+        operation and not in standby, else the pump's rating. Every check
+        that compares the rotor with full speed -- the rotor held down by
+        gas, the venting limit, base pressure only at full speed -- used to
+        switch itself off when this was unknown, which one lost reply at
+        connect made it for a whole run. A wrong guess ends a run early; no
+        guess lets a dragged rotor trip the drive.
+        """
+        return self._nominal(snap or self.snapshot())[0]
+
+    def stale_after(self, snap: dict) -> float:
+        """How old a reading of this pump may be and still decide anything.
+
+        Two of the sampler's own cycles past its period, and a second -- a
+        reading is replaced about one period and one cycle after it began,
+        and a lost reply makes a cycle longer -- but never under
+        SNAPSHOT_MAX_AGE_S or over SNAPSHOT_MAX_AGE_CAP_S. A fixed 5 s was
+        reached routinely at the real bus's speed, and refused the station
+        stop and the turbopump start at random.
+        """
+        cycle = (snap.get("cycle_ms") or 0) / 1000.0
+        return min(SNAPSHOT_MAX_AGE_CAP_S,
+                   max(SNAPSHOT_MAX_AGE_S, self.interval + 2 * cycle + 1.0))
+
+    def _nominal(self, snap: dict) -> tuple[float, str]:
+        value = snap.get("identity", {}).get("NominalSpd")
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value), "drive"
+        setpoints, status = snap.get("setpoints", {}), snap.get("status", {})
+        target = status.get("SetRotSpd")
+        if (setpoints.get("OpModeTMP") == 0 and setpoints.get("Standby") is False
+                and isinstance(target, (int, float)) and target > 0):
+            return float(target), "setpoint"
+        return float(RATINGS["nominal_hz"]), "rating"
+
     # --- link -------------------------------------------------------------
 
     def _open(self):
         return device.TC600(self.port, address=self.address,
-                            timeout=self.timeout, retries=0)
+                            timeout=self.timeout, retries=0, settle=self.settle)
 
     def offline(self, message: str) -> dict:
         snap = super().offline(message)
@@ -297,6 +421,13 @@ class PumpService(DeviceService):
     # --- sampling ---------------------------------------------------------
 
     def _read(self) -> dict:
+        """One poll: the fast set, two of the slow set, and any identity
+        field still missing.
+
+        There is no separate "is it there?" read any more: the pump is there
+        if anything answers. One lost reply leaves one field out -- unknown,
+        never 0 or "off" -- instead of marking the whole pump offline.
+        """
         with self.lock:
             try:
                 pump = self.driver()
@@ -304,79 +435,107 @@ class PumpService(DeviceService):
                 self.drop()
                 return self.offline(f"cannot open {self.port}: {exc}")
 
-            # One cheap read decides whether the pump is there at all.
+            if not self._identity:
+                self._slow.clear()      # a new link may be another drive
+            fields = list(self.FAST)
+            for _ in range(min(self.SLOW_PER_CYCLE, len(self.SLOW))):
+                fields.append(self.SLOW[self._slow_next % len(self.SLOW)])
+                self._slow_next += 1
+
+            values: dict[tuple[str, str], object] = {}
+            answered, quiet = 0, 0
             try:
-                pump.read_raw(349)
-                self.note_success()
-            except protocol.ProtocolError as exc:
-                self.note_failure()
-                return self.offline(str(exc))
+                for field in fields:
+                    try:
+                        values[field] = pump.read(field[1])
+                        answered += 1
+                        quiet = 0
+                    except protocol.DeviceError:
+                        answered += 1            # an answer, if not a value
+                        quiet = 0
+                    except protocol.ProtocolError:
+                        # Two unanswered in a row: the pump has gone quiet,
+                        # maybe half way through this cycle. Waiting out
+                        # every remaining field held the reading back for
+                        # fifteen seconds; what was not read is unknown.
+                        quiet += 1
+                        if quiet >= 2:
+                            break
+                if answered:
+                    self._complete_identity(pump)
             except (serial.SerialException, OSError) as exc:
                 self.drop()
                 return self.offline(str(exc))
 
-            if not self._identity:
-                try:
-                    self._identity = pump.identify()
-                except protocol.ProtocolError:
-                    self._identity = {}
+            if not answered:
+                self.note_failure()
+                return self.offline(f"no reply from the pump at address "
+                                    f"{self.address}")
+            self.note_success()
 
-            status, units = {}, {}
-            for number in params.STATUS_VIEW:
-                parameter = params.BY_NUMBER[number]
-                try:
-                    status[parameter.name] = parameter.decode(pump.read_raw(number))
-                    units[parameter.name] = parameter.unit
-                except protocol.ProtocolError:
-                    continue
-                except (serial.SerialException, OSError) as exc:
-                    self.drop()
-                    return self.offline(str(exc))
+            now = time.monotonic()
+            for field in self.SLOW:
+                if field in values:
+                    self._slow[field] = (values[field], now)
+                elif field in self._slow and \
+                        now - self._slow[field][1] <= self.SLOW_KEEP_S:
+                    values[field] = self._slow[field][0]
 
-            # Standby (P2) is read too: the panel's standby button and the
-            # "held down by gas" warning both need to know whether a rotor
-            # below full speed was asked to be there.
-            setpoints = {}
-            for name in ("SpdSVal", "StdbySVal", "OpModeTMP",
-                         "PumpgStatn", "MotorPump", "Standby"):
-                try:
-                    setpoints[name] = pump.read(name)
-                except (protocol.ProtocolError, KeyError, ValueError):
-                    pass
-
-            # The bakeout procedure needs the TMS temperature every sample, so
-            # it rides along with the status view rather than costing a
-            # separate accessory read per cycle.
-            for name in ("TMSActTemp", "TMSHeatSVal", "Heating"):
-                try:
-                    parameter = params.BY_NAME[name.lower()]
-                    status[name] = parameter.decode(pump.read_raw(parameter.number))
-                    units[name] = parameter.unit
-                except (protocol.ProtocolError, KeyError):
-                    continue
-                except (serial.SerialException, OSError) as exc:
-                    self.drop()
-                    return self.offline(str(exc))
-
+            status, units, setpoints = {}, {}, {}
+            for (group, name), value in values.items():
+                if group == "status":
+                    status[name] = value
+                    units[name] = params.lookup(name).unit
+                else:
+                    setpoints[name] = value
             return self.online(address=self.address, status=status,
                                units=units, setpoints=setpoints)
 
-    def observe(self, snap: dict) -> None:
-        """Maintain the stop dwell timer from continuous observation."""
+    def _complete_identity(self, pump) -> None:
+        """Ask for whatever identity field has not answered yet.
+
+        Called every cycle; costs nothing once the identity is complete. A
+        field the firmware refuses outright (NO_DEF) is asked for again only
+        once a minute, so a drive without it is not polled for it for ever.
+        """
+        if not self._identity:
+            self._identity_retry.clear()          # a new link: ask afresh
         now = time.monotonic()
-        if not snap.get("connected"):
-            # Contact lost: forget the timer rather than let a stale one
-            # authorise something once contact returns.
-            self._rotor_zero_since = None
-            return
+        for name in self.IDENTITY:
+            if name in self._identity or now < self._identity_retry.get(name, 0):
+                continue
+            try:
+                self._identity[name] = pump.read(name)
+            except protocol.DeviceError:
+                self._identity_retry[name] = now + self.IDENTITY_RETRY_S
+            except protocol.ProtocolError:
+                # Lost: ask again next cycle -- and stop here, so a pump that
+                # has gone quiet costs one timeout per cycle, not four.
+                break
 
-        speed = snap["status"].get("ActualSpd")
+    def observe(self, snap: dict) -> None:
+        """Maintain the stop dwell timer from continuous observation.
 
+        Timed from the first 0 Hz reading; any reading of a turning rotor
+        restarts it. A reading with no speed in it -- a reply lost on the
+        bus, or no contact at all -- neither counts as 0 Hz nor, unless
+        STOP_GAP_READINGS of them come in a row, restarts the wait. It used
+        to count as 0 Hz: a lost reply in the middle of a coast-down read as
+        a rotor at rest, and the power-down stopped the station under it.
+        """
+        now = time.monotonic()
+        speed = snap.get("status", {}).get("ActualSpd") \
+            if snap.get("connected") else None
         if isinstance(speed, (int, float)):
+            self._speed_unread = 0
             if speed > 0:
                 self._rotor_zero_since = None
             elif self._rotor_zero_since is None:
                 self._rotor_zero_since = now
+        else:
+            self._speed_unread += 1
+            if self._speed_unread >= STOP_GAP_READINGS:
+                self._rotor_zero_since = None
 
     def sample_fields(self, snap: dict) -> dict:
         status = snap.get("status", {})
@@ -385,8 +544,8 @@ class PumpService(DeviceService):
         def number(value):
             return value if isinstance(value, (int, float)) else None
 
-        def flag(name):
-            value = status.get(name)
+        def flag(name, source=status):
+            value = source.get(name)
             return (1 if value else 0) if isinstance(value, bool) else None
 
         # `tms_temp` is stored exactly as the drive reports it, including the
@@ -403,55 +562,94 @@ class PumpService(DeviceService):
             "power": number(status.get("DrvPower")),
             "tms_temp": number(status.get("TMSActTemp")),
             "error_code": status.get("ErrorCode"),
-            "station": 1 if setpoints.get("PumpgStatn") is True else 0,
-            "motor": 1 if setpoints.get("MotorPump") is True else 0,
+            # NULL when the reading did not come back, not 0: a lost reply
+            # is not the drive saying "off", and a run that took it for one
+            # reset its timers on it.
+            "station": flag("PumpgStatn", setpoints),
+            "motor": flag("MotorPump", setpoints),
             "ov_temp_pump": flag("OvTempPump"),
             "ov_temp_elec": flag("OvTempElec"),
         }
 
     # --- interlocks -------------------------------------------------------
 
-    def interlocks(self, snap: dict | None = None) -> dict:
-        """Return {action: {allowed, reason, wait}} for the guarded actions."""
+    def interlocks(self, snap: dict | None = None,
+                   waive=frozenset()) -> dict:
+        """Return {action: {allowed, reason, wait, rule}} for the guarded actions.
+
+        Each refusal names its `rule`, a stable id, so that an admin's
+        override can waive that one rule and no other: an override used to
+        waive every rule of the action, so waiving "the pressure is unknown"
+        also waived "the backing pump is not running". Rules are tried in
+        order and the first that applies refuses; a rule in `waive` is
+        skipped, and the entry's `waived` lists the ones that would have
+        refused.
+        """
         if snap is None:
             snap = self.snapshot()
         now = time.monotonic()
         out: dict[str, dict] = {}
 
-        def allow(action):
-            out[action] = {"allowed": True, "reason": "", "wait": 0}
-
-        def block(action, reason, wait=0.0):
-            out[action] = {"allowed": False, "reason": reason,
-                           "wait": int(round(wait))}
+        def judge(action, rules):
+            """rules: (id, applies, reason or a function making it, wait)."""
+            waived = []
+            for rule, applies, reason, wait in rules:
+                if not applies:
+                    continue
+                if rule in waive:
+                    waived.append(rule)
+                    continue
+                out[action] = {"allowed": False, "rule": rule,
+                               "reason": reason() if callable(reason) else reason,
+                               "wait": int(round(wait)), "waived": waived}
+                return
+            out[action] = {"allowed": True, "rule": None, "reason": "",
+                           "wait": 0, "waived": waived}
 
         if not snap.get("connected"):
-            for action in ("on", "off", "motor_on", "motor_off"):
-                block(action, "no contact with the pump")
+            for action in ("on", "off", "motor_on", "motor_off", "ack"):
+                judge(action, [("no_contact", True,
+                                "no contact with the pump", 0)])
             return out
 
-        status, setpoints = snap["status"], snap["setpoints"]
+        status, setpoints = snap.get("status", {}), snap.get("setpoints", {})
+        # A field missing from the reading is a reply that did not come
+        # back: unknown, which is never the same as 0 Hz or "off".
         speed = status.get("ActualSpd")
-        speed = speed if isinstance(speed, (int, float)) else 0
-        station = setpoints.get("PumpgStatn") is True
-        motor = setpoints.get("MotorPump") is True
+        speed = speed if isinstance(speed, (int, float)) else None
+        station = setpoints.get("PumpgStatn")
+        motor = setpoints.get("MotorPump")
+        age = snap.get("age")
+        # No age at all is not "fresh": every published reading has one.
+        stale = not isinstance(age, (int, float)) or age > self.stale_after(snap)
+        old = ("the last reading of the pump has no age, so what it is doing "
+               "now is not known" if not isinstance(age, (int, float)) else
+               f"the last reading of the pump is {age:.0f} s old, so what it "
+               f"is doing now is not known" if stale else "")
 
         # --- stopping the backing pump -----------------------------------
-        if speed > 0:
-            block("off", f"the turbopump is still spinning at {speed} Hz. "
-                         "It needs backing until it has fully stopped.")
-        elif motor and station:
-            block("off", "the turbopump motor is still enabled. Turn the "
-                         "motor off first, then stop the station.")
-        elif self._rotor_zero_since is not None:
-            waited = now - self._rotor_zero_since
-            if waited < STOP_DWELL_SECONDS:
-                block("off", "waiting for the rotor to settle after reaching "
-                             "0 Hz.", STOP_DWELL_SECONDS - waited)
-            else:
-                allow("off")
-        else:
-            allow("off")
+        # 0 Hz, from a fresh reading: the dwell runs from the first such
+        # reading. With no timer at all the wait is the whole of it.
+        waited = (now - self._rotor_zero_since
+                  if self._rotor_zero_since is not None else 0.0)
+        judge("off", [
+            ("stale_reading", stale,
+             lambda: f"{old}. The station stays on until a fresh reading "
+                     "shows the rotor at rest.", 0),
+            ("speed_unknown", speed is None,
+             "the rotor speed did not come back in the last reading, so "
+             "whether the rotor is still turning is not known. The station "
+             "stays on until a reading shows it at rest.", 0),
+            ("rotor_turning", speed is not None and speed > 0,
+             lambda: f"the turbopump is still spinning at {speed} Hz. It "
+                     "needs backing until it has fully stopped.", 0),
+            ("motor_enabled", motor is True and station is True,
+             "the turbopump motor is still enabled. Turn the motor off "
+             "first, then stop the station.", 0),
+            ("stop_dwell", waited < STOP_DWELL_SECONDS,
+             "waiting for the rotor to settle after reaching 0 Hz.",
+             STOP_DWELL_SECONDS - waited),
+        ])
 
         # --- starting the turbopump ---------------------------------------
         # The gate is the chamber pressure, not a stopwatch: the turbopump
@@ -471,80 +669,102 @@ class PumpService(DeviceService):
         # pressure therefore unknown. A turning rotor is not evidence about
         # the foreline. Only the gauge is.
         #
-        if motor:
-            # The motor enable is already set, so the command cannot change
-            # anything. This is the one genuine no-op, and it is keyed on the
-            # drive's own setpoint -- never on observed rotation.
-            allow("motor_on")
-        elif not station:
-            block("motor_on", "the backing pump is not running. Start the "
-                              "pumping station first and rough the chamber "
-                              f"down to {limit:.0E} mbar.")
-        elif chamber["mbar"] is None:
-            spinning = (f" The rotor is turning at {speed:.0f} Hz, but that is "
-                        f"gas flow through a pump that is not driven, not "
-                        f"evidence that it is safe to drive it."
-                        if speed > 0 else "")
-            block("motor_on",
-                  f"the chamber pressure is unknown: {chamber['reason']}. The "
-                  f"turbopump must not be started above {limit:.0E} mbar, so "
-                  f"this cannot be allowed without a reading.{spinning}")
-        elif chamber["mbar"] > limit:
-            block("motor_on",
-                  f"the chamber is at {chamber['mbar']:.2E} mbar. Keep "
-                  f"roughing until it reaches {limit:.0E} mbar -- a turbopump "
-                  f"started against an un-roughed foreline cannot develop "
-                  f"compression, draws its current limit and trips on "
-                  f"over-temperature.")
-        else:
-            allow("motor_on")
+        # The one genuine no-op: the motor enable is already set, so the
+        # command cannot change anything. Keyed on the drive's own setpoint
+        # -- never on observed rotation -- and checked against the drive
+        # again when it is sent (see command()).
+        starting = motor is not True
+        spinning = (f" The rotor is turning at {speed:.0f} Hz, but that is gas "
+                    f"flow through a pump that is not driven, not evidence "
+                    f"that it is safe to drive it." if speed else "")
+        judge("motor_on", [
+            ("stale_reading", stale,
+             lambda: f"{old}. Starting the turbopump waits for a fresh one.", 0),
+            ("station_unknown", starting and station is None,
+             "whether the pumping station is on did not come back in the "
+             "last reading. The turbopump needs the backing pump running "
+             "before it starts.", 0),
+            ("backing_off", starting and station is False,
+             f"the backing pump is not running. Start the pumping station "
+             f"first and rough the chamber down to {limit:.0E} mbar.", 0),
+            ("pressure_unknown", starting and chamber["mbar"] is None,
+             lambda: f"the chamber pressure is unknown: {chamber['reason']}. "
+                     f"The turbopump must not be started above {limit:.0E} "
+                     f"mbar, so this cannot be allowed without a "
+                     f"reading.{spinning}", 0),
+            ("pressure_high", starting and chamber["mbar"] is not None
+             and chamber["mbar"] > limit,
+             lambda: f"the chamber is at {chamber['mbar']:.2E} mbar. Keep "
+                     f"roughing until it reaches {limit:.0E} mbar -- a "
+                     f"turbopump started against an un-roughed foreline "
+                     f"cannot develop compression, draws its current limit "
+                     f"and trips on over-temperature.", 0),
+        ])
         # Whether or not it is blocked, say what the rule is measuring, so the
         # panel can show the approach to crossover rather than just a refusal.
         out["motor_on"].update({"pressure_mbar": chamber["mbar"],
                                 "limit_mbar": limit})
 
-        # Starting the backing pump and stopping the turbopump are always the
-        # safe direction, so they are never blocked.
-        allow("on")
-        allow("motor_off")
+        # Stopping the turbopump is always the safe direction, so it is never
+        # blocked. Starting the station and acknowledging a fault are not
+        # blocked either, but either one can let the drive start the rotor,
+        # so each switches the motor off first -- see command().
+        for action in ("on", "motor_off", "ack"):
+            judge(action, [])
 
         # --- speed policy during a deposition -----------------------------
-        if self._full_speed_reason:
-            for action in ("speed", "standby_on"):
-                block(action,
-                      f"the rotor is locked at full speed: "
-                      f"{self._full_speed_reason}. Throttle with the gate "
-                      f"valve instead. Stop the run to release this.")
-        else:
-            allow("speed")
-            allow("standby_on")
+        for action in ("speed", "standby_on"):
+            judge(action, [
+                ("full_speed_lock", bool(self._full_speed_reason),
+                 lambda: f"the rotor is locked at full speed: "
+                         f"{self._full_speed_reason}. Throttle with the gate "
+                         f"valve instead. Stop the run to release this.", 0)])
         return out
 
-    def _check(self, action: str, snap: dict) -> None:
-        rule = self.interlocks(snap).get(action)
+    def _check(self, action: str, snap: dict, waive=frozenset()) -> list[str]:
+        """Raise Interlock if `action` is refused; return the rules waived."""
+        rule = self.interlocks(snap, waive).get(action)
         if rule and not rule["allowed"]:
-            raise Interlock(rule["reason"], rule["wait"])
+            raise Interlock(rule["reason"], rule["wait"], rule["rule"])
+        return list(rule.get("waived", [])) if rule else []
 
-    def _check_param(self, name: str, value, snap: dict) -> None:
+    def _check_param(self, name: str, value, snap: dict,
+                     waive=frozenset()) -> list[str]:
         """Interlocks that apply to accessory parameter writes."""
-        status = snap.get("status", {})
-        identity = snap.get("identity", {})
-        speed = status.get("ActualSpd")
-        speed = speed if isinstance(speed, (int, float)) else 0
-        nominal = identity.get("NominalSpd") or 0
-        limit = nominal * VENT_SPEED_LIMIT if nominal else 0
-
         venting_now = (name == "VentMode" and int(value) == 2) or \
                       (name == "EnableVent" and int(value) == 1)
-        if venting_now and nominal and speed > limit:
+        if not venting_now:
+            return []
+        limit = self.nominal_speed(snap) * VENT_SPEED_LIMIT
+        speed = snap.get("status", {}).get("ActualSpd")
+        age = snap.get("age")
+        if (not snap.get("connected") or not isinstance(speed, (int, float))
+                or not isinstance(age, (int, float))
+                or age > self.stale_after(snap)):
+            if "vent_speed_unknown" in waive:
+                return ["vent_speed_unknown"]
+            raise Interlock(
+                f"the rotor speed is not known right now. Venting is only "
+                f"permitted below {int(limit)} Hz, so it waits for a fresh "
+                f"reading -- letting air in at speed can wreck the rotor.",
+                rule="vent_speed_unknown")
+        if speed > limit:
+            if "vent_speed" in waive:
+                return ["vent_speed"]
             raise Interlock(
                 f"the rotor is at {speed} Hz. Venting is only permitted below "
-                f"{int(limit)} Hz -- letting air in at speed can wreck the rotor.")
+                f"{int(limit)} Hz -- letting air in at speed can wreck the rotor.",
+                rule="vent_speed")
+        return []
 
     def snapshot(self) -> dict:
         snap = super().snapshot()
         snap["interlocks"] = self.interlocks(snap)
         snap["ratings"] = RATINGS
+        # Full speed, and where that number came from: the drive itself, the
+        # speed it is driving at, or the pump's rating while it has not said.
+        hz, source = self._nominal(snap)
+        snap["nominal"] = {"hz": hz, "source": source}
         # What the current error code means, so every page can say it in
         # words rather than leave "Err006" to be looked up.
         snap["fault"] = describe_error(snap.get("status", {}).get("ErrorCode"))
@@ -582,19 +802,29 @@ class PumpService(DeviceService):
 
     # --- commands ---------------------------------------------------------
 
-    def command(self, action: str, value=None, override: bool = False) -> dict:
+    def command(self, action: str, value=None, override=None) -> dict:
+        """Carry out `action`, through the interlocks.
+
+        `override` names the rules to waive -- one rule id, or several --
+        and only those: there is no waiving everything. The result's
+        `overridden` lists the waived rules that would have refused; it is
+        empty when the override changed nothing.
+        """
+        try:
+            waive = waived_rules(override)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
         if action == "param":
             name, setting = (value or {}).get("name"), (value or {}).get("value")
-            return self.write_param(str(name), setting, override)
+            return self.write_param(str(name), setting, waive)
 
         snap = self.snapshot()
-        if not override:
-            try:
-                self._check(action, snap)
-            except Interlock as stop:
-                return {"ok": False, "error": stop.reason,
-                        "interlock": True, "wait": stop.wait}
+        try:
+            used = set(self._check(action, snap, waive))
+        except Interlock as stop:
+            return refused(stop)
 
+        started_rotor = False
         with self.lock:
             try:
                 pump = self.driver()
@@ -603,23 +833,53 @@ class PumpService(DeviceService):
                 return {"ok": False, "error": f"cannot open {self.port}: {exc}"}
             try:
                 if action == "on":
-                    result = pump.pumping_station(True)
+                    # Already on: send nothing. On Pfeiffer's newer drives
+                    # P010 = 1 means "on, and acknowledge the error", and on a
+                    # drive with the motor flag set and a fault latched that
+                    # restarts the rotor past the crossover rule. Whether the
+                    # TC 600 does the same is not documented here.
+                    if self._fresh(pump, "PumpgStatn") is True:
+                        result = True
+                    else:
+                        started_rotor = self._motor_off_first(
+                            pump, "starting the pumping station", waive, used,
+                            snap, station_after=True)
+                        result = pump.write("PumpgStatn", True,
+                                            retries=COMMAND_RETRIES)
                 elif action == "off":
-                    result = pump.pumping_station(False)
+                    result = pump.write("PumpgStatn", False,
+                                        retries=COMMAND_RETRIES)
                 elif action == "motor_on":
-                    result = pump.motor(True)
+                    checked, motor = self._recheck_start(pump, snap, waive)
+                    used.update(checked)
+                    if motor is True:
+                        result = True          # already set: nothing to send
+                    else:
+                        # Stamped before sending: a start whose replies are
+                        # all lost has still happened, and the supervisor
+                        # must not blame the front panel for it.
+                        started_rotor = True
+                        self.commanded["motor_start"] = time.monotonic()
+                        result = pump.write("MotorPump", True,
+                                            retries=COMMAND_RETRIES)
                 elif action == "motor_off":
-                    result = pump.motor(False)
+                    result = pump.write("MotorPump", False,
+                                        retries=COMMAND_RETRIES)
                 elif action == "standby_on":
                     result = pump.standby(True)
                 elif action == "standby_off":
                     result = pump.standby(False)
                 elif action == "ack":
-                    result = pump.acknowledge_error()
+                    started_rotor = self._motor_off_first(
+                        pump, "clearing the fault", waive, used, snap)
+                    result = pump.write("ErrorAckn", True,
+                                        retries=COMMAND_RETRIES)
                 elif action == "speed":
                     result = pump.set_speed_percent(float(value))
                 else:
                     return {"ok": False, "error": f"unknown action {action!r}"}
+            except Interlock as stop:
+                return refused(stop)
             except protocol.ProtocolError as exc:
                 self.note_failure()
                 return {"ok": False, "error": str(exc)}
@@ -630,11 +890,111 @@ class PumpService(DeviceService):
                 return {"ok": False, "error": str(exc)}
 
         self.note_success()
-        self.commanded[action] = time.monotonic()
+        now = time.monotonic()
+        self.commanded[action] = now
+        if started_rotor:
+            # The supervisor alarms on a rotor that starts without this
+            # panel having asked for it; this is the panel asking.
+            self.commanded["motor_start"] = now
         return {"ok": True, "action": action, "result": result,
-                "overridden": bool(override)}
+                "overridden": sorted(used)}
+
+    # --- commands that could start the rotor ---------------------------------
+    #
+    # The drive runs the rotor whenever the station and the motor are both on
+    # and no fault is latched. So three commands can start it, not one: the
+    # motor itself, the station coming on while the motor flag is still set,
+    # and a fault being cleared under both. Only the first used to pass the
+    # crossover interlock; the other two started the turbopump into whatever
+    # the chamber held. Each is now checked against the drive itself at the
+    # moment of sending -- the cached reading can be seconds old.
+
+    def _fresh(self, pump, name: str):
+        """One setpoint read from the drive now; None if it did not answer."""
+        try:
+            return pump.read(name, retries=COMMAND_RETRIES)
+        except (protocol.ProtocolError, ValueError):
+            return None
+
+    def _motor_off_first(self, pump, doing: str, waive, used: set,
+                         snap: dict, station_after=None) -> bool:
+        """Switch the motor off before `doing`, unless the drive says it is.
+
+        Raises Interlock (rule "motor_off_first") if the motor cannot be
+        switched off. With that rule waived, the command goes out with the
+        motor possibly on -- which is a turbopump start, so it must pass the
+        start's own rules first (the pressure, the reading's age) unless
+        those are waived too: waiving one rule must never waive the others.
+        `station_after` is the station once the command is done; None means
+        read it now. Returns True when the command may start the rotor --
+        this panel starting it, stamped as such before it is sent.
+        """
+        if self._fresh(pump, "MotorPump") is False:
+            return False
+        if "motor_off_first" in waive:
+            station = (station_after if station_after is not None
+                       else self._fresh(pump, "PumpgStatn"))
+            if station is not False:
+                # The rotor starts once station and motor are both on, so it
+                # is judged as a start: station on, motor flag being set.
+                start = dict(snap)
+                start["setpoints"] = {**snap.get("setpoints", {}),
+                                      "PumpgStatn": True, "MotorPump": False}
+                used.update(self._check("motor_on", start, waive))
+            used.add("motor_off_first")
+            self.commanded["motor_start"] = time.monotonic()
+            return True
+        try:
+            echoed = pump.write("MotorPump", False, retries=COMMAND_RETRIES)
+        except protocol.ProtocolError as exc:
+            echoed = exc
+        if echoed is not False and self._fresh(pump, "MotorPump") is False:
+            # The reply was lost or refused, but the drive says it is off --
+            # which is all that matters. Trusting only the echo meant a lost
+            # one could keep a fault latched, and the backing pump off, for
+            # good.
+            echoed = False
+        if echoed is not False:
+            raise Interlock(
+                f"the turbopump motor could not be switched off before "
+                f"{doing} ({echoed}). With it on, the drive would start the "
+                f"rotor at once, past the crossover interlock, so nothing was "
+                f"sent. Switch the motor off and try again.",
+                rule="motor_off_first")
+        return False
+
+    def _recheck_start(self, pump, snap: dict, waive) -> tuple[list, object]:
+        """The start rule again, with the station and motor read now.
+
+        Returns the waived rules that applied, and the motor flag as read.
+        """
+        motor = self._fresh(pump, "MotorPump")
+        fresh = dict(snap)
+        fresh["setpoints"] = {**snap.get("setpoints", {}),
+                              "PumpgStatn": self._fresh(pump, "PumpgStatn"),
+                              "MotorPump": motor}
+        return self._check("motor_on", fresh, waive), motor
 
     # --- the safe state after a fault ---------------------------------------
+
+    #: How long a make-safe waits for one already under way.
+    SECURE_WAIT_S = 30.0
+
+    def secure_when_free(self, reason: str, **options) -> dict:
+        """`secure`, once any sequence already under way has finished.
+
+        A drive fault during a run asks for it twice at once: the run ends in
+        pump trouble, and the supervisor recovers from the fault. The second
+        used to be told "already securing" and record a failure while the
+        pump was in fact being made safe. It now waits its turn, then checks
+        -- and finishes -- whatever the first left.
+        """
+        deadline = time.monotonic() + self.SECURE_WAIT_S
+        while True:
+            result = self.secure(reason, **options)
+            if not result.get("busy") or time.monotonic() >= deadline:
+                return result
+            time.sleep(0.25)
 
     def secure(self, reason: str, stop_motor: bool = True,
                keep_backing: bool = True, settle_s: float = 8.0) -> dict:
@@ -663,7 +1023,7 @@ class PumpService(DeviceService):
         """
         if not self._secure_lock.acquire(blocking=False):
             return {"ok": False, "error": "already securing the pump",
-                    "actions": []}
+                    "actions": [], "busy": True}
         try:
             actions: list[dict] = []
             snap = self.snapshot()
@@ -673,8 +1033,12 @@ class PumpService(DeviceService):
                                  "done over RS-485; the drive keeps doing "
                                  "what it was last told"}
             setpoints = snap.get("setpoints", {})
-            code = str(snap.get("status", {}).get("ErrorCode") or "").strip()
-            faulted = code not in ("", "000000", "000", "0")
+            raw = snap.get("status", {}).get("ErrorCode")
+            code = str(raw).strip() if raw is not None else ""
+            # A code that did not come back is acknowledged anyway: with the
+            # motor off first, clearing a fault that is not there costs
+            # nothing, and leaving one latched holds the backing pump off.
+            faulted = raw is None or code not in NO_FAULT
 
             def step(label, action):
                 result = self.command(action)
@@ -682,14 +1046,20 @@ class PumpService(DeviceService):
                                 "error": result.get("error")})
                 return result.get("ok")
 
-            if stop_motor and setpoints.get("MotorPump") is True:
+            # Unless the drive says the motor is off, switch it off: a motor
+            # flag that merely failed to read is still on as far as the
+            # drive's next move is concerned.
+            if stop_motor and setpoints.get("MotorPump") is not False:
                 step("turbopump motor switched off", "motor_off")
             if faulted:
-                step(f"fault {code} acknowledged", "ack")
+                step(f"fault {code} acknowledged" if raw is not None
+                     else "drive fault acknowledged", "ack")
             if keep_backing and setpoints.get("PumpgStatn") is not True:
                 step("pumping station (forevacuum pump) switched on", "on")
 
-            # Check it took: the cached snapshot lags a poll behind.
+            # Check it took: the cached snapshot lags a poll behind. Only what
+            # the drive says counts -- a field that did not come back is not
+            # "off", "on" or "clear".
             deadline = time.monotonic() + settle_s
             state = {}
             while time.monotonic() < deadline:
@@ -697,33 +1067,42 @@ class PumpService(DeviceService):
                 latest = self.snapshot()
                 if not latest.get("connected"):
                     continue
-                now_code = str(latest["status"].get("ErrorCode") or "").strip()
+                now_code = latest["status"].get("ErrorCode")
+                now_code = None if now_code is None else str(now_code).strip()
                 state = {
-                    "fault": None if now_code in ("", "000000", "000", "0")
-                    else now_code,
-                    "station": latest["setpoints"].get("PumpgStatn") is True,
-                    "motor": latest["setpoints"].get("MotorPump") is True,
+                    "fault": "unknown" if now_code is None
+                    else None if now_code in NO_FAULT else now_code,
+                    "station": latest["setpoints"].get("PumpgStatn"),
+                    "motor": latest["setpoints"].get("MotorPump"),
                     "speed": latest["status"].get("ActualSpd"),
                 }
-                if (not state["fault"] and (state["station"] or not keep_backing)
-                        and (not state["motor"] or not stop_motor)):
+                if (not state["fault"]
+                        and (state["station"] is True or not keep_backing)
+                        and (state["motor"] is False or not stop_motor)):
                     break
             # Say so even when nothing needed switching: "the forevacuum
             # pump is running" is the line an operator looks for after a fault.
             if keep_backing and state and not any(
                     a["step"].startswith("pumping station") for a in actions):
                 actions.append({"step": "forevacuum pump confirmed running"
-                                if state.get("station") else
-                                "forevacuum pump NOT running",
-                                "ok": bool(state.get("station")), "error": None})
+                                if state.get("station") is True else
+                                "forevacuum pump NOT confirmed running",
+                                "ok": state.get("station") is True,
+                                "error": None})
             secured = bool(state) and not state.get("fault") and \
-                (state.get("station") or not keep_backing)
+                (state.get("station") is True or not keep_backing) and \
+                (state.get("motor") is False or not stop_motor)
             return {"ok": secured, "actions": actions, "state": state,
                     "reason": reason,
                     "error": None if secured else
-                    ("the fault is still latched" if state.get("fault")
-                     else "the station did not come back on" if state
-                     else "no fresh reading from the pump to confirm it")}
+                    ("no fresh reading from the pump to confirm it"
+                     if not state else
+                     "the drive's error code did not come back to confirm "
+                     "the fault is cleared" if state.get("fault") == "unknown"
+                     else "the fault is still latched" if state.get("fault")
+                     else "the motor is not confirmed off"
+                     if stop_motor and state.get("motor") is not False
+                     else "the station did not come back on")}
         finally:
             self._secure_lock.release()
 
@@ -762,7 +1141,17 @@ class PumpService(DeviceService):
                 "missing": missing, "history": history,
                 "codes": {code: describe_error(code) for code in ERROR_CODES}}
 
-    def write_param(self, name: str, value, override: bool = False) -> dict:
+    def write_param(self, name: str, value, override=None) -> dict:
+        """Write one of ALLOWED_WRITES, through the venting rules.
+
+        Reads the value first, so the record can say what it was changed
+        from: a protective setting changed without its old value is hard to
+        put back.
+        """
+        try:
+            waive = waived_rules(override)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
         if name not in ALLOWED_WRITES:
             return {"ok": False, "error": f"{name} is not writable from here"}
         try:
@@ -781,17 +1170,21 @@ class PumpService(DeviceService):
         except (TypeError, ValueError):
             return {"ok": False, "error": f"bad value {value!r} for {name}"}
 
-        if not override:
-            try:
-                self._check_param(name, coerced, self.snapshot())
-            except Interlock as stop:
-                return {"ok": False, "error": stop.reason,
-                        "interlock": True, "wait": stop.wait}
+        try:
+            used = self._check_param(name, coerced, self.snapshot(), waive)
+        except Interlock as stop:
+            return refused(stop)
 
         with self.lock:
             try:
                 pump = self.driver()
-                result = pump.write(parameter.number, coerced)
+                try:
+                    previous = pump.read(parameter.number,
+                                         retries=COMMAND_RETRIES)
+                except protocol.ProtocolError:
+                    previous = None             # not readable: say so, write
+                result = pump.write(parameter.number, coerced,
+                                    retries=COMMAND_RETRIES)
             except protocol.ProtocolError as exc:
                 self.note_failure()
                 return {"ok": False, "error": str(exc)}
@@ -803,4 +1196,4 @@ class PumpService(DeviceService):
 
         self.note_success()
         return {"ok": True, "action": "param", "name": name, "result": result,
-                "overridden": bool(override)}
+                "previous": previous, "overridden": sorted(used)}

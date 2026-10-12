@@ -23,6 +23,8 @@ the API publishes its `fields` and the UI builds the form from them.
 from __future__ import annotations
 
 import math
+import queue
+import sys
 import threading
 import time
 from collections import deque
@@ -33,12 +35,20 @@ from . import pump as pumpmod
 from .history import SHAPE_KEYS, decimate
 from .pump import TURBO_START_MAX_MBAR
 
-#: Payload of a TC 600 error-code parameter when nothing is wrong.
-NO_ERROR = ("000000", "000, 0", "", None)
+#: Payload of a TC 600 error-code parameter when nothing is wrong. (It read
+#: "000, 0" once -- a typo that made "000" and "0" count as faults.)
+NO_ERROR = pumpmod.NO_FAULT + (None,)
 
 #: How a run treats steps the software cannot perform itself.
 GUIDED = "guided"        # stop, tell the operator, wait for acknowledgement
 AUTOMATIC = "auto"       # refuse to start unless everything is under control
+
+
+def within(seconds: float, deadline: float | None) -> float:
+    """`seconds`, or what is left before `deadline` (monotonic) if less."""
+    if deadline is None:
+        return seconds
+    return max(0.0, min(seconds, deadline - time.monotonic()))
 
 
 class Abort(Exception):
@@ -252,6 +262,16 @@ class Procedure:
     def begin(self, engine: "RunEngine") -> None:
         """Called once before the first sample."""
 
+    def guard(self, engine: "RunEngine", sample: dict) -> None:
+        """Checks that must not wait for the next sample. Raise Abort.
+
+        Run on every safety tick with new data -- once a second, whatever
+        the procedure's sample interval -- before `step`. Only judgements
+        belong here: no phase changes, no commands to the hardware. A
+        procedure sampling once a minute used to look at its rotor once a
+        minute too.
+        """
+
     def step(self, engine: "RunEngine", sample: dict) -> bool:
         """Called per sample. Return True when the run is finished."""
         raise NotImplementedError
@@ -270,8 +290,24 @@ class Procedure:
         """Compute the run's result from everything recorded."""
         return {}
 
-    def finish(self, engine: "RunEngine") -> None:
-        """Called once after the last sample, whatever the outcome."""
+    def finish(self, engine: "RunEngine") -> bool | None:
+        """Called after the last sample, whatever the outcome.
+
+        Returns False when the clean-up could not be done -- the run then
+        stays owed it -- and True or None otherwise (None: there was nothing
+        to confirm).
+
+        It may be called again, minutes or weeks later, on a fresh instance
+        that never began: an owed clean-up is tried again while the panel
+        runs, and at the next start. Called like that it must only switch
+        things off or close them: the heater off, the gas and the magnetron
+        to 0, the shutter closed -- never the station, the motor or one of
+        the drive's protections, where 0 or "off" can mean the opposite
+        (VentMode 0 is controlled venting). Anything else -- a rate-of-rise
+        reopening the gate valve it closed -- must hang on state that only
+        the run itself sets, as `isolated_at` does. The selftest replays
+        every procedure's `finish()` this way and checks what it asks for.
+        """
 
 
 class PumpDown(Procedure):
@@ -284,7 +320,7 @@ class PumpDown(Procedure):
     phases = ("roughing", "turbo", "pumping", "done")
     fields = (
         {"key": "target_mbar", "label": "Target pressure", "type": "exponent",
-         "default": 1e-5, "unit": "mbar",
+         "default": 1e-5, "unit": "mbar", "min": 1e-10, "max": 1000,
          "help": "The run completes when the chamber reaches this."},
         {"key": "timeout_min", "label": "Give up after", "type": "number",
          "default": 120, "unit": "min", "min": 1, "max": 1440},
@@ -396,7 +432,7 @@ class RateOfRise(Procedure):
     phases = ("settle", "measuring", "done")
     fields = (
         {"key": "volume_l", "label": "Chamber volume", "type": "number",
-         "default": 10, "unit": "L", "min": 0.01,
+         "default": 10, "unit": "L", "min": 0.01, "max": 10000,
          "help": "Needed to turn a pressure rise into a leak rate."},
         {"key": "settle_s", "label": "Settle for", "type": "number",
          "default": 60, "unit": "s", "min": 0, "max": 3600,
@@ -408,19 +444,31 @@ class RateOfRise(Procedure):
          "default": 5, "unit": "s", "min": 1, "max": 60},
     )
 
+    #: Above this the gate is not opened again by itself at the end: a
+    #: spinning turbopump handed a chamber this far up takes a gas load it
+    #: may not carry. Somebody opens it, slowly, once they have looked.
+    REOPEN_MAX_MBAR = 1.0e-2
+
     def begin(self, engine: "RunEngine") -> None:
         self.interval = max(1.0, self.number("interval_s", 5))
         self.settle = self.number("settle_s", 60)
         self.duration = self.number("duration_s", 600)
         self.volume = self.number("volume_l", 10)
         self.fit_from: float | None = None
-        engine.log("info",
-                   "Isolate the chamber now: close the valve to the pump. "
-                   f"The fit starts in {self.settle:.0f} s.")
+        self.isolated_at: float | None = None
 
     def step(self, engine: "RunEngine", sample: dict) -> bool:
         if self.phase == "settle":
-            if self.in_phase >= self.settle:
+            # The test is meaningless with the pump still pumping the
+            # chamber, so it begins by closing the gate -- by hand, in a
+            # guided run -- and settles from then, not from the start.
+            if self.isolated_at is None:
+                if not engine.require(engine.hardware.gate, 0):
+                    return False
+                self.isolated_at = sample["t"]
+                engine.log("info", f"Chamber isolated. The fit starts in "
+                                   f"{self.settle:.0f} s.")
+            if sample["t"] - self.isolated_at >= self.settle:
                 self.fit_from = sample["t"]
                 self.enter("measuring")
                 engine.log("info", "Settling done, measuring the rise")
@@ -430,6 +478,33 @@ class RateOfRise(Procedure):
             self.enter("done")
             return True
         return False
+
+    def finish(self, engine: "RunEngine") -> None:
+        """Open the chamber to the pump again, if that is safe to do blind."""
+        # Not isolated by this run -- or a run cut off by a crash, cleaned up
+        # at the next start: nobody knows the gate's state, so leave it.
+        if getattr(self, "isolated_at", None) is None:
+            return
+        gauge = engine.gauge()
+        pressure = gauge.best_pressure() if gauge else None
+        if not isinstance(pressure, (int, float)) or \
+                pressure > self.REOPEN_MAX_MBAR:
+            engine.log("warning",
+                       "The gate valve to the turbopump is left closed: the "
+                       + (f"chamber rose to {pressure:.2E} mbar while isolated"
+                          if isinstance(pressure, (int, float)) else
+                          "chamber pressure is not known")
+                       + ". Open it slowly once the pressure has been "
+                         "checked -- a spinning turbopump must not take "
+                         "that much gas at once.")
+            return
+        try:
+            engine.hardware.gate.set(100)
+            engine.log("action", "Gate valve opened again")
+        except process.OperatorRequired as prompt:
+            engine.log("warning", f"MANUAL STEP: {prompt.instruction}")
+        except process.ActuatorError as exc:
+            engine.log("error", f"Could not open the gate valve: {exc}")
 
     def summarise(self, engine: "RunEngine", samples: list[dict]) -> dict:
         start = self.fit_from if self.fit_from is not None else 0.0
@@ -473,7 +548,7 @@ class Hold(Procedure):
     phases = ("holding", "done")
     fields = (
         {"key": "duration_min", "label": "Hold for", "type": "number",
-         "default": 60, "unit": "min", "min": 1, "max": 10080},
+         "default": 60, "unit": "min", "min": 0.1, "max": 10080},
         {"key": "interval_s", "label": "Sample every", "type": "number",
          "default": 5, "unit": "s", "min": 1, "max": 300},
     )
@@ -526,7 +601,7 @@ class Bakeout(Procedure):
         {"key": "cool_to_c", "label": "Cool down to", "type": "number",
          "default": 40, "unit": "°C", "min": 20, "max": 80},
         {"key": "max_pressure_mbar", "label": "Abort above", "type": "exponent",
-         "default": 1e-3, "unit": "mbar",
+         "default": 1e-3, "unit": "mbar", "min": 1e-9, "max": 1e-1,
          "help": "Bake-out drives outgassing; abort if the pressure climbs "
                  "past this."},
         {"key": "interval_s", "label": "Sample every", "type": "number",
@@ -541,7 +616,11 @@ class Bakeout(Procedure):
         self.soak = self.number("soak_hours", 4) * 3600.0
         self.cool_to = self.number("cool_to_c", 40)
         self.heat_timeout = self.number("heat_timeout_min", 60) * 60.0
-        self.pressure_ceiling = self.number("max_pressure_mbar", 1e-3) or None
+        # Never `or None`: a 0 that slipped through was "no ceiling at all".
+        self.pressure_ceiling = self.number("max_pressure_mbar", 1e-3)
+        if not self.pressure_ceiling > 0:
+            raise Abort("the pressure limit for the bake-out must be above "
+                        "zero", dbmod.FAILED)
         self.peak_pressure = 0.0
         self.peak_temperature = 0.0
 
@@ -592,13 +671,15 @@ class Bakeout(Procedure):
                 return True
         return False
 
-    def finish(self, engine: "RunEngine") -> None:
+    def finish(self, engine: "RunEngine") -> bool:
         # Whatever happened -- completion, abort, operator stop -- the heater
         # must not be left on by a run that is no longer being watched.
         result = engine.pump_param("Heating", False)
         engine.log("action", "Heating switched off" if result.get("ok") else
                    f"WARNING: could not switch the heating off: "
                    f"{result.get('error')}")
+        # Done only if the drive itself says the heater is off.
+        return bool(result.get("ok")) and result.get("result") is False
 
     def summarise(self, engine: "RunEngine", samples: list[dict]) -> dict:
         temperatures = [s["tms_temp"] for s in samples
@@ -665,6 +746,7 @@ class VacuumSequence(Procedure):
                  "wired."},
         {"key": "crossover_mbar", "label": "Start the turbopump at",
          "type": "exponent", "default": DEFAULT_CROSSOVER_MBAR, "unit": "mbar",
+         "min": 1e-4, "max": 1000,
          "help": "The forevacuum pump works alone until the chamber reaches "
                  f"this. {TURBO_START_MAX_MBAR:.0E} mbar is the highest the "
                  "interlock will allow; asking for more is lowered to it, "
@@ -756,6 +838,8 @@ class VacuumSequence(Procedure):
         self._flat_since: float | None = None
         self._window: deque = deque()
         self.turbo_requested = False
+        self._motor_seen_on = False
+        self._station_seen_on = False
 
         engine.enforce_full_speed(self.full_speed_reason)
         result = engine.pump_command("on")
@@ -866,7 +950,11 @@ class VacuumSequence(Procedure):
         elif rate is not None and abs(rate) <= self.base_rate_limit:
             if self._flat_since is None:
                 self._flat_since = now
-            elif now - self._flat_since >= self.base_settle:
+            elif now - self._flat_since >= self.base_settle and \
+                    isinstance(pressure, (int, float)):
+                # The base pressure is this sample's reading, so it waits
+                # for a sample that has one: a gauge dropout here used to
+                # crash the run on formatting None.
                 self.base_mbar = pressure
                 self.base_reached_at = now
                 held = (f"{self.base_settle:.0f} s" if self.base_settle < 60
@@ -879,11 +967,13 @@ class VacuumSequence(Procedure):
             self._flat_since = None
 
         if self.base_timeout and self.phase_age(engine) >= self.base_timeout:
+            where = (f"at {pressure:.2E} mbar" if isinstance(pressure, (int, float))
+                     else "without a reading at this moment")
             raise Abort(
                 f"gave up after {self.base_timeout / 60:.0f} min: the chamber "
-                f"is at {pressure:.2E} mbar and still improving by "
-                f"{abs(rate):.1f} %/min. Suspect a leak, a wet chamber, or a "
-                f"target that needs baking." if rate is not None else
+                f"is {where} and still improving by {abs(rate):.1f} %/min. "
+                f"Suspect a leak, a wet chamber, or a target that needs "
+                f"baking." if rate is not None else
                 f"gave up after {self.base_timeout / 60:.0f} min without a "
                 f"usable pressure reading")
         return None
@@ -920,8 +1010,13 @@ class VacuumSequence(Procedure):
         """
         nominal = engine.nominal_speed() or 0
         speed = sample.get("speed")
-        if (self.full_speed_at is None or not nominal or not sample.get("motor")
-                or not isinstance(speed, (int, float))
+        motor = sample.get("motor")
+        if not isinstance(speed, (int, float)) or motor is None:
+            # A reading that did not come back neither starts the clock nor
+            # stops it. It used to stop it: one lost reply every two minutes
+            # kept a dragged rotor from ever being stopped for it.
+            return
+        if (self.full_speed_at is None or not nominal or not motor
                 or speed >= self.FULL_SPEED_FRACTION * nominal):
             self._dragged_since = None
             return
@@ -937,7 +1032,9 @@ class VacuumSequence(Procedure):
                        + f". The run ends if it is not back within "
                          f"{self.DRAGGED_LIMIT_S:.0f} s -- cut the gas flow "
                          f"or throttle the gate valve.")
-            return
+            # No return here: the first reading below full speed may already
+            # be below PROTECT_FRACTION, and waiting a sample to say so is
+            # waiting the run-up window out.
         held = sample["t"] - self._dragged_since
         if speed < self.PROTECT_FRACTION * nominal:
             raise Abort(
@@ -976,9 +1073,36 @@ class VacuumSequence(Procedure):
                         f"The turbopump motor is being switched off; the "
                         f"forevacuum pump keeps running.", pump_trouble=True)
 
-    def step(self, engine: "RunEngine", sample: dict) -> bool:
+    def check_pump_kept(self, engine: "RunEngine", sample: dict) -> None:
+        """End the run if its pump is switched off under it.
+
+        Nothing else noticed: with the motor off, `check_rotor` stands down
+        for a coasting rotor, and a deposition kept its argon flowing into a
+        pump that was no longer pumping. Judged only once the run has seen
+        each one on, so a reading taken just before the start is not
+        mistaken for a stop. A lost reading (None) is not a stop either.
+        """
+        motor, station = sample.get("motor"), sample.get("station")
+        if motor == 1:
+            self._motor_seen_on = True
+        if station == 1:
+            self._station_seen_on = True
+        stopped = ("turbopump motor" if motor == 0 and self._motor_seen_on
+                   else "pumping station" if station == 0
+                   and self._station_seen_on else None)
+        if stopped:
+            raise Abort(f"the {stopped} was switched off while the run still "
+                        f"needed it -- from this panel, the drive's front "
+                        f"panel or its remote plug -- so the run has ended. "
+                        f"The run changed nothing else on the pump.")
+
+    def guard(self, engine: "RunEngine", sample: dict) -> None:
+        """The pump's protection, on every safety tick."""
         self.check_temperature_flags(engine)
+        self.check_pump_kept(engine, sample)
         self.check_rotor(engine, sample)
+
+    def step(self, engine: "RunEngine", sample: dict) -> bool:
         handler = getattr(self, f"phase_{self.phase}", None)
         if handler is None:
             return True
@@ -1062,6 +1186,7 @@ class Deposition(VacuumSequence):
     fields = VacuumSequence.VACUUM_FIELDS + (
         {"key": "working_mbar", "label": "Argon working pressure",
          "type": "exponent", "default": 5e-3, "unit": "mbar",
+         "min": 1e-4, "max": 5e-2,
          "help": "Typical magnetron sputtering runs 1e-3 to 1e-2 mbar. Too "
                  "low and the plasma will not sustain; too high and the film "
                  "goes porous from gas scattering."},
@@ -1088,6 +1213,7 @@ class Deposition(VacuumSequence):
          "max": 1440},
         {"key": "max_inlet_mbar", "label": "Abort if pressure exceeds",
          "type": "exponent", "default": 5e-2, "unit": "mbar",
+         "min": 1e-4, "max": 1e-1,
          "help": "Protects the turbopump: at full speed it must not be asked "
                  "to swallow more than this continuously."},
         {"key": "settle_min", "label": "Let the pressure settle for",
@@ -1102,7 +1228,12 @@ class Deposition(VacuumSequence):
         self.presputter = self.number("presputter_min", 5) * 60.0
         self.deposit_time = self.number("deposit_min", 20) * 60.0
         self.settle = self.number("settle_min", 2) * 60.0
-        self.pressure_ceiling = self.number("max_inlet_mbar", 5e-2) or None
+        # Never `or None`: a cleared field arrived as 0, which removed the
+        # one limit protecting the spinning turbopump from the gas.
+        self.pressure_ceiling = self.number("max_inlet_mbar", 5e-2)
+        if not self.pressure_ceiling > 0:
+            raise Abort("the pressure ceiling must be above zero",
+                        dbmod.FAILED)
 
         self.deposition_started_at: float | None = None
         self.deposition_ended_at: float | None = None
@@ -1135,9 +1266,13 @@ class Deposition(VacuumSequence):
         the rotor actually turning, which is the condition the limit is
         really about.
         """
-        if (sample.get("speed") or 0) <= 0:
-            return None
         if self.phase in ("rough", "crossover", "spinup"):
+            return None
+        # A rotor read at rest is not the pump the ceiling protects; an
+        # unread speed is not a rotor at rest -- it used to lift the ceiling
+        # for every sample whose speed reply was lost.
+        speed = sample.get("speed")
+        if isinstance(speed, (int, float)) and speed <= 0:
             return None
         return self.pressure_ceiling
 
@@ -1224,9 +1359,9 @@ class Deposition(VacuumSequence):
             return "done"
         return None
 
-    def finish(self, engine: "RunEngine") -> None:
+    def finish(self, engine: "RunEngine") -> bool:
         """However this ended, the plasma and the gas must not be left on."""
-        engine.hardware.safe_shutdown(log=engine.log)
+        return engine.hardware.safe_shutdown(log=engine.log)
 
     def summarise(self, engine: "RunEngine", samples: list[dict]) -> dict:
         summary = self.vacuum_summary()
@@ -1288,10 +1423,10 @@ class FullVacuum(VacuumSequence):
       failing rather than working slowly, and it should say so instead of
       sitting at atmosphere overnight looking busy.
 
-    Stopping it powers the pump down by default, in the order the hardware
-    needs -- motor off, rotor to rest with the backing pump still running,
-    then the station. An operator who stops it and explicitly asks to keep
-    the vacuum is obeyed instead.
+    Stopping it asks what to leave behind: the chamber under vacuum, or the
+    pump powered down in the order the hardware needs -- motor off, rotor to
+    rest with the backing pump still running, then the station. It never
+    powers down by itself.
     """
 
     name = "full_vacuum"
@@ -1312,7 +1447,8 @@ class FullVacuum(VacuumSequence):
                    "speed and then holds the chamber under vacuum "
                    "indefinitely, recording pressure, rotor speed, drive "
                    "current, voltage, power and temperature throughout. "
-                   "Stopping it powers the pump down in the correct order.")
+                   "When you stop it you choose: keep the vacuum, or power "
+                   "the pump down in the correct order.")
     phases = ("rough", "crossover", "spinup", "basepressure", "holding",
               "done")
 
@@ -1324,7 +1460,7 @@ class FullVacuum(VacuumSequence):
     fields = (
         {"key": "crossover_mbar", "label": "Start the turbopump at",
          "type": "exponent", "default": VacuumSequence.DEFAULT_CROSSOVER_MBAR,
-         "unit": "mbar",
+         "unit": "mbar", "min": 1e-4, "max": 1000,
          "help": "The forevacuum pump works alone until the chamber reaches "
                  f"this. {TURBO_START_MAX_MBAR:.0E} mbar is the highest the "
                  "interlock will allow; asking for more is lowered to it."},
@@ -1389,9 +1525,9 @@ class FullVacuum(VacuumSequence):
 
     # -- watching, in every phase -----------------------------------------
 
-    def step(self, engine: "RunEngine", sample: dict) -> bool:
+    def guard(self, engine: "RunEngine", sample: dict) -> None:
         self._watch_temperature(engine, sample)
-        return super().step(engine, sample)
+        super().guard(engine, sample)
 
     def _watch_temperature(self, engine: "RunEngine", sample: dict) -> None:
         """Abort on the drive's own over-temperature flags, or on a limit.
@@ -1480,6 +1616,73 @@ CATALOGUE: dict[str, type[Procedure]] = {
 }
 
 
+def _finite(value) -> float | None:
+    """A number from a form or an API call, or None if it is not one."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def settle_config(procedure: type[Procedure], given) -> tuple[dict, list[str]]:
+    """The configuration a run will use, and what is wrong with the one given.
+
+    A field left out takes its published default. A field given must be the
+    right kind of value inside the field's own range. The form used to be
+    the only place those ranges lived, and a field cleared on it arrived as
+    0 -- which is "no limit" to a timeout and "no ceiling" to the pressure
+    that protects a spinning turbopump. Keys no field declares are dropped,
+    so the stored configuration is the one that ran.
+    """
+    given = given if isinstance(given, dict) else {}
+    config: dict = {}
+    problems: list[str] = []
+    for field in procedure.fields:
+        key, kind = field["key"], field.get("type", "number")
+        label = field.get("label", key).lstrip("…")
+        value = given.get(key)
+        if value is None:
+            config[key] = field.get("default")
+        elif kind == "boolean":
+            config[key] = (value.strip().lower() in ("1", "true", "yes", "on")
+                           if isinstance(value, str) else bool(value))
+        elif kind == "select":
+            options = [str(option["value"]) for option in field.get("options", [])]
+            if str(value) in options:
+                config[key] = str(value)
+            else:
+                problems.append(f'"{label}": {value!r} is not one of '
+                                f"{', '.join(options)}")
+        elif kind in ("number", "exponent"):
+            number = _finite(value)
+            low, high = field.get("min"), field.get("max")
+            unit = f" {field['unit']}" if field.get("unit") else ""
+            if number is None:
+                problems.append(f'"{label}" needs a number'
+                                + (" -- it was left empty"
+                                   if str(value).strip() == "" else
+                                   f", not {value!r}"))
+            elif (low is not None and number < low) or \
+                    (high is not None and number > high):
+                bound = (f"between {low:g} and {high:g}" if None not in (low, high)
+                         else f"at least {low:g}" if low is not None
+                         else f"at most {high:g}")
+                problems.append(f'"{label}" must be {bound}{unit}; it was '
+                                f"{number:g}")
+            else:
+                config[key] = number
+        else:
+            config[key] = value
+    return config, problems
+
+
 def not_installed(label: str, missing: list[str]) -> str:
     """Why a procedure cannot start: what it needs that is not on the rig."""
     plural = len(missing) > 1
@@ -1507,10 +1710,18 @@ def catalogue() -> list[dict]:
 class RunEngine:
     """Runs one procedure at a time against the registered devices."""
 
-    #: Consecutive samples with no contact before a run is abandoned. At a
-    #: 2 s cadence that is a minute of silence, long enough to ride out a
-    #: reconnect but short enough that nothing records a flat line for hours.
-    MAX_SILENT_SAMPLES = 30
+    #: Seconds without contact before a run is abandoned: long enough to ride
+    #: out a reconnect, short enough that nothing records a flat line for
+    #: hours. Counted in seconds, not samples -- thirty samples was half an
+    #: hour for a run sampling once a minute.
+    MAX_SILENT_S = 60.0
+
+    #: The safety tick. Abort conditions and each procedure's `guard` run
+    #: this often -- on new readings -- whatever the procedure's sample
+    #: interval, which only decides how often a sample is stored and the
+    #: procedure moves on. A condition found on one reading ends the run
+    #: within about two seconds at any interval.
+    TICK_S = 1.0
 
     #: Give up on an unattended shutdown after this long. A rotor that will
     #: not coast to rest, or a link that has gone away, must not leave a
@@ -1523,6 +1734,15 @@ class RunEngine:
     #: step. The rotor coasts for minutes; there is nothing to gain from
     #: asking faster than the pump's own sampler answers.
     SHUTDOWN_POLL_S = 2.0
+
+    #: An owed clean-up -- a run cut off by a crash or a power cut, or one
+    #: whose clean-up failed as it ended: how often it looks for the pump
+    #: (there is no deadline -- a run cannot start without the pump anyway),
+    #: and, once the pump answers, how many attempts a minute apart before it
+    #: is left owed to the next start.
+    ORPHAN_POLL_S = 2.0
+    ORPHAN_RETRY_S = 60.0
+    ORPHAN_TRIES = 5
 
     def __init__(self, database: "dbmod.Database", registry,
                  hardware: "process.ProcessHardware | None" = None,
@@ -1545,10 +1765,34 @@ class RunEngine:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._stop_interrupted = False
+        #: Database writes that failed, for the supervisor's alarm: a full or
+        #: worn-out SD card must cost the record, never the run's clean-up.
+        self.storage_error: dict | None = None
+        self._storage_lock = threading.Lock()
+        #: The run's writes go to one writer thread through this queue, in
+        #: order, so the safety tick never waits on the database -- whose
+        #: lock a download holds through a backup and a VACUUM.
+        self._writes: queue.Queue = queue.Queue()
+        threading.Thread(target=self._writer, name="run-writer",
+                         daemon=True).start()
+        #: Runs whose clean-up is owed -- found at startup, or failed as a run
+        #: ended -- and what has been done for each; tried on their own thread.
+        self.orphans: list[dict] = []
+        self._orphan_thread: threading.Thread | None = None
+        self._orphan_lock = threading.Lock()
+        #: Set by close(): nothing is started or tried again from then on.
+        self._closing = threading.Event()
         self._procedure: Procedure | None = None
         self._run: dict | None = None
         self._samples: list[dict] = []
-        self._silent = 0
+        #: Since when an instrument has been out of contact, monotonic.
+        self._silent_since: float | None = None
+        #: When the run's safety tick last ran, monotonic; None between runs
+        #: and while a procedure is still beginning.
+        self._last_tick: float | None = None
+        #: When an ending run began its clean-up, monotonic.
+        self._cleanup_since: float | None = None
 
         #: Progress of a guided power-down, or None if none has been asked
         #: for. Kept after it finishes so the panel can show the outcome.
@@ -1564,6 +1808,11 @@ class RunEngine:
         #: Progress of the safe-state sequence after a pump-trouble ending,
         #: or None. Kept after it finishes so the panel can say what was done.
         self._secure: dict | None = None
+        #: The make-safe sequence under way, and the lock it is started
+        #: under: a press of Make safe as a run ends in pump trouble must not
+        #: start a second one beside it.
+        self._secure_thread: threading.Thread | None = None
+        self._secure_start = threading.Lock()
         #: How the most recent run ended, so the panel can keep showing it --
         #: and its live aftermath -- instead of snapping back to a blank form.
         self._last: dict | None = None
@@ -1661,6 +1910,13 @@ class RunEngine:
         else:
             self.log("warning", f"Could not select final-speed mode: "
                                 f"{result.get('error')}")
+        # Final-speed mode does not leave standby, and standby holds the rotor
+        # at its standby speed: a run started in standby would read its own
+        # rotor as dragged down by gas.
+        left = self.pump_command("standby_off")
+        if not left.get("ok"):
+            self.log("warning", f"Could not take the pump out of standby: "
+                                f"{left.get('error')}")
         pump = self.pump()
         if pump is not None:
             pump.lock_full_speed(why)
@@ -1681,7 +1937,8 @@ class RunEngine:
     # --- history ----------------------------------------------------------
 
     def run_id(self) -> int | None:
-        return self._run["id"] if self._run else None
+        run = self._run                          # read once: _forget may clear it
+        return run["id"] if run else None
 
     def runner(self) -> str | None:
         """The account that started the run in progress, or None.
@@ -1705,14 +1962,167 @@ class RunEngine:
         return None
 
     def _close_orphans(self) -> None:
-        """Close out runs left open by a crash or a restart."""
+        """Close out runs left open by a crash or a power cut -- and make
+        their hardware safe.
+
+        A run still marked running belongs to a process that died without
+        its clean-up: a bake-out's heater may still be on, a deposition's
+        argon still flowing. Each is closed as failed, its procedure's own
+        clean-up (`finish`, as for any ending) is run once the pump answers,
+        and the supervisor raises an alarm for each. So is a run that ended
+        properly but whose clean-up did not succeed -- while the panel ran,
+        or as a restart stopped it: it is owed exactly as a cut-off one is.
+        """
+        remember = self._remember
         for run in self.db.orphaned_runs():
+            # Marked as still owing its clean-up until that has run against
+            # a pump that answered: a second restart before then must find
+            # it again, or a heater stays on with nobody to switch it off.
             self.db.finish_run(
                 run["id"], dbmod.FAILED,
                 {"error": "the control process stopped while this run was "
-                          "in progress"})
+                          "in progress", "cleanup_pending": True,
+                 "cut_off": True})
             self.db.add_event(run["id"], "error",
                               "Run abandoned: the control process stopped")
+            remember(run, "waiting for the pump", None, "crash")
+        for run in self.db.runs_owing_cleanup():
+            if run["id"] not in {o["id"] for o in self.orphans}:
+                cut_off = (run.get("result") or {}).get("cut_off")
+                remember(run, "waiting for the pump", None,
+                         "crash" if cut_off else "unfinished")
+        for run in self.db.runs(status=dbmod.ABORTED, limit=5):
+            result = run.get("result") or {}
+            if result.get("interrupted") and not result.get("reported"):
+                if run["id"] not in {o["id"] for o in self.orphans}:
+                    remember(run, "the panel was stopped (a restart or a "
+                                  "shutdown) while it was going; its clean-up "
+                                  "ran then", True, "restart")
+                self.db.set_result(run["id"], {**result, "reported": True})
+        self._start_cleanups()
+
+    def _remember(self, run: dict, state: str, ok, kind: str) -> dict:
+        """List a run whose clean-up is owed, or done, for the supervisor.
+
+        `kind`: "crash" (cut off), "unfinished" (its clean-up failed when it
+        ended, found at a start), "restart" (ended by a restart, clean-up
+        done) or "retry" (its clean-up failed as it ended, just now).
+        """
+        procedure = CATALOGUE.get(run.get("procedure"))
+        entry = {
+            "id": run["id"], "name": run.get("name"),
+            "procedure": run.get("procedure"),
+            "label": procedure.label if procedure else run.get("procedure"),
+            "config": run.get("config") or {}, "kind": kind,
+            "interrupted": bool((run.get("result") or {}).get("interrupted")),
+            "state": state, "ok": ok, "attempts": 0}
+        with self._orphan_lock:
+            self.orphans.append(entry)
+        return entry
+
+    def _start_cleanups(self) -> None:
+        """Try the owed clean-ups on their own thread, starting it if needed."""
+        with self._orphan_lock:
+            if self._closing.is_set():
+                return
+            if self._orphan_thread is not None and self._orphan_thread.is_alive():
+                return
+            if not any(o["ok"] is None for o in self.orphans):
+                return
+            self._orphan_thread = threading.Thread(
+                target=self._clean_up_orphans, name="orphan-cleanup",
+                daemon=True)
+            self._orphan_thread.start()
+
+    def _clean_up_orphans(self) -> None:
+        """Run each owed run's own clean-up once the pump answers.
+
+        Kept at until it works: a pump that comes back fifteen minutes after
+        the PC must still get its heater switched off without another
+        restart, and so must one whose link dropped as a bake-out ended.
+        `start()` refuses meanwhile, so nothing this does can touch a run
+        started since. Each run has its own count of attempts.
+        """
+        pump = self.pump()
+        while not self._closing.is_set():
+            with self._orphan_lock:
+                owed = [o for o in self.orphans if o["ok"] is None]
+                if not owed:
+                    self._orphan_thread = None
+                    return
+            if pump is not None and not pump.snapshot().get("connected"):
+                self._closing.wait(self.ORPHAN_POLL_S)
+                continue
+            for orphan in owed:
+                if self._closing.is_set():
+                    break
+                orphan["attempts"] += 1
+                self._clean_up_one(orphan, orphan["attempts"],
+                                   orphan["attempts"] >= self.ORPHAN_TRIES)
+            if any(orphan["ok"] is None for orphan in owed):
+                self._closing.wait(self.ORPHAN_RETRY_S)
+        with self._orphan_lock:
+            if self._orphan_thread is threading.current_thread():
+                self._orphan_thread = None
+
+    def _clean_up_one(self, orphan: dict, attempt: int, last: bool) -> None:
+        procedure = CATALOGUE.get(orphan["procedure"])
+        if procedure is None:
+            done, why = True, ("no clean-up is known for this procedure; check "
+                               "the rig by eye")
+        else:
+            try:
+                done = procedure(orphan["config"]).finish(self) is not False
+                why = ("its clean-up was run" if done else
+                       "its clean-up did not succeed")
+            except Exception as exc:              # never lose the thread
+                done, why = False, f"its clean-up failed: {exc}"
+        if done:
+            orphan.update(ok=True, state=why)
+        elif last:
+            orphan.update(ok=False, state=f"{why} after {attempt} attempts; "
+                                          f"the panel tries again at its next "
+                                          f"start")
+        else:
+            orphan["state"] = f"{why} yet; trying again in a minute"
+            return
+        # Bound now, not when the writer gets to them: the loop moves on.
+        run_id, state, ok, at = orphan["id"], orphan["state"], orphan["ok"], \
+            time.time()
+        when = ("Clean-up tried again" if orphan.get("kind") == "retry"
+                else "After the restart")
+        self._write(lambda: self.db.add_event(
+            run_id, "action" if ok else "error", f"{when}: {state}.", at=at))
+        if ok:
+            # Owed no longer: the next start has nothing to repeat.
+            self._write(lambda: self._settle_cleanup(run_id))
+
+    def _settle_cleanup(self, run_id: int) -> None:
+        record = self.db.run(run_id)
+        if record:
+            self.db.set_result(run_id, {**(record.get("result") or {}),
+                                        "cleanup_pending": False})
+
+    def _pump_not_ready(self) -> str | None:
+        """Why no run may start on the pump as it is now, or None."""
+        pump = self.pump()
+        if pump is None:
+            return None
+        snap = pump.snapshot()
+        if not snap.get("connected"):
+            return (f"no contact with the pump ({snap.get('error') or 'offline'}). "
+                    f"A run cannot start on a drive it cannot read.")
+        code = snap.get("status", {}).get("ErrorCode")
+        if code is None:
+            return ("the drive's error code did not come back in the last "
+                    "reading, so whether a fault is latched is not known. "
+                    "Try again in a moment.")
+        if str(code).strip() not in pumpmod.NO_FAULT:
+            title = pumpmod.describe_error(code).get("title", "drive fault")
+            return (f"the drive has fault {str(code).strip()} latched "
+                    f"({title.lower()}). Find the cause and use Make safe on "
+                    f"the pump page, then start the run.")
+        return None
 
     # --- device access ----------------------------------------------------
 
@@ -1737,9 +2147,17 @@ class RunEngine:
         return pump.command("param", {"name": name, "value": value})
 
     def nominal_speed(self) -> float | None:
+        """The rotor's full speed in Hz; None only with no pump configured.
+
+        The pump service never leaves it unknown (see
+        `PumpService.nominal_speed`): every check against full speed used to
+        switch itself off for a whole run after one lost reply at connect.
+        """
         pump = self.pump()
         if pump is None:
             return None
+        if hasattr(pump, "nominal_speed"):
+            return pump.nominal_speed()
         value = pump.snapshot().get("identity", {}).get("NominalSpd")
         return value if isinstance(value, (int, float)) else None
 
@@ -1798,8 +2216,56 @@ class RunEngine:
     # --- logging ----------------------------------------------------------
 
     def log(self, level: str, message: str, detail: dict | None = None) -> None:
-        run_id = self._run["id"] if self._run else None
-        self.db.add_event(run_id, level, message, detail)
+        run = self._run                          # read once: _forget may clear it
+        run_id = run["id"] if run else None
+        # The run's own log is what its own thread writes. Everything else
+        # the engine files under a run -- a power-down, which goes ahead
+        # after a minute even if the run's ending is still stuck, a clean-up
+        # tried again -- is the rig's, kept if that run is deleted.
+        origin = "run" if threading.current_thread() is self._thread else None
+        # Stamped now: the writer may get to it seconds later.
+        at = time.time()
+        self._write(lambda: self.db.add_event(run_id, level, message, detail,
+                                              at=at, origin=origin),
+                    f"{level}: {message}")
+
+    def _write(self, write, what: str = "") -> None:
+        """Queue one database write that must not end anything if it fails.
+
+        Done in order on the writer thread. A failed write is counted for the
+        supervisor's alarm and said on stderr, and nobody waits for it: what
+        the run is doing to the hardware matters more than what it manages to
+        write down, and when.
+        """
+        self._writes.put((write, what, None))
+
+    def _flush(self, timeout: float = 15.0) -> bool:
+        """Wait until every write queued so far is done."""
+        done = threading.Event()
+        self._writes.put((None, "", done))
+        return done.wait(timeout)
+
+    def _writer(self) -> None:
+        while True:
+            write, what, done = self._writes.get()
+            if done is not None:
+                done.set()
+                continue
+            try:
+                write()
+            except Exception as exc:              # never lose the thread
+                self.note_write_failure(exc, what)
+
+    def note_write_failure(self, exc: Exception, what: str = "") -> None:
+        """Count a database write that failed, for the supervisor's `storage`
+        alarm -- the run's, or one the panel itself could not make."""
+        with self._storage_lock:
+            failed = self.storage_error or {"count": 0}
+            self.storage_error = {"count": failed["count"] + 1,
+                                  "error": str(exc), "at": time.time()}
+        if failed["count"] == 0 or failed["count"] % 100 == 0:
+            sys.stderr.write(f"  !! database write failed ({exc})"
+                             + (f": {what[:120]}" if what else "") + "\n")
 
     # --- lifecycle --------------------------------------------------------
 
@@ -1817,6 +2283,17 @@ class RunEngine:
             if absent:
                 return {"ok": False, "error": not_installed(
                     CATALOGUE[procedure_name].label, absent)}
+            config, problems = settle_config(CATALOGUE[procedure_name], config)
+            if problems:
+                return {"ok": False, "problems": problems,
+                        "error": "The run was not started: "
+                                 + "; ".join(problems) + "."}
+            # A procedure's `begin` starts the station and selects the drive's
+            # modes before the first abort check looks at anything, so a drive
+            # that cannot be read, or has a fault latched, is refused here.
+            refusal = self._pump_not_ready()
+            if refusal:
+                return {"ok": False, "error": refusal}
             # A power-down still bringing the rotor to rest must not run
             # alongside a new recipe: it would stop the station whenever the
             # rotor reached 0 Hz, in the middle of the new run. That is what
@@ -1827,8 +2304,21 @@ class RunEngine:
                                  "until the rotor is at rest, or cancel the "
                                  "power-down on the Pump page, then start "
                                  "the run."}
+            if self._orphan_thread and self._orphan_thread.is_alive():
+                waiting = "; ".join(f"run {o['id']}: {o['state']}"
+                                    for o in self.orphans if o["ok"] is None)
+                return {"ok": False,
+                        "error": f"the panel is still trying the clean-up of "
+                                 f"an earlier run ({waiting}). It tries "
+                                 f"{self.ORPHAN_TRIES} times once the pump "
+                                 f"answers; if that fails, an alarm asks for "
+                                 f"the rig to be checked by hand -- do that "
+                                 f"before starting a run."}
+            if self._closing.is_set():
+                return {"ok": False, "error": "the panel is shutting down"}
 
             self._stop_shutdown = None
+            self._stop_interrupted = False
             # A finished power-down is kept only so the panel can report the
             # outcome. Starting a new run makes it history: the rig is
             # plainly running again, and a stale "rotor at rest, station off"
@@ -1854,11 +2344,24 @@ class RunEngine:
                 procedure_name, name or procedure.label, config,
                 operator=operator, notes=notes, started_by=started_by,
                 chamber=self.chamber)
+            if self._closing.is_set():
+                # close() came while the record was written -- a download can
+                # hold the database that long: the run never begins. (Should
+                # the store be closed already, the record stays "running" and
+                # the next start reports it cut off: the safe direction.)
+                try:
+                    self.db.finish_run(run["id"], dbmod.ABORTED,
+                                       {"error": "the panel was shutting down"})
+                except Exception:
+                    pass
+                return {"ok": False, "error": "the panel is shutting down"}
 
             self._procedure = procedure
             self._run = run
             self._samples = []
-            self._silent = 0
+            self._silent_since = None
+            self._last_tick = None
+            self._cleanup_since = None
             self._prompt = None
             self._satisfied = {}
             self._stop.clear()
@@ -1868,7 +2371,7 @@ class RunEngine:
             return {"ok": True, "run": run}
 
     def stop(self, reason: str = "stopped by the operator",
-             shutdown: bool = False) -> dict:
+             shutdown: bool = False, interrupted: bool = False) -> dict:
         """End the run. With `shutdown`, also bring the pump to a full stop.
 
         The two are separate decisions and the panel asks for both, because
@@ -1883,12 +2386,129 @@ class RunEngine:
                 return {"ok": False, "error": "no run is in progress"}
             self._stop_reason = reason
             self._stop_shutdown = bool(shutdown)
+            # Not the operator's decision to end it: an abort, even for the
+            # one procedure whose stop is otherwise its completion.
+            self._stop_interrupted = bool(interrupted)
             self._stop.set()
             thread = self._thread
         if shutdown:
             self.shutdown_pump(f"after the run was stopped: {reason}",
                                after=thread)
         return {"ok": True, "stopping": True, "shutdown": bool(shutdown)}
+
+    def close(self, timeout: float = 20.0,
+              deadline: float | None = None) -> None:
+        """End a run in progress, with its clean-up, before the process exits.
+
+        `systemctl restart` sends SIGTERM, which used to end the process on
+        the spot: a deploy during a bake-out left the heater on with nothing
+        watching it. The run is stopped -- not the pump; the vacuum stays as
+        it is -- and waited for, which is what runs its clean-up; so is a
+        make-safe sequence, whether under way or started by the run as it
+        ends, however long its clean-up took. Cut between the motor off and
+        the acknowledgement, a make-safe leaves a latched fault holding the
+        forevacuum pump off. A power-down still waiting for its rotor is
+        cancelled, leaving the backing pump running. Owed clean-ups are not
+        tried again from here on: the next start does them.
+
+        Nothing here waits past `deadline` (monotonic), or `timeout` seconds
+        from now without one.
+        """
+        if deadline is None:
+            deadline = time.monotonic() + timeout
+        # From here no start() begins a run: it looks at the flag under its
+        # lock, and again once its record is written. One already past both
+        # finishes under the lock; taking the lock once means its run, if it
+        # began, is in `_thread` -- and is stopped below.
+        self._closing.set()
+        settled = self._lock.acquire(timeout=within(5.0, deadline))
+        if settled:
+            self._lock.release()
+        powering_down = self._shutdown_thread
+        if powering_down and powering_down.is_alive():
+            self._cancel_shutdown.set()
+        cancelled_by = time.monotonic() + self.SHUTDOWN_POLL_S * 3
+        stopped = None
+        while time.monotonic() < deadline:
+            if not settled:
+                # A start() is still holding the lock -- a download can hold
+                # the database it is writing to: keep waiting for it.
+                settled = self._lock.acquire(timeout=within(0.2, deadline))
+                if settled:
+                    self._lock.release()
+            thread = self._thread
+            if thread is not None and thread.is_alive() and thread is not stopped:
+                self.stop("the control process was stopped (the panel was "
+                          "restarted or shut down)", shutdown=False,
+                          interrupted=True)
+                stopped = thread
+            busy = [t for t in (thread, self._secure_thread)
+                    if t is not None and t.is_alive()]
+            if powering_down is not None and powering_down.is_alive() \
+                    and time.monotonic() < cancelled_by:
+                busy.append(powering_down)
+            if busy:
+                busy[0].join(within(0.2, deadline))
+            elif settled:
+                break
+        self._flush(within(5.0, deadline))
+
+    def delete_run(self, run_id: int) -> dict:
+        """Delete a stored run, unless it is going or its clean-up is being
+        tried.
+
+        The database work is done outside the engine's lock: an operator's
+        Stop takes that lock, and must never wait on a download holding the
+        database. A run starting meanwhile is safe all the same -- its
+        record says "running" from before its thread exists, and the
+        database refuses to delete a running run.
+        """
+        in_progress = {"ok": False, "code": 409,
+                       "error": f"run {run_id} is in progress; stop it first"}
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive() \
+                    and self._run and self._run.get("id") == run_id:
+                return in_progress
+            if any(o["id"] == run_id and o["ok"] is None
+                   for o in list(self.orphans)):
+                return {"ok": False, "code": 409,
+                        "error": f"run {run_id}'s clean-up is being tried "
+                                 f"again; delete it once that has ended"}
+        record = self.db.run(run_id)
+        try:
+            deleted = self.db.delete_run(run_id)
+        except dbmod.RunStillRunning:
+            with self._lock:
+                going = self._thread is not None and self._thread.is_alive() \
+                    and self._run and self._run.get("id") == run_id
+            return in_progress if going else {
+                "ok": False, "code": 409,
+                "error": f"run {run_id} is still marked as running: its end "
+                         f"was never recorded. The panel closes it at its "
+                         f"next start; delete it after that"}
+        if not deleted:
+            return {"ok": False, "code": 404, "error": f"no run {run_id}"}
+        with self._lock:
+            self._forget(run_id)
+        return {"ok": True, "record": record}
+
+    def forget_run(self, run_id: int) -> None:
+        """A run was deleted: stop naming it. The engine's log and the
+        supervisor's records go to the last run between runs, and a row that
+        is gone makes every one of them fail -- a false "storage" alarm.
+        Under start()'s lock, or a run started from another screen at that
+        moment could lose its name instead."""
+        with self._lock:
+            self._forget(run_id)
+
+    def _forget(self, run_id: int) -> None:
+        """forget_run's body; the caller holds the lock. A run going is never
+        the one deleted -- the store refuses a running row -- so a match is
+        always a run that has ended, even with another one started since."""
+        if self._run and self._run.get("id") == run_id:
+            self._run = None
+        if self._last and self._last.get("id") == run_id:
+            self._last = None
 
     # --- guided power-down ------------------------------------------------
 
@@ -1912,6 +2532,19 @@ class RunEngine:
                 return {"ok": False, "error": "a shutdown is already running"}
             if self.pump() is None:
                 return {"ok": False, "error": "no pump is configured"}
+            # Cut short by the process ending, a power-down could stop half
+            # way; close() cancels them, and none begins after it.
+            if self._closing.is_set():
+                return {"ok": False, "error": "the panel is shutting down"}
+            # Under a running run, only through Stop: the run must end first
+            # -- its gas off, its heater off -- or it carries on, feeding a
+            # deposition's argon to a turbopump that is being switched off.
+            if self._thread and self._thread.is_alive() and after is not self._thread:
+                return {"ok": False,
+                        "error": "a run is in progress. Stop the run and choose "
+                                 "Power down: the run ends first, with its own "
+                                 "clean-up, and then the pump is brought to "
+                                 "rest."}
             self._shutdown = {
                 "active": True, "phase": "starting", "reason": reason,
                 "message": "starting the power-down sequence",
@@ -2039,20 +2672,31 @@ class RunEngine:
         pump = self.pump()
         if pump is None:
             return {"ok": False, "error": "no pump is configured"}
+        with self._secure_start:
+            running = self._secure_thread
+            if running is not None and running.is_alive():
+                return {"ok": False,
+                        "error": "the pump is already being made safe"}
+            return self._start_securing(pump, reason)
+
+    def _start_securing(self, pump, reason: str) -> dict:
         self._secure = {"active": True, "reason": reason,
                         "started_at": time.time(), "actions": [], "ok": None}
         run_id = self.run_id()
 
         def work():
-            result = pump.secure(reason)
+            # The supervisor's recovery from the same fault may be under way:
+            # wait for it, then check what it left, rather than report it busy.
+            result = pump.secure_when_free(reason)
             done = ", ".join(a["step"] for a in result.get("actions", [])
                              if a.get("ok")) or "nothing needed changing"
-            self.db.add_event(
+            at = time.time()
+            self._write(lambda: self.db.add_event(
                 run_id, "action" if result.get("ok") else "error",
                 f"Pump made safe after the run ended: {done}."
                 + ("" if result.get("ok") else
                    f" Not confirmed: {result.get('error')}."),
-                {"reason": reason, "result": result})
+                {"reason": reason, "result": result}, at=at))
             self._secure = {**self._secure, "active": False,
                             "ok": bool(result.get("ok")),
                             "actions": result.get("actions", []),
@@ -2060,7 +2704,9 @@ class RunEngine:
                             "error": result.get("error"),
                             "ended_at": time.time()}
 
-        threading.Thread(target=work, name="pump-secure", daemon=True).start()
+        self._secure_thread = threading.Thread(target=work, name="pump-secure",
+                                               daemon=True)
+        self._secure_thread.start()
         return {"ok": True}
 
     def stop_choice(self) -> bool | None:
@@ -2101,6 +2747,8 @@ class RunEngine:
             "in_phase_s": round(procedure.in_phase, 1),
             "samples": len(self._samples),
             "interval_s": procedure.interval,
+            "tick_age_s": (round(age, 1) if (age := self.tick_age()) is not None
+                           else None),
             "latest": self._samples[-1] if self._samples else None,
             "stopping": self._stop.is_set(),
             "mode": self.mode,
@@ -2111,6 +2759,24 @@ class RunEngine:
             "secure": self._secure,
             "last": self._last,
         }
+
+    def cleanup_age(self) -> float | None:
+        """Seconds an ending run has spent on its clean-up; None otherwise."""
+        since = self._cleanup_since
+        if since is None or not (self._thread and self._thread.is_alive()):
+            return None
+        return time.monotonic() - since
+
+    def tick_age(self) -> float | None:
+        """Seconds since the run's safety tick last ran; None with no run.
+
+        The supervisor alarms when this grows: a run whose loop is stuck --
+        on a command that will not return, say -- is checking nothing.
+        """
+        tick = self._last_tick
+        if tick is None or not (self._thread and self._thread.is_alive()):
+            return None
+        return time.monotonic() - tick
 
     def recent_samples(self, limit: int = 600) -> list[dict]:
         return self._samples[-limit:]
@@ -2142,13 +2808,19 @@ class RunEngine:
 
     # --- the run thread ---------------------------------------------------
 
-    def _collect(self, started_at: float) -> dict:
-        """One sample row, merged from every registered device."""
+    def _collect(self, started: float) -> dict:
+        """One sample row, merged from every registered device.
+
+        `t`, the run time every timer of a procedure is measured in, is on
+        the monotonic clock from `started`; `at` is the wall-clock time, for
+        display. A wall clock corrected by the network mid-run used to move
+        `t` with it -- an hour forward is a two-minute timer run out, an
+        hour back is one that cannot run out.
+        """
         row = self.registry.sample_row()
         row.update(self.hardware.sample_fields())
-        now = time.time()
-        row["t"] = round(now - started_at, 3)
-        row["at"] = now
+        row["t"] = round(time.monotonic() - started, 3)
+        row["at"] = time.time()
         row["phase"] = self._procedure.phase if self._procedure else ""
 
         gauge = self.gauge()
@@ -2160,16 +2832,18 @@ class RunEngine:
         pump = self.pump()
         gauge = self.gauge()
 
-        pump_up = pump is None or pump.snapshot().get("connected")
-        gauge_up = gauge is None or gauge.snapshot().get("connected")
+        pump_up = pump is None or self._answering(pump)
+        gauge_up = gauge is None or self._answering(gauge)
         if not (pump_up and gauge_up):
-            self._silent += 1
-            if self._silent >= self.MAX_SILENT_SAMPLES:
+            now = time.monotonic()
+            self._silent_since = self._silent_since or now
+            silent = now - self._silent_since
+            if silent >= self.MAX_SILENT_S:
                 lost = "pump" if not pump_up else "gauge"
                 raise Abort(f"lost contact with the {lost} for "
-                            f"{self._silent} samples")
+                            f"{silent:.0f} s")
         else:
-            self._silent = 0
+            self._silent_since = None
 
         code = sample.get("error_code")
         if code is not None and str(code).strip() not in NO_ERROR:
@@ -2185,46 +2859,92 @@ class RunEngine:
             raise Abort(f"pressure rose to {pressure:.2E} mbar, above the "
                         f"{ceiling:.2E} mbar ceiling set for this run")
 
+    @staticmethod
+    def _answering(service) -> bool:
+        """In contact, and with a reading that is still being renewed: one
+        that says "connected" but has stopped changing -- a sampler held up
+        behind a long exchange -- is silence too."""
+        snap = service.snapshot()
+        if not snap.get("connected"):
+            return False
+        age = snap.get("age")
+        limit = (service.stale_after(snap) if hasattr(service, "stale_after")
+                 else pumpmod.PRESSURE_MAX_AGE_S)
+        return isinstance(age, (int, float)) and age <= limit
+
+    def _readings(self) -> tuple:
+        """Which readings the instruments have published, by number."""
+        return tuple(service.snapshot().get("seq") for service in self.registry)
+
+    def _keep(self, run_id: int, sample: dict) -> None:
+        self._samples.append(sample)
+        self._write(lambda: self.db.add_sample(run_id, sample), "a sample")
+
     def _drive(self) -> None:
         procedure, run = self._procedure, self._run
         assert procedure is not None and run is not None
-        started_at = time.time()
+        started = time.monotonic()
         status, result, message = dbmod.COMPLETED, {}, ""
         pump_trouble = False
         by_operator = False
+        interrupted = False
 
         try:
             procedure.begin(self)
-            self.db.set_phase(run["id"], procedure.phase)
+            first = procedure.phase
+            self._write(lambda: self.db.set_phase(run["id"], first))
             phase = procedure.phase
+            due = time.monotonic()          # when the next sample is stored
+            seen = None                      # the readings last judged
 
+            # Every tick: the abort conditions, and the procedure's guards on
+            # readings they have not judged yet. Every `interval`: the
+            # procedure's step, and the sample stored -- after the step, so
+            # it carries what the procedure concluded from it (the
+            # base-pressure rate).
             while not self._stop.is_set():
-                sample = self._collect(started_at)
-                self._samples.append(sample)
-
-                # Stored after the step, not before it: the procedure adds
-                # what it concluded from this sample (the base-pressure rate)
-                # and the record should carry that. `finally` keeps the
-                # sample that triggered an abort -- the most important row
-                # of a failed run.
+                tick = time.monotonic()
+                self._last_tick = tick
+                # Which readings these are, taken before the sample: one
+                # published in between is then judged next tick, not marked
+                # judged without having been.
+                readings = self._readings()
+                sample = self._collect(started)
+                fresh = readings != seen or not readings
+                seen = readings
+                stepping = tick >= due
+                finished = False
                 try:
                     self._check_aborts(sample)
-                    finished = procedure.step(self, sample)
-                finally:
-                    self.db.add_sample(run["id"], sample)
-                if finished:
-                    break
-                if procedure.phase != phase:
-                    phase = procedure.phase
-                    self.db.set_phase(run["id"], phase)
-                    self.log("info", f"Phase: {phase}")
+                    if fresh:
+                        procedure.guard(self, sample)
+                    if stepping:
+                        finished = procedure.step(self, sample)
+                except Exception:
+                    # The sample that ended the run is the most important
+                    # row of a failed run: kept whether or not it was due,
+                    # and whatever ended it.
+                    self._keep(run["id"], sample)
+                    raise
+                if stepping:
+                    self._keep(run["id"], sample)
+                    due = max(due + procedure.interval, tick)
+                    if finished:
+                        break
+                    if procedure.phase != phase:
+                        phase = procedure.phase
+                        self._write(lambda now=phase: self.db.set_phase(
+                            run["id"], now))
+                        self.log("info", f"Phase: {phase}")
 
-                self._stop.wait(procedure.interval)
+                tick_s = min(self.TICK_S, procedure.interval)
+                self._stop.wait(max(0.0, tick + tick_s - time.monotonic()))
             else:
+                interrupted = self._stop_interrupted
                 status = (dbmod.COMPLETED if procedure.stop_is_completion
-                          else dbmod.ABORTED)
+                          and not interrupted else dbmod.ABORTED)
                 message = getattr(self, "_stop_reason", "stopped by the operator")
-                by_operator = True
+                by_operator = not interrupted
 
         except Abort as abort:
             status, message = abort.status, abort.reason
@@ -2233,10 +2953,18 @@ class RunEngine:
         except Exception as exc:                      # never lose the thread
             status, message = dbmod.FAILED, f"internal error: {exc}"
             self.log("error", message)
+        # The checks have stopped on purpose: a slow clean-up is not a stall --
+        # but one that never ends is, and has its own clock.
+        self._last_tick = None
+        self._cleanup_since = time.monotonic()
 
+        # The hardware first, each step on its own, and only then the record:
+        # a write that fails -- a full or worn SD card -- used to replace the
+        # abort and skip everything after it, the heater and the gas included.
         try:
-            procedure.finish(self)
+            cleaned = procedure.finish(self) is not False
         except Exception as exc:
+            cleaned = False
             self.log("error", f"Cleanup after the run failed: {exc}")
 
         # Whatever happened, the manual controls come back and nothing is
@@ -2244,7 +2972,23 @@ class RunEngine:
         self._prompt = None
         pump = self.pump()
         if pump is not None:
-            pump.unlock_full_speed()
+            try:
+                pump.unlock_full_speed()
+            except Exception:
+                pass
+
+        # The pump itself was the problem: put it in its safe state -- motor
+        # off, fault cleared, forevacuum pump running. Never the station off.
+        if pump_trouble:
+            try:
+                begun = self.secure_pump(message)
+                if not begun.get("ok"):
+                    self.log("warning", f"Making the pump safe did not start: "
+                                        f"{begun.get('error')}.")
+            except Exception as exc:
+                self.log("error", f"Could not start making the pump safe: {exc}")
+        # The hardware's part is over; what follows is only the record.
+        self._cleanup_since = None
 
         try:
             result = procedure.summarise(self, self._samples)
@@ -2255,20 +2999,36 @@ class RunEngine:
         if message:
             result["message"] = message
         result["samples"] = len(self._samples)
+        if interrupted:
+            # Stopped by the panel shutting down: the next start says so.
+            result.update({"interrupted": True, "reported": False})
+        if not cleaned:
+            # Owed to the next start, whatever ended the run: a restart must
+            # not turn "the heater did not go off" into "its clean-up ran".
+            result["cleanup_pending"] = True
 
-        self.db.finish_run(run["id"], status, result)
+        self._write(lambda: self.db.finish_run(run["id"], status, result),
+                    f"the end of run {run['id']}")
         self.log("info" if status == dbmod.COMPLETED else "warning",
                  f"Run {status}" + (f": {message}" if message else ""))
-        self._run = self.db.run(run["id"])
+        self._flush()
+        try:
+            self._run = self.db.run(run["id"]) or self._run
+        except Exception:
+            pass
+        # A failed clean-up is tried again in the background, as at a start:
+        # a heater left on because the pump's link dropped is switched off
+        # once the pump answers, not at the next restart, weeks later.
+        retrying = not cleaned and not interrupted and not self._closing.is_set()
         self._last = {
             "id": run["id"], "name": run.get("name"), "procedure": procedure.name,
             "label": procedure.label, "status": status, "message": message,
             "started_at": run.get("started_at"), "ended_at": time.time(),
             "phases": list(procedure.phases), "by_operator": by_operator,
-            "pump_trouble": pump_trouble,
+            "pump_trouble": pump_trouble, "cleanup_failed": not cleaned,
+            "retrying": retrying,
         }
-
-        # The pump itself was the problem: put it in its safe state -- motor
-        # off, fault cleared, forevacuum pump running. Never the station off.
-        if pump_trouble:
-            self.secure_pump(message)
+        if retrying:
+            self._remember({**run, "procedure": procedure.name},
+                           "trying again", None, "retry")
+            self._start_cleanups()

@@ -23,10 +23,16 @@ supply -- closely enough that the panel's charts show what the real one does:
 
 The speed dynamics stay simple linear ramps, deliberately: a real coast-down
 takes many minutes, and the selftest's power-down check cannot wait that long.
+
+It also fails on demand. `FAULTS` makes it drop, corrupt, delay or refuse
+chosen replies, go silent, or echo like a looping converter, so the tests can
+show what the panel does with a link that is not perfect -- the real one is
+not -- and `reset()` puts everything back between tests.
 """
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import time
@@ -77,6 +83,62 @@ STATE: dict[int, object] = {
 # Parameters this fake firmware deliberately does not implement, so the
 # NO_DEF path gets exercised by `verify`.
 UNIMPLEMENTED = {326, 330, 336, 342, 346, 397, 398, 399}
+
+#: Faults to inject. Empty is a healthy pump. The counted kinds map a
+#: parameter number to how many requests for it they spoil, -1 meaning every
+#: one:
+#:
+#:   silent    True: answer nothing at all, as a drive switched off would
+#:   quiet_after  n: answer n more requests, then nothing -- a drive that
+#:             goes quiet half way through a reading
+#:   drop      {param: n}  no reply -- the commonest fault on a real bus. A
+#:                         write still takes effect: the reply is what is lost
+#:   corrupt   {param: n}  a reply with a wrong checksum
+#:   nodef     {param: n}  NO_DEF, as if the firmware lacked the parameter
+#:   late      {param: n}  hold the reply back and send it just before the
+#:                         reply to the next request: one that arrives after
+#:                         its own exchange has given up
+#:   value     {param: v}  report v instead of the simulated value
+#:   echo      True: loop every request back before answering, as some
+#:             RS-485 converters do
+#:   delay_s   seconds before every reply: the real bus at 9600 baud
+#:   drop_write    {param: n}  lose only the replies to writes; the writes
+#:                 still happen
+#:   refuse_write  {param: payload}  answer writes with an error payload
+#:                 ("_LOGIC") and do nothing, as a drive refusing them would
+#:   station_acks  True: writing P010 = 1 also acknowledges a fault, as
+#:                 P010 does on Pfeiffer's newer drives (unconfirmed here)
+FAULTS: dict = {}
+
+#: Replies held back by a "late" fault, sent ahead of the next reply.
+_held: list[bytes] = []
+
+#: The state as the drive starts, for `reset()`.
+_INITIAL = copy.deepcopy(STATE)
+
+
+def reset() -> None:
+    """A healthy pump at rest again: state, simulation and faults."""
+    global _speed, _tms, _attained, _limited_for, _below_switchpoint_for
+    global GAS_LOAD
+    STATE.clear()
+    STATE.update(copy.deepcopy(_INITIAL))
+    FAULTS.clear()
+    _held.clear()
+    _speed, _tms, _attained = 0.0, 0.0, False
+    _limited_for = _below_switchpoint_for = 0.0
+    GAS_LOAD = 0.0
+
+
+def _take(kind: str, number: int) -> bool:
+    """Whether fault `kind` spoils this request for `number`, using it up."""
+    counts = FAULTS.get(kind) or {}
+    left = counts.get(number)
+    if not left:
+        return False
+    if left > 0:
+        counts[number] = left - 1
+    return True
 
 
 #: Rotor speed carried as a float, since STATE[309] is rounded for the wire
@@ -239,11 +301,39 @@ def handle(frame: bytes) -> bytes | None:
 
     if address not in (ADDRESS, protocol.GROUP_ADDRESS):
         return None
+    if FAULTS.get("silent"):
+        return None
+    left = FAULTS.get("quiet_after")
+    if left is not None:
+        if left <= 0:
+            return None
+        FAULTS["quiet_after"] = left - 1
+
+    # A dropped reply is lost on the way back: the drive has already done
+    # what a write asked, though the host never hears that it did.
+    answer = _answer(action, number, payload)
+    if _take("drop", number):
+        return None
+    if action == protocol.ACTION_WRITE and _take("drop_write", number):
+        return None
+    if _take("corrupt", number):
+        text = answer.decode("ascii").rstrip("\r")
+        wrong = f"{(int(text[-3:]) + 1) % 256:03d}"
+        answer = (text[:-3] + wrong + "\r").encode("ascii")
+    if _take("late", number):
+        _held.append(answer)
+        return None
+    return answer
+
+
+def _answer(action: str, number: int, payload: str) -> bytes:
+    """What a healthy drive answers to one request."""
 
     def reply(data: str) -> bytes:
         return protocol.build(ADDRESS, protocol.ACTION_WRITE, number, data)
 
-    if number in UNIMPLEMENTED or number not in params.BY_NUMBER:
+    if number in UNIMPLEMENTED or number not in params.BY_NUMBER \
+            or _take("nodef", number):
         return reply("NO_DEF")
 
     parameter = params.BY_NUMBER[number]
@@ -251,17 +341,23 @@ def handle(frame: bytes) -> bytes | None:
     if action == protocol.ACTION_READ:
         if number not in STATE:
             return reply("NO_DEF")
-        return reply(parameter.encode(STATE[number]))
+        forced = FAULTS.get("value") or {}
+        return reply(parameter.encode(forced.get(number, STATE[number])))
 
     if action == protocol.ACTION_WRITE:
         if not parameter.writable:
             return reply("_LOGIC")
+        refusal = (FAULTS.get("refuse_write") or {}).get(number)
+        if refusal:
+            return reply(refusal)
         try:
             value = parameter.decode(payload)
         except protocol.ProtocolError:
             return reply("_RANGE")
         STATE[number] = value
         if number == 9 and value:  # ErrorAckn
+            STATE[303] = "000000"
+        if number == 10 and value and FAULTS.get("station_acks"):
             STATE[303] = "000000"
         return reply(parameter.encode(STATE[number]))
 
@@ -298,13 +394,23 @@ def serve(master: int, should_stop=None) -> None:
         while b"\r" in buffer:
             frame, _, rest = bytes(buffer).partition(b"\r")
             buffer = bytearray(rest)
+            if FAULTS.get("echo"):
+                _send(master, frame + b"\r")
+            # Replies held back from earlier requests go out first, ahead of
+            # this one's -- which is what a reply arriving late looks like.
+            late, _held[:] = list(_held), []
             answer = handle(frame + b"\r")
-            if answer:
-                time.sleep(0.01)
-                try:
-                    os.write(master, answer)
-                except OSError:
-                    pass
+            out = b"".join(late) + (answer or b"")
+            if out:
+                time.sleep(0.01 + float(FAULTS.get("delay_s") or 0))
+                _send(master, out)
+
+
+def _send(master: int, data: bytes) -> None:
+    try:
+        os.write(master, data)
+    except OSError:
+        pass
 
 
 def main() -> int:

@@ -163,17 +163,46 @@ export function Field({ field, value, onChange }) {
     </label>`;
 }
 
-/** Turn a procedure's field list into a config object of the right types. */
+/** One numeric field's value, or null when the box is empty or not a number. */
+function fieldNumber(field, raw) {
+  if (field.type === "exponent") return fmt.parseExponent(raw);
+  const text = String(raw ?? "").trim();
+  if (!text) return null;
+  const value = Number(text);
+  return Number.isFinite(value) ? value : null;
+}
+
+/** Turn a procedure's field list into a config object of the right types.
+ *  Only for a form `configProblems` passed: an empty box is never sent. */
 export function coerceConfig(fields, values) {
   const out = {};
   for (const field of fields) {
     const raw = values[field.key];
     if (field.type === "boolean") out[field.key] = !!raw;
-    else if (field.type === "exponent") out[field.key] = fmt.parseExponent(raw);
-    else if (field.type === "number") out[field.key] = Number(raw);
-    else out[field.key] = raw;
+    else if (field.type === "exponent" || field.type === "number") {
+      out[field.key] = fieldNumber(field, raw);
+    } else out[field.key] = raw;
   }
   return out;
+}
+
+/** What is wrong with a filled-in form, one sentence per field. The server
+ *  refuses the same things; saying so here keeps Start from being pressed. */
+export function configProblems(fields, values) {
+  const problems = [];
+  for (const field of fields) {
+    if (field.type !== "exponent" && field.type !== "number") continue;
+    const label = String(field.label || field.key).replace(/^…/, "");
+    const value = fieldNumber(field, values[field.key]);
+    const unit = field.unit ? ` ${field.unit}` : "";
+    if (value === null) {
+      problems.push(`"${label}" needs a number.`);
+    } else if ((field.min != null && value < field.min)
+               || (field.max != null && value > field.max)) {
+      problems.push(`"${label}" must be between ${field.min} and ${field.max}${unit}.`);
+    }
+  }
+  return problems;
 }
 
 export function defaultConfig(fields) {

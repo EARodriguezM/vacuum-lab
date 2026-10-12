@@ -29,11 +29,28 @@ class DeviceError(Exception):
     """Raised when a device command cannot be carried out."""
 
 
+def waived_rules(override) -> frozenset:
+    """The interlock rule ids an override names.
+
+    True -- "waive everything" -- is refused: an override is for one rule
+    somebody has looked at, and the rule after it still applies.
+    """
+    if override is None or override is False:
+        return frozenset()
+    if override is True:
+        raise ValueError("an override must name the rule it waives")
+    if isinstance(override, str):
+        return frozenset([override])
+    return frozenset(str(rule) for rule in override)
+
+
 class DeviceService:
     """Base class: owns a link, polls it, publishes a cached snapshot."""
 
-    #: Seconds between polls. Overridden per device -- a gauge is cheap to
-    #: read, a pump with a dozen parameters is not.
+    #: Seconds from the start of one poll to the start of the next -- a
+    #: period, not a pause after the reading: a pause made the period the
+    #: reading time plus this, and the pump's data four seconds old. A poll
+    #: that takes longer than this is followed by the next one at once.
     interval = 2.0
 
     #: Consecutive failures tolerated before the link is torn down and
@@ -64,6 +81,10 @@ class DeviceService:
         self._identity: dict = {}
         self._failures = 0
 
+        #: Counts published snapshots. A reader that must judge each reading
+        #: once -- "two readings in a row" -- compares it, because several
+        #: readers may look at the same cached snapshot many times over.
+        self._seq = 0
         self._snap: dict = self.offline("starting up")
         self._snap_lock = threading.Lock()
 
@@ -97,8 +118,12 @@ class DeviceService:
         """Map a snapshot onto columns of the run-sample row."""
         return {}
 
-    def command(self, action: str, value=None, override: bool = False) -> dict:
-        """Carry out a named action. Devices with no controls need not."""
+    def command(self, action: str, value=None, override=None) -> dict:
+        """Carry out a named action. Devices with no controls need not.
+
+        `override` names the interlock rules an admin chose to waive -- one
+        rule id or several, never all of them.
+        """
         return {"ok": False, "error": f"{self.label} has no action {action!r}"}
 
     # --- link management ---------------------------------------------------
@@ -182,7 +207,9 @@ class DeviceService:
     # --- sampling ---------------------------------------------------------
 
     def _loop(self) -> None:
+        due = time.monotonic()
         while not self._stop.is_set():
+            started = time.monotonic()
             if (self.port or "auto").lower() == "auto":
                 # Not found on any port yet: nothing to open, only to look for.
                 snap = self.offline(
@@ -195,11 +222,26 @@ class DeviceService:
                     snap = self._read()
                 except Exception as exc:          # never kill the thread
                     snap = self.offline(str(exc))
-            self.observe(snap)
-            with self._snap_lock:
-                self._snap = snap
+            self._publish(snap, started)
             self._maybe_search(snap)
-            self._stop.wait(self.interval)
+            # On a fixed cadence; after a slow poll, no backlog to catch up.
+            due = max(due + self.interval, time.monotonic())
+            self._stop.wait(max(0.0, due - time.monotonic()))
+
+    def _publish(self, snap: dict, started: float) -> None:
+        """Stamp a reading and make it the one every reader sees.
+
+        Aged from when the reading *began*, on the monotonic clock: a
+        reading is as old as its oldest field, and a wall clock set back by
+        the network would make a frozen sampler look fresh.
+        """
+        self._seq += 1
+        snap["seq"] = self._seq
+        snap["mono"] = started
+        snap["cycle_ms"] = round((time.monotonic() - started) * 1000)
+        self.observe(snap)
+        with self._snap_lock:
+            self._snap = snap
 
     def _maybe_search(self, snap: dict) -> None:
         """Look for the instrument on the other ports once it has gone quiet.
@@ -246,20 +288,24 @@ class DeviceService:
             "key": self.key, "kind": self.kind, "label": self.label,
             "connected": False, "port": self.port, "error": message,
             "identity": {}, "timestamp": time.time(),
+            "mono": time.monotonic(), "seq": self._seq,
         }
 
     def online(self, **payload) -> dict:
         return {
             "key": self.key, "kind": self.kind, "label": self.label,
             "connected": True, "port": self.port, "error": None,
-            "identity": self._identity, "timestamp": time.time(),
+            "identity": dict(self._identity), "timestamp": time.time(),
+            "mono": time.monotonic(), "seq": self._seq,
             **payload,
         }
 
     def snapshot(self) -> dict:
+        """The latest reading. `timestamp` is wall-clock time, for display;
+        `age` is seconds since the reading began, on the monotonic clock."""
         with self._snap_lock:
             snap = dict(self._snap)
-        snap["age"] = round(time.time() - snap.get("timestamp", 0), 1)
+        snap["age"] = round(max(0.0, time.monotonic() - snap["mono"]), 1)
         return snap
 
 

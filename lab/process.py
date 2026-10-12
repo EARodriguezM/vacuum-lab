@@ -309,14 +309,17 @@ class ProcessHardware:
             "shutter": None if shutter is None else (1 if shutter else 0),
         }
 
-    def safe_shutdown(self, log=None) -> None:
+    def safe_shutdown(self, log=None) -> bool:
         """Put the process hardware in its safe state, best effort.
 
         Called when a run ends for any reason. Order matters: the plasma goes
         first, then the gas, then the shutter closes. Every step is attempted
         even if an earlier one failed, because "the magnetron would not switch
-        off" must not also leave the gas running.
+        off" must not also leave the gas running. Returns False if a wired
+        actuator failed; one worked by hand cannot be confirmed from here and
+        is left to the operator's prompt.
         """
+        done = True
         for actuator, value in ((self.magnetron, 0), (self.gas, 0),
                                 (self.shutter, False)):
             try:
@@ -325,8 +328,10 @@ class ProcessHardware:
                 if log:
                     log("warning", f"MANUAL STEP: {prompt.instruction}")
             except ActuatorError as exc:
+                done = False
                 if log:
                     log("error", f"Could not make {actuator.label} safe: {exc}")
+        return done
 
 
 # --- what is on the rig at all -------------------------------------------------

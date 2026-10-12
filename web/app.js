@@ -95,8 +95,13 @@ function mergeLive(held, { payload, reload }) {
  * under the name of who sent it.
  */
 function OverrideDialog({ request, onCancel, onConfirm }) {
+  // Without the rule's id there is nothing to override: the server waives
+  // the named rules, never all of them. A rule that turns up after another
+  // was waived is added to it, so a command two rules stand in front of can
+  // be sent at all.
   const [sure, setSure] = useState(false);
-  useEffect(() => { setSure(false); }, [request]);
+  const [why, setWhy] = useState("");
+  useEffect(() => { setSure(false); setWhy(""); }, [request]);
   useEffect(() => {
     if (!request) return undefined;
     const onKey = (event) => { if (event.key === "Escape") onCancel(); };
@@ -110,17 +115,26 @@ function OverrideDialog({ request, onCancel, onConfirm }) {
         <h2>Override: ${request.label}</h2>
         <div class="small">
           <p><strong>The interlock refuses this:</strong> ${request.reason}</p>
-          <p>Overriding sends it anyway. Do it only when you have looked at the
-            rig yourself and know why the rule does not apply right now. It is
-            recorded under your name.</p>
+          <p>Overriding waives ${(request.waived || []).length ? "these rules" : "this rule"} (${
+            [...(request.waived || []), request.rule].map((rule, index) => html`${
+              index ? ", " : ""}<span class="mono" key=${rule}>${rule}</span>`)}) and sends
+            it; any other rule still applies. Do it only when you have
+            looked at the rig yourself and know why the rule does not apply
+            right now. It is recorded under your name, with your reason.</p>
         </div>
+        <label class="field">
+          <span>Why it is safe now</span>
+          <input value=${why} maxlength="300" placeholder="What you checked, in a sentence"
+                 onInput=${(e) => setWhy(e.target.value)} />
+        </label>
         <label class="check">
           <input type="checkbox" checked=${sure} onChange=${(e) => setSure(e.target.checked)} />
           <span>I have checked the chamber and the pump myself.</span>
         </label>
         <div class="actions">
           <button onClick=${onCancel}>Cancel</button>
-          <button class="danger" disabled=${!sure} onClick=${onConfirm}>
+          <button class="danger" disabled=${!sure || !request.rule || why.trim().length < 3}
+                  onClick=${() => onConfirm(why.trim())}>
             Override and send</button>
         </div>
       </div>
@@ -452,9 +466,11 @@ function App() {
         notify(`${fmt.titleCase(action)} sent${override ? " — interlock overridden" : ""}.`, "ok");
       } else if (result.interlock) {
         notify(`Refused: ${result.error}`, "error");
-        // An admin is offered the deliberate way past it; nobody else is.
-        if (!override && stateRef.current?.me?.can?.override) {
+        // An admin is offered the deliberate way past that one rule; nobody
+        // else is. After an override, the refusal is a different rule.
+        if (result.rule && stateRef.current?.me?.can?.override) {
           setOverriding({ device, action, value, reason: result.error,
+                          rule: result.rule, waived: override?.rules || [],
                           label: label || fmt.titleCase(action) });
         }
       } else {
@@ -477,10 +493,13 @@ function App() {
     request.resolve?.(result);
   };
 
-  const confirmOverride = async () => {
+  const confirmOverride = async (why) => {
     const request = overriding;
     setOverriding(null);
-    await send(request.device, request.action, request.value, true, request.label);
+    await send(request.device, request.action, request.value,
+               { rules: [...(request.waived || []), request.rule], reason: why,
+                 refusal: request.reason, checked: true },
+               request.label);
   };
 
   const cancelPending = () => {
@@ -694,8 +713,8 @@ function App() {
                         onShutdown: () => setPoweringDown(true),
                         onSecure: () => setSecuring(true),
                         onOverride: me?.can?.override
-                          ? (action, label, reason) => setOverriding(
-                            { device: "pump", action, label, reason })
+                          ? (action, label, reason, rule) => setOverriding(
+                            { device: "pump", action, label, reason, rule })
                           : null }}
           gaugeProps=${{ state, onCommand: gaugeCommand, busy: locked }} />`;
       case "tests":

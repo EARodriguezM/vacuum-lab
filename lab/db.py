@@ -27,6 +27,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from pathlib import Path
 
 SCHEMA_VERSION = 4
 
@@ -113,7 +114,11 @@ CREATE TABLE IF NOT EXISTS events (
     message     TEXT    NOT NULL,
     detail      TEXT,
     -- The username behind an action, NULL for what the rig did by itself.
-    user        TEXT
+    user        TEXT,
+    -- 'run' for a run's own log, written by the run engine; NULL for the
+    -- rig's records filed under a run (alarms, overrides, actions), which
+    -- outlive it; 'legacy' for records from before this column.
+    origin      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS events_by_run ON events(run_id, at);
@@ -174,6 +179,15 @@ CREATE TABLE IF NOT EXISTS role_requests (
     decided_at  REAL
 );
 
+-- Facts about the store itself. `last_run_id` is the highest run id ever
+-- given out: SQLite hands a deleted newest run's id to the next run, and
+-- everything that names a run by its id -- alarms, links, the event log --
+-- would take the new run for the old one.
+CREATE TABLE IF NOT EXISTS meta (
+    key         TEXT    PRIMARY KEY,
+    value       TEXT    NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS devices (
     key         TEXT    PRIMARY KEY,
     kind        TEXT    NOT NULL,
@@ -210,7 +224,12 @@ MIGRATIONS = (
     ("runs", "started_by", "TEXT"),
     ("runs", "chamber", "TEXT"),
     ("events", "user", "TEXT"),
+    ("events", "origin", "TEXT"),
 )
+
+
+class RunStillRunning(ValueError):
+    """A run still marked running cannot be deleted."""
 
 #: Tables holding credentials. Dropped from every copy that leaves the box.
 ACCOUNT_TABLES = ("sessions", "role_requests", "roles", "users")
@@ -243,6 +262,10 @@ class Database:
             self._db.execute("PRAGMA foreign_keys=ON")
             self._db.executescript(SCHEMA)
             self._migrate()
+            # A store from before `meta` starts from the runs it holds.
+            self._db.execute(
+                "INSERT OR IGNORE INTO meta (key, value) "
+                "SELECT 'last_run_id', COALESCE(MAX(id), 0) FROM runs")
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._db.commit()
 
@@ -251,7 +274,23 @@ class Database:
         for table, column, kind in MIGRATIONS:
             present = {row["name"] for row in
                        self._db.execute(f"PRAGMA table_info({table})")}
-            if column not in present:
+            if column not in present and (table, column) == ("events", "origin"):
+                # Who wrote these was not recorded: delete_run judges them by
+                # the older rule. The column and the marking in one
+                # transaction -- a power cut between the two would leave the
+                # old rows unmarked for good.
+                if self._db.in_transaction:
+                    self._db.commit()
+                self._db.execute("BEGIN")
+                try:
+                    self._db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+                    self._db.execute("UPDATE events SET origin='legacy'")
+                    self._db.commit()
+                except Exception:
+                    self._db.rollback()
+                    raise
+            elif column not in present:
                 self._db.execute(
                     f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
@@ -277,15 +316,23 @@ class Database:
                    chamber: str | None = None) -> dict:
         now = time.time()
         with self._lock:
-            cursor = self._db.execute(
-                "INSERT INTO runs (uuid, procedure, name, operator, notes, "
+            # Never an id given out before, even to a run since deleted.
+            run_id = 1 + self._db.execute(
+                "SELECT MAX(COALESCE((SELECT MAX(id) FROM runs), 0), "
+                "COALESCE((SELECT CAST(value AS INTEGER) FROM meta "
+                "WHERE key='last_run_id'), 0))").fetchone()[0]
+            self._db.execute(
+                "INSERT INTO runs (id, uuid, procedure, name, operator, notes, "
                 "config, status, started_at, created_at, started_by, chamber) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), procedure, name, operator, notes,
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, str(uuid.uuid4()), procedure, name, operator, notes,
                  json.dumps(config), RUNNING, now, now, started_by, chamber),
             )
+            self._db.execute(
+                "INSERT OR REPLACE INTO meta (key, value) "
+                "VALUES ('last_run_id', ?)", (str(run_id),))
             self._db.commit()
-            return self.run(cursor.lastrowid)  # type: ignore[arg-type]
+            return self.run(run_id)  # type: ignore[arg-type]
 
     def finish_run(self, run_id: int, status: str, result: dict) -> None:
         with self._lock:
@@ -294,6 +341,13 @@ class Database:
                 "WHERE id=?",
                 (status, time.time(), json.dumps(result), run_id),
             )
+            self._db.commit()
+
+    def set_result(self, run_id: int, result: dict) -> None:
+        """Replace a finished run's result, leaving its status and times."""
+        with self._lock:
+            self._db.execute("UPDATE runs SET result=? WHERE id=?",
+                             (json.dumps(result), run_id))
             self._db.commit()
 
     def set_phase(self, run_id: int, phase: str) -> None:
@@ -373,10 +427,66 @@ class Database:
         return _run_row(row) if row else None
 
     def delete_run(self, run_id: int) -> bool:
+        """Delete a run with its samples and its own log.
+
+        Not with the rig's records that were only filed under it: between
+        runs the panel files them under the run that just ended, and an
+        admin's interlock override, any account's action, and the alarms and
+        recoveries after the run ended must outlive a tidy-up of History.
+        They move to the rig's log, with the run they were filed under: all
+        but the run's own log (`origin` 'run'); records from before `origin`
+        by the older rule -- with a user, or dated after the run ended.
+
+        A run still marked running is refused (`RunStillRunning`): checked
+        here, under the database's lock, a run whose record `start()` has
+        just written cannot be deleted before its thread exists. All or
+        nothing: a move that fails leaves every record where it was.
+        """
         with self._lock:
-            cursor = self._db.execute("DELETE FROM runs WHERE id=?", (run_id,))
-            self._db.commit()
+            row = self._db.execute("SELECT status, ended_at FROM runs WHERE id=?",
+                                   (run_id,)).fetchone()
+            if row is None:
+                return False
+            if row["status"] == RUNNING:
+                raise RunStillRunning(f"run {run_id} is still running")
+            ended = row["ended_at"]
+            try:
+                kept = self._db.execute(
+                    "SELECT id, detail FROM events WHERE run_id=? AND "
+                    "(origin IS NULL OR origin NOT IN ('run', 'legacy') OR "
+                    "(origin='legacy' AND "
+                    "(user IS NOT NULL OR (? IS NOT NULL AND at > ?))))",
+                    (run_id, ended, ended)).fetchall()
+                for event in kept:
+                    try:
+                        detail = json.loads(event["detail"]) \
+                            if event["detail"] else {}
+                    except ValueError:
+                        detail = {"detail": event["detail"]}
+                    if not isinstance(detail, dict):
+                        detail = {"detail": detail}
+                    detail["deleted_run"] = run_id
+                    self._db.execute(
+                        "UPDATE events SET run_id=NULL, detail=? WHERE id=?",
+                        (json.dumps(detail), event["id"]))
+                cursor = self._db.execute("DELETE FROM runs WHERE id=?",
+                                          (run_id,))
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
             return cursor.rowcount > 0
+
+    def runs_owing_cleanup(self) -> list[dict]:
+        """Ended runs whose clean-up has not been done yet, oldest first --
+        cut off by a crash, or ended with a clean-up that failed -- however
+        many runs have been recorded since."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM runs WHERE status != ? AND result LIKE ? "
+                "ORDER BY id", (RUNNING, '%"cleanup_pending": true%')).fetchall()
+        return [run for run in map(_run_row, rows)
+                if (run.get("result") or {}).get("cleanup_pending") is True]
 
     def orphaned_runs(self) -> list[dict]:
         """Runs left `running` by a crash or a restart.
@@ -445,14 +555,38 @@ class Database:
     # --- events -----------------------------------------------------------
 
     def add_event(self, run_id: int | None, level: str, message: str,
-                  detail: dict | None = None, user: str | None = None) -> None:
+                  detail: dict | None = None, user: str | None = None,
+                  at: float | None = None, origin: str | None = None) -> None:
+        """Record one event. `at` is when it happened, if that was earlier
+        than now -- a write that waited in a queue is still dated right.
+
+        A record for a run deleted meanwhile -- a make-safe that finished
+        after an admin removed its run -- is kept in the rig's log, with the
+        run it was about in its detail, rather than lost to the foreign key.
+        """
         with self._lock:
-            self._db.execute(
-                "INSERT INTO events (run_id, at, level, message, detail, user) "
-                "VALUES (?,?,?,?,?,?)",
-                (run_id, time.time(), level, message,
-                 json.dumps(detail) if detail else None, user),
-            )
+            when = time.time() if at is None else at
+            try:
+                self._db.execute(
+                    "INSERT INTO events (run_id, at, level, message, detail, "
+                    "user, origin) VALUES (?,?,?,?,?,?,?)",
+                    (run_id, when, level, message,
+                     json.dumps(detail) if detail else None, user, origin),
+                )
+            except sqlite3.IntegrityError:
+                given = self._db.execute(
+                    "SELECT CAST(value AS INTEGER) FROM meta "
+                    "WHERE key='last_run_id'").fetchone()
+                if run_id is None or self.run(run_id) is not None \
+                        or not given or run_id > given[0]:
+                    raise                 # not a run deleted: a caller's bug
+                self._db.execute(
+                    "INSERT INTO events (run_id, at, level, message, detail, "
+                    "user, origin) VALUES (NULL,?,?,?,?,?,?)",
+                    (when, level, message,
+                     json.dumps({**(detail or {}), "deleted_run": run_id}),
+                     user, origin),
+                )
             self._db.commit()
 
     def events(self, run_id: int | None = None, limit: int = 500) -> list[dict]:
@@ -541,16 +675,43 @@ class Database:
         and the file vacuumed, so the freed pages do not still hold them: a
         viewer may download the runs, never the password hashes.
         """
-        with self._lock:
-            target = sqlite3.connect(destination)
-            try:
+        target = sqlite3.connect(destination)
+        try:
+            # The lock only for the copy itself: dropping the accounts and
+            # vacuuming touch the copy alone, and everything else that writes
+            # -- the supervisor's alarms, sign-ins -- waits while it is held.
+            with self._lock:
                 self._db.backup(target)
-                for table in ACCOUNT_TABLES:
-                    target.execute(f"DROP TABLE IF EXISTS {table}")
-                target.commit()
-                target.execute("VACUUM")
-            finally:
-                target.close()
+            # The copy inherits WAL mode, and then the DROP and the VACUUM
+            # land in its -wal file: the main file -- the one that is sent --
+            # keeps the accounts until a checkpoint at close, which a write
+            # error can skip. A plain rollback journal puts them in the file.
+            mode = target.execute("PRAGMA journal_mode=DELETE").fetchone()
+            if not mode or str(mode[0]).lower() != "delete":
+                raise RuntimeError("the copy could not leave WAL mode")
+            for table in ACCOUNT_TABLES:
+                target.execute(f"DROP TABLE IF EXISTS {table}")
+            target.commit()
+            target.execute("VACUUM")
+        finally:
+            target.close()
+        # Checked on disk, as it will be sent: no write-ahead log left beside
+        # it, and no account table in it.
+        if os.path.exists(destination + "-wal"):
+            raise RuntimeError("the copy still has a write-ahead log")
+        check = sqlite3.connect(Path(destination).resolve().as_uri()
+                                + "?immutable=1", uri=True)
+        try:
+            left = {row[0] for row in check.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            check.close()
+        if left & set(ACCOUNT_TABLES):
+            raise RuntimeError("the copy still holds account tables")
+        if "runs" not in left:
+            # A copy with nothing in it -- or the check looking at another
+            # file -- must not pass for one without accounts.
+            raise RuntimeError("the copy holds no runs table")
         return destination
 
     # --- accounts ---------------------------------------------------------

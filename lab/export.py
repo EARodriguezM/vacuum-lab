@@ -182,8 +182,18 @@ def database_snapshot(database: "dbmod.Database", directory: str) -> tuple[str, 
     """A consistent copy of the .db file. Returns (filename, path on disk)."""
     import os
 
+    import tempfile
+
     stamp = time.strftime("%Y%m%d-%H%M%S")
     name = f"{stamp}-vacuum-lab.db"
-    path = os.path.join(directory, name)
-    database.snapshot(path)
+    # A file of its own: two downloads in the same second used to share one,
+    # and the second copy could land after the first had dropped the
+    # account tables -- and be served with them.
+    handle, path = tempfile.mkstemp(dir=directory, suffix=".db")
+    os.close(handle)
+    try:
+        database.snapshot(path)
+    except Exception:
+        os.unlink(path)                      # a refused copy is not left about
+        raise
     return name, path

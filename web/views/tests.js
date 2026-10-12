@@ -7,7 +7,8 @@
 
 import { html } from "../html.js";
 import { useEffect, useMemo, useState } from "preact/hooks";
-import { Banner, Card, Empty, Field, Pairs, Pill, coerceConfig, defaultConfig }
+import { Banner, Card, Empty, Field, Pairs, Pill, coerceConfig, configProblems,
+         defaultConfig }
   from "../ui.js";
 import { RunCharts } from "../runcharts.js";
 import { useStored } from "../rigcharts.js";
@@ -197,6 +198,11 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
 
   if (!procedure) return html`<${Empty}>The server published no procedures.<//>`;
 
+  // Until this procedure's defaults are filled in -- the first frame, and
+  // the frame after switching procedure, which still holds the previous
+  // one's settings -- there is nothing of its own to judge.
+  const ready = procedure.fields.every((field) => field.key in config);
+  const problems = ready ? configProblems(procedure.fields, config) : [];
   const start = () => {
     onStart({
       procedure: procedure.name,
@@ -276,15 +282,22 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
 
       <${Card}>
         <div class="row">
-          <button class="primary" disabled=${busy || absent.length > 0} onClick=${start}>
+          <button class="primary" disabled=${busy || absent.length > 0 || problems.length > 0}
+                  onClick=${start}>
             Start ${procedure.label.toLowerCase()}
           </button>
           <span class="small muted">
             ${absent.length > 0
               ? "Switched off until its equipment is installed."
-              : "The run drives the hardware through the same interlocks as the manual controls — it holds no override."}
+              : problems.length > 0
+                ? "Fix the settings marked below first."
+                : "The run drives the hardware through the same interlocks as the manual controls — it holds no override."}
           </span>
         </div>
+        ${problems.length > 0 && html`
+          <div class="banner warn small" role="alert">
+            ${problems.map((problem) => html`<div key=${problem}>${problem}</div>`)}
+          </div>`}
       <//>
     </div>`;
 }
