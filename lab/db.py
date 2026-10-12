@@ -162,7 +162,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     active_at   REAL    NOT NULL,
     expires_at  REAL,
     address     TEXT    DEFAULT '',
-    agent       TEXT    DEFAULT ''
+    agent       TEXT    DEFAULT '',
+    -- The paired tablet a person signed in on, if any: such a session ends
+    -- when it goes idle (lab/auth.py).
+    device_id   INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS sessions_by_user ON sessions(user_id);
@@ -225,6 +228,7 @@ MIGRATIONS = (
     ("runs", "chamber", "TEXT"),
     ("events", "user", "TEXT"),
     ("events", "origin", "TEXT"),
+    ("sessions", "device_id", "INTEGER"),
 )
 
 
@@ -248,9 +252,10 @@ class Database:
         self.path = path or default_path()
         directory = os.path.dirname(os.path.abspath(self.path))
         if directory:
-            os.makedirs(directory, exist_ok=True)
+            os.makedirs(directory, mode=0o700, exist_ok=True)
         self._lock = threading.RLock()
         self._db = sqlite3.connect(self.path, check_same_thread=False)
+        self._private()
         self._db.row_factory = sqlite3.Row
         with self._lock:
             self._db.execute("PRAGMA journal_mode=WAL")
@@ -268,6 +273,21 @@ class Database:
                 "SELECT 'last_run_id', COALESCE(MAX(id), 0) FROM runs")
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._db.commit()
+        self._private()                  # and the -wal, -shm made just now
+
+    def _private(self) -> None:
+        """Make the store readable by its owner only.
+
+        It holds the password hashes, and a file created under the usual
+        umask is readable by every account on the machine. SQLite gives the
+        -wal and -shm files the database file's own mode when it makes them;
+        those already there are set too.
+        """
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.chmod(self.path + suffix, 0o600)
+            except OSError:
+                pass                     # not there yet, or not ours to change
 
     def _migrate(self) -> None:
         """Add columns an older database is missing. Caller holds the lock."""
@@ -356,9 +376,12 @@ class Database:
             self._db.commit()
 
     def update_run(self, run_id: int, **fields) -> dict | None:
-        """Edit the operator-supplied metadata of an existing run."""
+        """Edit the operator-supplied metadata of an existing run. A field
+        given as None is left as it is -- an edit of the notes alone must not
+        write NULL over the name."""
         allowed = {"name", "operator", "notes"}
-        changes = {k: v for k, v in fields.items() if k in allowed}
+        changes = {k: v for k, v in fields.items()
+                   if k in allowed and v is not None}
         if not changes:
             return self.run(run_id)
         assignments = ", ".join(f"{k}=?" for k in changes)
@@ -667,21 +690,32 @@ class Database:
             "bytes": size,
         }
 
+    def _read_only(self) -> sqlite3.Connection:
+        """A connection of its own that can only read the store."""
+        return sqlite3.connect(Path(self.path).resolve().as_uri() + "?mode=ro",
+                               uri=True, timeout=30)
+
     def snapshot(self, destination: str) -> str:
         """Write a consistent copy of the database, safe to download.
 
         Copying the file directly would race the WAL; `sqlite3.backup` takes a
-        proper online backup instead. The accounts are dropped from the copy
+        proper online backup instead, in one step, from its own read-only
+        connection. The accounts are dropped from the copy
         and the file vacuumed, so the freed pages do not still hold them: a
         viewer may download the runs, never the password hashes.
         """
         target = sqlite3.connect(destination)
         try:
-            # The lock only for the copy itself: dropping the accounts and
-            # vacuuming touch the copy alone, and everything else that writes
-            # -- the supervisor's alarms, sign-ins -- waits while it is held.
-            with self._lock:
-                self._db.backup(target)
+            # From a connection of its own, read-only, and without the lock:
+            # in WAL mode a reader sees one consistent state while the run's
+            # writer, the supervisor's alarms and sign-ins carry on. Copying
+            # through the shared connection held the lock -- and every
+            # writer -- for as long as the copy took.
+            source = self._read_only()
+            try:
+                source.backup(target)
+            finally:
+                source.close()
             # The copy inherits WAL mode, and then the DROP and the VACUUM
             # land in its -wal file: the main file -- the one that is sent --
             # keeps the accounts until a checkpoint at close, which a write
@@ -713,6 +747,20 @@ class Database:
             # file -- must not pass for one without accounts.
             raise RuntimeError("the copy holds no runs table")
         return destination
+
+    # --- facts about the store -------------------------------------------
+
+    def meta(self, key: str) -> str | None:
+        with self._lock:
+            row = self._db.execute("SELECT value FROM meta WHERE key=?",
+                                   (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self._db.execute("INSERT OR REPLACE INTO meta (key, value) "
+                             "VALUES (?, ?)", (key, str(value)))
+            self._db.commit()
 
     # --- accounts ---------------------------------------------------------
     #
@@ -811,15 +859,15 @@ class Database:
 
     def create_session(self, token_hash: str, user_id: int,
                        expires_at: float | None, address: str = "",
-                       agent: str = "") -> None:
+                       agent: str = "", device_id: int | None = None) -> None:
         now = time.time()
         with self._lock:
             self._db.execute(
                 "INSERT INTO sessions (token_hash, user_id, created_at, "
-                "seen_at, active_at, expires_at, address, agent) "
-                "VALUES (?,?,?,?,?,?,?,?)",
+                "seen_at, active_at, expires_at, address, agent, device_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
                 (token_hash, user_id, now, now, now, expires_at, address,
-                 agent[:200]))
+                 agent[:200], device_id))
             self._db.commit()
 
     def session(self, token_hash: str) -> dict | None:

@@ -29,7 +29,6 @@ import argparse
 import os
 import signal
 import sys
-from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -139,7 +138,11 @@ def build(args) -> api.Application:
                            finder=finder,
                            chamber={"id": args.chamber_id,
                                     "name": args.chamber_name},
-                           allow=api.parse_networks(args.allow_from))
+                           allow=api.parse_networks(args.allow_from),
+                           hosts=api.machine_names(
+                               [n for n in args.host_name.split(",") if n]),
+                           origins=[o for o in args.allow_origin.split(",") if o],
+                           admin_from=api.parse_networks(args.admin_from))
 
 
 def main() -> int:
@@ -187,6 +190,23 @@ def main() -> int:
                              "panel at all, e.g. 192.168.50.0/24. Loopback is "
                              "always allowed (the tablet on its USB cable). "
                              "Default: any address")
+    parser.add_argument("--admin-from", default="",
+                        help="comma-separated networks from which what only an "
+                             "admin may do -- accounts, overrides, the drive's "
+                             "protections, the rig's set-up -- is accepted, "
+                             "e.g. the lab router's 192.168.50.0/24. Loopback "
+                             "always is. Default: any address. Until the panel "
+                             "has TLS, passwords cross the network in clear")
+    parser.add_argument("--host-name", default="",
+                        help="comma-separated names the panel answers to "
+                             "besides its IP addresses and this machine's own "
+                             "name, e.g. a domain. Requests naming any other "
+                             "host are refused (DNS rebinding)")
+    parser.add_argument("--allow-origin", default="",
+                        help="comma-separated origins a panel may be served "
+                             "from and still use this API, e.g. "
+                             "http://192.168.50.10:8600. Default: only the "
+                             "panel's own pages")
     parser.add_argument("--idle-minutes", type=float, default=15,
                         help="a person must type their password again to act "
                              "after this long without touching the panel")
@@ -205,15 +225,17 @@ def main() -> int:
                              "the pump safe automatically (motor off, fault "
                              "acknowledged, forevacuum pump kept on)")
     args = parser.parse_args()
-    try:
-        api.parse_networks(args.allow_from)
-    except ValueError as exc:
-        parser.error(f"--allow-from: {exc}")
+    for flag, value in (("--allow-from", args.allow_from),
+                        ("--admin-from", args.admin_from)):
+        try:
+            api.parse_networks(value)
+        except ValueError as exc:
+            parser.error(f"{flag}: {exc}")
 
     application = build(args)
     api.Handler.app = application
 
-    httpd = ThreadingHTTPServer((args.bind, args.port), api.Handler)
+    httpd = api.Server((args.bind, args.port), api.Handler)
     print(f"Vacuum lab panel for {args.chamber_name} ({args.chamber_id}) "
           f"on http://{args.bind}:{args.port}/")
     for device in application.registry:
@@ -241,6 +263,10 @@ def main() -> int:
                  if args.chamber_id != "chamber-1" else ""))
     if args.allow_from:
         print(f"  reachable only from: {args.allow_from} (and loopback)")
+    if args.admin_from:
+        print(f"  administered only from: {args.admin_from} (and loopback)")
+    print(f"  answers to: any IP address, "
+          f"{', '.join(sorted(application.hosts))}")
 
     # `systemctl stop` and `restart` send SIGTERM, which by default ends the
     # process on the spot -- with a run's clean-up (the heater, the gas)

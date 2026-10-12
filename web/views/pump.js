@@ -227,14 +227,16 @@ function FaultsCard({ pump, alarms, busy, safeBusy, canAdmin = true, onCommand,
   const [loading, setLoading] = useState(false);
   const [showCodes, setShowCodes] = useState(false);
 
-  const load = () => {
+  const load = (fresh = false) => {
     setLoading(true);
-    api.pumpDiagnostics()
+    api.pumpDiagnostics("pump", fresh)
       .then(setDiagnostics)
       .catch((error) => setDiagnostics({ ok: false, error: error.message }))
       .finally(() => setLoading(false));
   };
-  useEffect(() => { if (pump?.connected) load(); }, [pump?.connected]);
+  // Read again on a new fault code: the history is what it is about.
+  useEffect(() => { if (pump?.connected) load(); },
+            [pump?.connected, pump?.fault?.code]);
 
   const fault = pump?.fault?.code ? pump.fault : null;
   const auto = alarms?.auto_recover;
@@ -255,7 +257,7 @@ function FaultsCard({ pump, alarms, busy, safeBusy, canAdmin = true, onCommand,
     <${Card} title="Faults and recovery"
       hint="After a drive fault the panel makes the pump safe by itself: turbopump motor off, fault acknowledged, pumping station — the forevacuum pump — kept on. It never switches the forevacuum pump off, and it never restarts the turbopump: that is your decision, through the crossover interlock."
       actions=${html`
-        <button class="small" disabled=${loading} onClick=${load}>
+        <button class="small" disabled=${loading} onClick=${() => load(true)}>
           ${loading ? "Reading…" : "Read the drive"}</button>`}>
 
       ${fault
@@ -318,6 +320,8 @@ function FaultsCard({ pump, alarms, busy, safeBusy, canAdmin = true, onCommand,
           </div>
           <div>
             <h3 class="sub-head">The drive's last faults</h3>
+            ${diagnostics.read_s_ago > 0 && html`
+              <p class="small muted">As read ${Math.round(diagnostics.read_s_ago)} s ago.</p>`}
             ${diagnostics.history?.length
               ? html`<ol class="fault-history">
                   ${diagnostics.history.map((entry) => html`
@@ -491,7 +495,7 @@ export function PumpView({ state, onCommand, onWriteParam, busy, safeBusy,
   const [accessories, setAccessories] = useState(null);
   const [speed, setSpeed] = useState("");
 
-  const reload = () => api.accessories("pump").then(setAccessories)
+  const reload = (fresh = false) => api.accessories("pump", fresh).then(setAccessories)
     .catch((error) => setAccessories({ ok: false, error: error.message }));
 
   useEffect(() => { if (pump?.connected) reload(); }, [pump?.connected]);
@@ -628,7 +632,7 @@ export function PumpView({ state, onCommand, onWriteParam, busy, safeBusy,
       <${PumpTrends} pump=${pump} gauge=${state?.devices?.gauge} />
 
       <${Card} title="Accessory connectors"
-               actions=${html`<button class="small" onClick=${reload}>Refresh</button>`}
+               actions=${html`<button class="small" onClick=${() => reload(true)}>Refresh</button>`}
                hint="Read on demand rather than in the status poll: fourteen extra round trips per refresh.">
         <${Accessories} data=${accessories} busy=${busy} onWrite=${writeParam}
                         reload=${reload} />

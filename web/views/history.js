@@ -198,7 +198,8 @@ export function HistoryView({ notify, state }) {
         hint=${stats?.stats
           ? `${stats.stats.runs} ${stats.stats.runs === 1 ? "run" : "runs"} · ` +
             `${fmt.integer(stats.stats.samples)} samples · ` +
-            `${fmt.bytes(stats.stats.bytes)} · ${stats.stats.path}`
+            `${fmt.bytes(stats.stats.bytes)}` +
+            (stats.stats.path ? ` · ${stats.stats.path}` : "")
           : ""}
         actions=${html`
           <button onClick=${() => save("/api/export/runs.csv", notify)}>All runs (CSV)</button>

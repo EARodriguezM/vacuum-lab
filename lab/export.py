@@ -148,9 +148,11 @@ def index_csv(database: "dbmod.Database") -> tuple[str, str]:
 def index_json(database: "dbmod.Database") -> tuple[str, str]:
     """Every run's header and result, without the curves."""
     stamp = time.strftime("%Y%m%d-%H%M")
+    stats = database.stats()
+    stats.pop("path", None)                 # the machine's business
     payload = {
         "runs": database.runs(limit=100000),
-        "stats": database.stats(),
+        "stats": stats,
         "exported_at": time.time(),
         "exported_iso": _iso(time.time()),
         "schema_version": dbmod.SCHEMA_VERSION,
@@ -158,24 +160,41 @@ def index_json(database: "dbmod.Database") -> tuple[str, str]:
     return f"{stamp}-all-runs.json", json.dumps(payload, indent=2)
 
 
-def bundle_json(database: "dbmod.Database") -> tuple[str, str]:
-    """Every run *with* its curve. Large; the honest full-archive option."""
-    runs = []
-    for run in database.runs(limit=100000):
-        runs.append({
-            **run,
-            "samples": database.samples(run["id"]),
-            "events": list(reversed(database.events(run["id"], limit=10000))),
-        })
+def bundle_json(database: "dbmod.Database", directory: str) -> tuple[str, str]:
+    """Every run *with* its curve. Large; the honest full-archive option.
+
+    Written to a file of its own in `directory`, one run at a time, and
+    returned as (filename, path): a whole archive held in memory as one
+    string -- a week's run alone is hundreds of megabytes of dicts -- is
+    memory the rig runs on. The same JSON as before, less the indentation.
+    """
+    import os
+    import tempfile
+
     stamp = time.strftime("%Y%m%d-%H%M")
-    payload = {
-        "runs": runs,
-        "stats": database.stats(),
-        "exported_at": time.time(),
-        "exported_iso": _iso(time.time()),
-        "schema_version": dbmod.SCHEMA_VERSION,
-    }
-    return f"{stamp}-vacuum-lab-archive.json", json.dumps(payload, indent=2)
+    stats = database.stats()
+    stats.pop("path", None)                 # the machine's business
+    handle, path = tempfile.mkstemp(dir=directory, suffix=".json")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            out.write('{"runs": [')
+            for index, run in enumerate(database.runs(limit=100000)):
+                if index:
+                    out.write(", ")
+                json.dump({
+                    **run,
+                    "samples": database.samples(run["id"]),
+                    "events": list(reversed(database.events(run["id"],
+                                                            limit=10000))),
+                }, out)
+            now = time.time()
+            out.write('], ' + json.dumps({
+                "stats": stats, "exported_at": now, "exported_iso": _iso(now),
+                "schema_version": dbmod.SCHEMA_VERSION})[1:])
+    except Exception:
+        os.unlink(path)
+        raise
+    return f"{stamp}-vacuum-lab-archive.json", path
 
 
 def database_snapshot(database: "dbmod.Database", directory: str) -> tuple[str, str]:

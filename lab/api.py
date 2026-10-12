@@ -25,10 +25,12 @@ import json
 import mimetypes
 import os
 import posixpath
+import socket
 import sys
 import tempfile
+import threading
 import time
-from http.server import BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import auth as authmod
@@ -72,6 +74,28 @@ PUBLIC_POSTS = ("/api/login", "/api/signup", "/api/pair")
 #: GETs that need more than watching.
 ADMIN_GETS = ("/api/ports/survey",)
 
+#: The most rows one listing returns, whatever the request asks for.
+MAX_LIST = 1000
+
+#: How long a run's name, operator and notes may be, in characters.
+RUN_NAME_MAX, RUN_OPERATOR_MAX, RUN_NOTES_MAX = 120, 80, 4000
+
+#: Connections served at once, in all and from one address. Each holds a
+#: thread; beyond these a new connection is turned away, so a flood from the
+#: network cannot take the threads and memory the rig runs on. Loopback --
+#: the kiosk tablet on its USB cable -- is held only to the per-address cap,
+#: so a flood from the network cannot take the wall screen with it.
+MAX_CONNECTIONS = 64
+MAX_CONNECTIONS_PER_ADDRESS = 16
+
+#: Whoever a request turned out to be when, with accounts on, it was never
+#: resolved: no role, no rights. Code that reached for the local owner as a
+#: fallback would otherwise hand an unresolved request the owner's name.
+NOBODY = authmod.Principal(-1, "unknown", "Unknown", "none", "none", None)
+
+#: How long a download waits for the one before it to be built.
+EXPORT_WAIT_S = 10.0
+
 #: The largest request body accepted. Every real one is a few hundred bytes;
 #: without a cap, anyone on the network could make the server allocate
 #: whatever a Content-Length claims, before any password is checked.
@@ -107,6 +131,46 @@ def parse_networks(text: str | None) -> list:
         if part:
             networks.append(ipaddress.ip_network(part, strict=False))
     return networks
+
+
+def machine_names(extra: list[str] | None = None) -> set[str]:
+    """The names this panel answers to, besides any IP address: this
+    machine's own, and whatever `--host-name` adds (a domain, once there is
+    one)."""
+    names = {"localhost"}
+    try:
+        own = socket.gethostname().lower().rstrip(".")
+        names |= {own, own.split(".")[0], f"{own.split('.')[0]}.local",
+                  socket.getfqdn().lower().rstrip(".")}
+    except OSError:
+        pass
+    names |= {str(n).strip().lower().rstrip(".") for n in (extra or [])
+              if str(n).strip()}
+    names.discard("")
+    return names
+
+
+def host_allowed(header: str | None, names: set[str]) -> bool:
+    """Whether a request's Host header names this panel.
+
+    A browser page from anywhere can make its own domain resolve to this
+    machine (DNS rebinding) and then read the answers as its own; it cannot
+    make the browser send this machine's name or address as the Host. A
+    request with no Host at all is no browser's, and passes.
+    """
+    host = str(header or "").strip().lower()
+    if not host:
+        return True
+    if host.startswith("["):                       # [v6]:port
+        host = host[1:host.find("]")] if "]" in host else ""
+    elif host.count(":") == 1:
+        host = host.split(":")[0]
+    host = host.rstrip(".")
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return host in names
 
 
 def address_allowed(address: str, networks: list) -> bool:
@@ -164,13 +228,95 @@ def list_ports(kind: str = "all", include_phantom: bool = False) -> dict:
     return {"ports": found, "hidden": hidden}
 
 
+_loopback = authmod._loopback
+
+
+def _client_key(client_address) -> str:
+    """Whom a connection is counted against: its address, with the whole of
+    loopback (127.0.0.0/8, ::1) as one -- a local process must not multiply
+    its share by connecting from 127.0.0.2, .3, ..."""
+    address = str(client_address[0]) if client_address else ""
+    return "loopback" if _loopback(address) else address
+
+
+class Server(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a bound on the threads connections may take.
+
+    The standard server starts a thread for every connection, without limit.
+    A connection over MAX_CONNECTIONS, or over MAX_CONNECTIONS_PER_ADDRESS
+    from one client, is closed at once instead.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._count_lock = threading.Lock()
+        self._open: dict[str, int] = {}
+        self.refused = 0
+        self._reported = -60.0
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        address = _client_key(client_address)
+        local = address == "loopback"
+        with self._count_lock:
+            total = sum(n for a, n in self._open.items() if a != "loopback")
+            if (total >= MAX_CONNECTIONS and not local) or \
+                    self._open.get(address, 0) >= MAX_CONNECTIONS_PER_ADDRESS:
+                self.refused += 1
+                admitted = False
+                # Said on stderr, the first time and then once a minute.
+                now = time.monotonic()
+                report = now - self._reported >= 60.0
+                if report:
+                    self._reported = now
+            else:
+                self._open[address] = self._open.get(address, 0) + 1
+                admitted = True
+        if not admitted:
+            if report:
+                sys.stderr.write(
+                    f"  !! connection from {address} turned away: "
+                    f"{self.refused} so far ({total} open, "
+                    f"{self._open.get(address, 0)} from that address)\n")
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
+                                b"Content-Length: 0\r\nConnection: close\r\n"
+                                b"Retry-After: 5\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._closed(address)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._closed(_client_key(client_address))
+
+    def _closed(self, address: str) -> None:
+        with self._count_lock:
+            left = self._open.get(address, 0) - 1
+            if left > 0:
+                self._open[address] = left
+            else:
+                self._open.pop(address, None)
+
+
 class Application:
     """Everything the request handler needs, assembled once at startup."""
 
     def __init__(self, registry, database: "dbmod.Database",
                  engine: "runs.RunEngine", auth: "authmod.Auth | None" = None,
                  history=None, supervisor=None, finder=None,
-                 chamber: dict | None = None, allow: list | None = None):
+                 chamber: dict | None = None, allow: list | None = None,
+                 hosts: set[str] | None = None, origins: list | None = None,
+                 admin_from: list | None = None):
         self.registry = registry
         self.db = database
         self.engine = engine
@@ -182,6 +328,14 @@ class Application:
                                    "name": self.auth.chamber}
         #: Networks allowed to reach the panel at all; empty allows any.
         self.allow = allow or []
+        #: Names the panel answers to besides IP addresses (host_allowed).
+        self.hosts = hosts if hosts is not None else machine_names()
+        #: Other origins a panel may be served from and still use this API
+        #: (--allow-origin). Same-origin requests need nothing.
+        self.origins = {str(o).rstrip("/").lower() for o in (origins or [])}
+        #: Networks from which what only an admin may do is accepted
+        #: (--admin-from); empty accepts any. Loopback always may.
+        self.admin_from = admin_from or []
         #: The rolling chart recorder, or None if this server keeps none.
         self.history = history
         #: Alarms and the automatic safe state after a fault, or None.
@@ -192,6 +346,9 @@ class Application:
         #: Fingerprint of web/ when this server started (see web_build).
         self.build = web_build()
         self._export_dir = tempfile.mkdtemp(prefix="vacuum-lab-export-")
+        #: One download built at a time: each reads the whole store, and two
+        #: at once double the memory and the disk the rig shares with them.
+        self.export_slot = threading.BoundedSemaphore(1)
 
     #: The longest an orderly shutdown may take, all of it. Below the unit's
     #: TimeoutStopSec (90 s), so systemd never kills the process in the
@@ -316,11 +473,19 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write(f"  {self.address_string()} {fmt % args}\n")
 
     def _cors(self):
-        # Permissive on purpose: the panel may be opened from another machine
-        # and pointed here. That is safe because the session travels in a
-        # header that no other page can read, never in a cookie a browser
-        # would attach to somebody else's request.
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # The ping is open to any page: it says only what a sign-in page and
+        # the kiosk need. Everything else answers another origin only if it
+        # was named with --allow-origin -- a panel opened elsewhere and
+        # pointed here. The session travels in a header no other page can
+        # read, never in a cookie, so this is a second wall, not the first.
+        origin = (self.headers.get("Origin") or "").rstrip("/").lower()
+        if urlparse(self.path).path == "/api/ping":
+            self.send_header("Access-Control-Allow-Origin", "*")
+        elif origin and origin in self.app.origins:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        else:
+            return
         self.send_header("Access-Control-Allow-Headers",
                          "Content-Type, Authorization")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -403,12 +568,48 @@ class Handler(BaseHTTPRequestHandler):
         return str(self.client_address[0]) if self.client_address else ""
 
     def _reachable(self) -> bool:
-        """Refuse a client outside --allow-from before anything else."""
-        if address_allowed(self._address(), self.app.allow):
+        """Refuse a client outside --allow-from, or a request naming another
+        host, before anything else."""
+        if not address_allowed(self._address(), self.app.allow):
+            self._json({"ok": False, "error": "This panel only answers the lab "
+                                              "network."}, 403)
+            return False
+        if not host_allowed(self.headers.get("Host"), self.app.hosts):
+            self._json({"ok": False, "error": "This panel does not answer to "
+                                              "that name."}, 421)
+            return False
+        return True
+
+    def _same_site(self) -> bool:
+        """A POST carrying an Origin must come from this panel's own pages
+        or from one named with --allow-origin."""
+        origin = (self.headers.get("Origin") or "").rstrip("/").lower()
+        if not origin:
+            return True                    # not sent by a browser page
+        if origin in self.app.origins:
             return True
-        self._json({"ok": False, "error": "This panel only answers the lab "
+        host = (self.headers.get("Host") or "").strip().lower()
+        return bool(host) and urlparse(origin).netloc == host
+
+    def _admin_reachable(self) -> bool:
+        """Whether what only an admin may do is accepted from this client
+        (--admin-from). Loopback always is."""
+        return address_allowed(self._address(), self.app.admin_from)
+
+    def _admin_refused(self) -> bool:
+        """Send the refusal and say so, if this client may not administer."""
+        if self._admin_reachable():
+            return False
+        self._json({"ok": False, "error": "This is only done from the lab's own "
                                           "network."}, 403)
-        return False
+        return True
+
+    def _who(self) -> "authmod.Principal":
+        """Who sent this request: the resolved principal; the local owner
+        only with accounts off; otherwise nobody at all, never the owner."""
+        if self.principal is not None:
+            return self.principal
+        return authmod.LOCAL if not self.app.auth.enabled else NOBODY
 
     def _principal(self) -> "authmod.Principal | None":
         header = self.headers.get("Authorization", "")
@@ -461,7 +662,7 @@ class Handler(BaseHTTPRequestHandler):
     def _audit(self, message: str, level: str = "action",
                detail: dict | None = None) -> None:
         """Put an action in the rig's record under the name of who took it."""
-        who = self.principal or authmod.LOCAL
+        who = self._who()
         self._record(self.app.engine.run_id(), level, f"{who.name}: {message}",
                      detail, user=who.username)
 
@@ -473,6 +674,26 @@ class Handler(BaseHTTPRequestHandler):
             return int(self._query().get(key, [default])[0])
         except (TypeError, ValueError):
             return default
+
+    def _fresh(self, who: "authmod.Principal") -> bool:
+        """Whether to read the drive now rather than serve a kept reading:
+        asked for, by somebody who may operate. Every such read holds the
+        serial line the pump's safety readings come through, so a viewer --
+        or a script on a shared login -- gets the kept one."""
+        return bool(self._int("fresh", 0)) and (
+            not self.app.auth.enabled or who.at_least("operator"))
+
+    def _limit(self, key: str, default: int) -> int:
+        """A row count from the query, within 1..MAX_LIST."""
+        return max(1, min(self._int(key, default), MAX_LIST))
+
+    def _stats(self, principal: "authmod.Principal") -> dict:
+        """The store's figures. Where the file lives is the machine's
+        business: shown to an admin, not to everyone who may watch."""
+        stats = self.app.db.stats()
+        if self.app.auth.enabled and not principal.at_least("admin"):
+            stats.pop("path", None)
+        return stats
 
     def _float(self, key: str, default: float | None) -> float | None:
         try:
@@ -542,10 +763,13 @@ class Handler(BaseHTTPRequestHandler):
         # The controller's own polling is what keeps control alive.
         self.app.auth.renew(principal)
 
-        if route in ADMIN_GETS:
-            refusal = self._check(principal, "admin", False)
-            if refusal:
-                self._refused(refusal)
+        if route in ADMIN_GETS or route == "/api/users":
+            if route in ADMIN_GETS:
+                refusal = self._check(principal, "admin", False)
+                if refusal:
+                    self._refused(refusal)
+                    return
+            if self._admin_refused():
                 return
         if route == "/api/me":
             self._json({"ok": True, "me": self.app.auth.me(principal),
@@ -578,11 +802,11 @@ class Handler(BaseHTTPRequestHandler):
                 {"ok": True, "equipment": self.app.engine.equipment_report()}),
             "/api/trends": lambda: self._json(self.app.trends()),
             "/api/stats": lambda: self._json(
-                {"ok": True, "stats": self.app.db.stats(),
+                {"ok": True, "stats": self._stats(principal),
                  "devices": self.app.db.devices()}),
             "/api/events": lambda: self._json(
                 {"ok": True, "events": self.app.db.events(
-                    limit=self._int("limit", 200))}),
+                    limit=self._limit("limit", 200))}),
             "/api/ports": lambda: self._json(
                 {"ok": True,
                  "kind": (self._query().get("kind") or ["all"])[0],
@@ -618,6 +842,10 @@ class Handler(BaseHTTPRequestHandler):
         route = urlparse(self.path).path
         if not self._reachable():
             return
+        if not self._same_site():
+            self._json({"ok": False, "error": "Refused: sent from another "
+                                              "site's page."}, 403)
+            return
         payload = self._body()
         if payload is None:
             return
@@ -641,6 +869,8 @@ class Handler(BaseHTTPRequestHandler):
         refusal = self._check(principal, minimum, control)
         if refusal:
             self._refused(refusal)
+            return
+        if minimum == "admin" and self._admin_refused():
             return
         # Doing something on purpose is a touch: it keeps the session awake.
         self.app.auth.mark_active(principal)
@@ -846,18 +1076,27 @@ class Handler(BaseHTTPRequestHandler):
     def _public_post(self, route: str, payload: dict) -> None:
         auth = self.app.auth
         agent = self.headers.get("User-Agent", "")
-        if route == "/api/login":
-            result = auth.login(str(payload.get("username", "")),
-                                str(payload.get("password", "")),
-                                self._address(), agent)
-        elif route == "/api/signup":
-            result = auth.signup(str(payload.get("username", "")),
-                                 str(payload.get("name", "")),
-                                 str(payload.get("password", "")),
-                                 str(payload.get("note", "")), self._address())
-        else:
-            result = auth.pair(str(payload.get("code", "")), self._address(),
-                               agent)
+        try:
+            if route == "/api/login":
+                # A paired tablet sends its own session along: the person
+                # signing in on it is signed out again when idle.
+                device = payload.get("device")
+                result = auth.login(str(payload.get("username", "")),
+                                    str(payload.get("password", "")),
+                                    self._address(), agent,
+                                    device_token=device
+                                    if isinstance(device, str) else None)
+            elif route == "/api/signup":
+                result = auth.signup(str(payload.get("username", "")),
+                                     str(payload.get("name", "")),
+                                     str(payload.get("password", "")),
+                                     str(payload.get("note", "")),
+                                     self._address())
+            else:
+                result = auth.pair(str(payload.get("code", "")),
+                                   self._address(), agent)
+        except authmod.Busy as busy:
+            result = authmod.refusal(str(busy), 503, retry_after=2)
         if result.get("ok"):
             self._json(result)
         else:
@@ -875,19 +1114,44 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 return -1
 
+        if route.startswith(("/api/users/", "/api/devices/",
+                             "/api/role-requests/decide")) \
+                and self._admin_refused():
+            return
+        try:
+            result = self._account_action(route, payload, principal, number)
+        except authmod.Busy as busy:
+            result = authmod.refusal(str(busy), 503, retry_after=2)
+        if result.get("ok") and route.startswith(
+                ("/api/users/", "/api/devices/", "/api/role-requests")):
+            # Administering is a deliberate touch, like any other action.
+            auth.mark_active(principal)
+        if result.get("ok"):
+            self._json(result)
+        else:
+            self._refused(result)
+
+    def _account_action(self, route: str, payload: dict,
+                        principal: "authmod.Principal", number) -> dict:
+        auth = self.app.auth
         if route == "/api/logout":
             result = auth.logout(principal)
         elif route == "/api/session/touch":
             result = {"ok": True, "active": auth.mark_active(principal),
                       "me": auth.me(principal)}
         elif route == "/api/session/reauth":
-            result = auth.reauth(principal, str(payload.get("password", "")))
+            result = auth.reauth(principal, str(payload.get("password", "")),
+                                 self._address())
         elif route == "/api/me/password":
             result = auth.change_password(principal,
                                           str(payload.get("current", "")),
-                                          str(payload.get("new", "")))
+                                          str(payload.get("new", "")),
+                                          self._address())
         elif route == "/api/control/take":
-            if principal.must_change:
+            if payload.get("force") and not self._admin_reachable():
+                result = authmod.refusal("Taking control over is only done from "
+                                         "the lab's own network.", 403)
+            elif principal.must_change:
                 result = authmod.refusal("Choose a new password first.", 403,
                                          must_change=True)
             else:
@@ -915,7 +1179,8 @@ class Handler(BaseHTTPRequestHandler):
             result = auth.reset_password(principal, number("id"))
         elif route == "/api/users/transfer-owner":
             result = auth.transfer_owner(principal, number("id"),
-                                         str(payload.get("password", "")))
+                                         str(payload.get("password", "")),
+                                         self._address())
         elif route == "/api/devices/add":
             result = auth.create_device(principal, str(payload.get("label", "")))
         elif route == "/api/devices/code":
@@ -924,10 +1189,7 @@ class Handler(BaseHTTPRequestHandler):
             result = auth.remove_device(principal, number("id"))
         else:
             result = authmod.refusal("not found", 404)
-        if result.get("ok"):
-            self._json(result)
-        else:
-            self._refused(result)
+        return result
 
     # --- route groups -----------------------------------------------------
 
@@ -946,8 +1208,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "device": device.snapshot()})
         elif view == "accessories" and hasattr(device, "accessories"):
             # What this person may write: the panel greys out the rest.
-            report = device.accessories()
-            who = self.principal or authmod.LOCAL
+            who = self._who()
+            report = device.accessories(fresh=self._fresh(who))
             if report.get("ok") and not who.at_least("admin"):
                 report["writable"] = sorted(set(report.get("writable", []))
                                             & OPERATOR_WRITES)
@@ -955,7 +1217,7 @@ class Handler(BaseHTTPRequestHandler):
         elif view == "details" and hasattr(device, "details"):
             self._json(device.details())
         elif view == "diagnostics" and hasattr(device, "diagnostics"):
-            self._json(device.diagnostics())
+            self._json(device.diagnostics(fresh=self._fresh(self._who())))
         else:
             self._json({"ok": False,
                         "error": f"{key} has no view {view!r}"}, 404)
@@ -967,8 +1229,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({
                 "ok": True,
                 "runs": self.app.db.runs(
-                    limit=self._int("limit", 100),
-                    offset=self._int("offset", 0),
+                    limit=self._limit("limit", 100),
+                    offset=max(0, self._int("offset", 0)),
                     procedure=(self._query().get("procedure") or [None])[0],
                     status=(self._query().get("status") or [None])[0],
                     search=(self._query().get("search") or [None])[0],
@@ -1015,13 +1277,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True,
                         "events": self.app.db.events(run_id, limit=5000)})
         elif view in ("export.csv", "csv"):
-            result = export.run_csv(self.app.db, run_id)
-            if result:
-                self._download(*result, "text/csv")
+            self._one_export(lambda: self._download(
+                *export.run_csv(self.app.db, run_id), "text/csv"))
         elif view in ("export.json", "json"):
-            result = export.run_json(self.app.db, run_id)
-            if result:
-                self._download(*result, "application/json")
+            self._one_export(lambda: self._download(
+                *export.run_json(self.app.db, run_id), "application/json"))
         else:
             self._json({"ok": False, "error": f"no view {view!r}"}, 404)
 
@@ -1035,16 +1295,36 @@ class Handler(BaseHTTPRequestHandler):
         action = parts[3] if len(parts) > 3 else "update"
 
         if action == "update":
+            def bounded(key: str, limit: int):
+                value = payload.get(key)
+                return None if value is None else str(value)[:limit]
+            before = self.app.db.run(run_id)
             updated = self.app.db.update_run(
                 run_id,
-                name=payload.get("name"),
-                operator=payload.get("operator"),
-                notes=payload.get("notes"),
+                name=bounded("name", RUN_NAME_MAX),
+                operator=bounded("operator", RUN_OPERATOR_MAX),
+                notes=bounded("notes", RUN_NOTES_MAX),
             )
             if updated is None:
                 self._json({"ok": False, "error": f"no run {run_id}"}, 404)
-            else:
-                self._json({"ok": True, "run": updated})
+                return
+            # A run's record is evidence: who changed its name, operator or
+            # notes, and from what, is kept in the rig's log.
+            def short(text):
+                text = "" if text is None else str(text)
+                return text if len(text) <= 200 else text[:200] + "..."
+            changed = {key: {"from": short((before or {}).get(key)),
+                             "to": short(updated.get(key))}
+                       for key in ("name", "operator", "notes")
+                       if (before or {}).get(key) != updated.get(key)}
+            if changed:
+                who = self._who()
+                self._record(None, "info",
+                             f"{who.name}: edited the {', '.join(changed)} of "
+                             f"run {run_id}",
+                             {"run": run_id, "changes": changed},
+                             user=who.username)
+            self._json({"ok": True, "run": updated})
         elif action == "delete":
             if not payload.get("confirm"):
                 self._json({"ok": False,
@@ -1058,7 +1338,7 @@ class Handler(BaseHTTPRequestHandler):
             # Kept in the rig's log, not the run's, which is now gone -- with
             # what it still owed, which nothing will try again.
             record = outcome.get("record") or {}
-            who = self.principal or authmod.LOCAL
+            who = self._who()
             owed = (record.get("result") or {}).get("cleanup_pending") is True
             self._record(
                 None, "warning",
@@ -1070,25 +1350,42 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"ok": False, "error": f"no action {action!r}"}, 404)
 
+    def _one_export(self, build) -> None:
+        """Build one download, waiting for any other being built."""
+        slot = self.app.export_slot
+        if not slot.acquire(timeout=EXPORT_WAIT_S):
+            self._json({"ok": False, "error": "Another download is being "
+                                              "prepared. Try again in a "
+                                              "moment."}, 429)
+            return
+        try:
+            build()
+        finally:
+            slot.release()
+
     def _export_get(self, route: str):
         name = route.rsplit("/", 1)[-1]
-        if name == "runs.csv":
-            self._download(*export.index_csv(self.app.db), "text/csv")
-        elif name == "runs.json":
-            self._download(*export.index_json(self.app.db), "application/json")
-        elif name == "archive.json":
-            self._download(*export.bundle_json(self.app.db), "application/json")
-        elif name == "database.db":
-            filename, path = export.database_snapshot(
-                self.app.db, self.app._export_dir)
-            self._download_file(filename, path, "application/vnd.sqlite3")
-        else:
+        db, folder = self.app.db, self.app._export_dir
+        builders = {
+            "runs.csv": lambda: self._download(*export.index_csv(db),
+                                               "text/csv"),
+            "runs.json": lambda: self._download(*export.index_json(db),
+                                                "application/json"),
+            "archive.json": lambda: self._download_file(
+                *export.bundle_json(db, folder), "application/json"),
+            "database.db": lambda: self._download_file(
+                *export.database_snapshot(db, folder),
+                "application/vnd.sqlite3"),
+        }
+        if name not in builders:
             self._json({"ok": False, "error": f"no export {name!r}"}, 404)
+            return
+        self._one_export(builders[name])
 
     def _command(self, payload: dict):
         key = str(payload.get("device", "pump"))
         action = str(payload.get("action", ""))
-        who = self.principal or authmod.LOCAL
+        who = self._who()
         raw = payload.get("override")
         overriding = raw not in (None, False)
 
@@ -1129,8 +1426,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
         # The drive's own protections and settings are an admin's to change;
         # an operator keeps the pump's heater, for a bake-out.
+        if overriding and self._admin_refused():
+            return
         if action == "param":
             name = str((payload.get("value") or {}).get("name", ""))
+            if name not in OPERATOR_WRITES and self._admin_refused():
+                return
             if name not in OPERATOR_WRITES and not who.at_least("admin"):
                 self._json({"ok": False,
                             "error": f"{name} is one of the drive's own "

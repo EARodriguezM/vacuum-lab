@@ -46,6 +46,11 @@ const MOVED = { pump: "equipment/pump", gauge: "equipment/gauge" };
 // person using the panel never meets the idle prompt (lab/auth.py IDLE_S).
 const TOUCH_EVERY_MS = 60000;
 
+/** What a paired tablet says when it signs a person out for walking away. */
+const idleMessage = (me) =>
+  `Signed out after ${Math.round((me?.idle_after_s || 900) / 60)} min without a touch. ` +
+  "The tablet keeps watching.";
+
 const NO_LIVE = { runId: null, samples: [], lastT: null, fullAt: 0 };
 
 function applyTheme(theme) {
@@ -290,7 +295,14 @@ function App() {
 
   useEffect(() => { api.ping().then(setPing).catch(() => {}); }, [held]);
 
-  useEffect(() => onSessionChange((next) => {
+  useEffect(() => onSessionChange((next, reason) => {
+    // A person's session ended under them -- whichever request found out
+    // first -- on a browser that keeps watching as a paired tablet.
+    if (reason === "ended" && next.device) {
+      const last = stateRef.current?.me;
+      notify(last?.kind === "person" && last.idle_in_s != null && last.idle_in_s <= 10
+        ? idleMessage(last) : "Signed out. The tablet keeps watching.", "ok");
+    }
     setHeld({ ...next });
     setNeedLogin(false);
     setShowLogin(false);
@@ -324,10 +336,13 @@ function App() {
         api.touch().catch(() => {});
       }
     };
-    window.addEventListener("pointerdown", touched, { passive: true });
+    // A click, not a pointerdown: the kiosk taps itself after every load
+    // to unlock sound -- a press it cancels, which never makes a click --
+    // and that must not keep an abandoned session awake.
+    window.addEventListener("click", touched, { passive: true, capture: true });
     window.addEventListener("keydown", touched);
     return () => {
-      window.removeEventListener("pointerdown", touched);
+      window.removeEventListener("click", touched, { capture: true });
       window.removeEventListener("keydown", touched);
     };
   }, []);
@@ -335,12 +350,13 @@ function App() {
   // On a paired tablet a person who walks away is signed out altogether, and
   // the tablet goes back to watching. On a personal phone the session stays,
   // watching, and asks for the password before acting (the server's rule).
+  // The server ends such a session itself once it is idle; this covers one
+  // signed in before it did, and goes by the server's idea of idle, not by
+  // a clock in this page that every reload would restart.
   const signOutIfAbandoned = (me) => {
     const tokens = sessionTokens();
     if (!tokens.device || !tokens.person || me?.kind !== "person") return;
-    if (Date.now() - touchRef.current.last > (me.idle_after_s || 900) * 1000) {
-      signOut("Signed out after a quarter of an hour without a touch. The tablet keeps watching.");
-    }
+    if (me.idle) signOut(idleMessage(me));
   };
 
   // --- polling --------------------------------------------------------------

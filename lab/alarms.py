@@ -622,9 +622,25 @@ class Supervisor:
                          f" Not confirmed: {result.get('error')}."),
                       {"result": result})
 
-        self._recovery_thread = threading.Thread(target=work, name="auto-recovery",
-                                                 daemon=True)
-        self._recovery_thread.start()
+        thread = threading.Thread(target=work, name="auto-recovery",
+                                  daemon=True)
+        try:
+            thread.start()
+        except RuntimeError as exc:
+            # No thread to be had -- the process is at its task limit. The
+            # pump is made safe all the same, here on the watcher's thread:
+            # alarms wait for one sequence, a faulted pump does not wait.
+            self.raise_alarm(
+                "recovery_thread", "critical",
+                "Automatic recovery ran without its own thread",
+                f"The panel could not start a thread ({exc}): too many "
+                f"connections or threads at once. The pump is being made safe "
+                f"anyway; check the Pump page, and who is connecting to the "
+                f"panel.")
+            self._recovery_thread = None
+            work()
+            return
+        self._recovery_thread = thread
 
     def _watch_orphans(self) -> None:
         """A run cut off by a crash or a power cut, found at startup."""

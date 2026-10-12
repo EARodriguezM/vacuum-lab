@@ -56,6 +56,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import math
 import re
 import secrets
@@ -83,6 +84,29 @@ ACTIVE_WRITE_S = 30.0
 
 #: scrypt cost: 16 MB of memory per guess, whoever is guessing.
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
+#: How many passwords are hashed at once, whoever sent them. Every sign-in
+#: costs 16 MB before any password is known to be right; without a bound, a
+#: burst of sign-ins from the network takes the memory the rig runs in.
+SCRYPT_AT_ONCE = 2
+#: How long a sign-in waits for its turn before being told to try again.
+SCRYPT_WAIT_S = 5.0
+_scrypt_slots = threading.BoundedSemaphore(SCRYPT_AT_ONCE)
+
+#: A person signed in on a paired tablet stays signed in at most this long,
+#: and is signed out -- the session deleted -- once it goes idle.
+TABLET_SESSION_S = 8 * 3600
+#: Password checks (each one scrypt) one address, or one account, may ask
+#: for per minute -- right or wrong. Failures are throttled on their own;
+#: this keeps one client, even with the right password, from holding the
+#: hashing slots and turning everybody else away as busy.
+HASHES_PER_MINUTE = 10
+#: How long ago a last touch dated in the future counts as: long enough to
+#: be idle under any limit, finite so that it still goes into JSON.
+FUTURE_TOUCH_S = float(SESSION_S)
+#: How often the clock's synchronisation is asked again.
+CLOCK_CHECK_S = 30.0
+#: The wall clock's high-water mark is written back at most this often.
+HIGH_WATER_WRITE_S = 30.0
 
 MIN_PASSWORD = 8
 MAX_PASSWORD = 128
@@ -101,10 +125,27 @@ def _b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+class Busy(RuntimeError):
+    """Too many passwords are being checked at once; the caller answers 503."""
+
+
+def _scrypt(password: str, salt: bytes, n: int, r: int, p: int,
+            dklen: int) -> bytes:
+    """hashlib.scrypt, at most SCRYPT_AT_ONCE at a time; Busy if no turn
+    comes within SCRYPT_WAIT_S."""
+    if not _scrypt_slots.acquire(timeout=SCRYPT_WAIT_S):
+        raise Busy("The server is busy checking other passwords. Try again "
+                   "in a moment.")
+    try:
+        return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r,
+                              p=p, dklen=dklen)
+    finally:
+        _scrypt_slots.release()
+
+
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
-    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=SCRYPT_N,
-                            r=SCRYPT_R, p=SCRYPT_P, dklen=32)
+    digest = _scrypt(password, salt, SCRYPT_N, SCRYPT_R, SCRYPT_P, 32)
     return f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}${_b64(salt)}${_b64(digest)}"
 
 
@@ -114,9 +155,8 @@ def verify_password(password: str, stored: str) -> bool:
         if scheme != "scrypt":
             return False
         expected = base64.b64decode(digest)
-        actual = hashlib.scrypt(password.encode("utf-8"),
-                                salt=base64.b64decode(salt), n=int(n), r=int(r),
-                                p=int(p), dklen=len(expected))
+        actual = _scrypt(password, base64.b64decode(salt), int(n), int(r),
+                         int(p), len(expected))
     except (ValueError, TypeError):
         return False
     return hmac.compare_digest(actual, expected)
@@ -155,6 +195,86 @@ def check_password(password: str, username: str = "") -> str | None:
     if username and password.strip().lower() == username.lower():
         return "The password cannot be the username."
     return None
+
+
+def clock_synchronised() -> bool:
+    """Whether the kernel says network time is keeping the wall clock right.
+
+    adjtimex(2) with nothing to change only reads the clock's state, which
+    is TIME_ERROR (5) while no time service has disciplined it -- whichever
+    one runs, timesyncd or chrony. Anything else that goes wrong (not Linux,
+    no libc) counts as not synchronised: the cautious answer.
+    """
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        # Larger than struct timex on any architecture, and zeroed, so its
+        # `modes` is 0: nothing is set, the state is only read.
+        buffer = ctypes.create_string_buffer(1024)
+        state = libc.adjtimex(buffer)
+    except Exception:
+        return False
+    return state in (0, 1, 2, 3, 4)        # TIME_OK .. TIME_WAIT
+
+
+def _loopback(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
+
+
+class Budget:
+    """At most `count` uses per key in any `window` seconds."""
+
+    def __init__(self, count: int, window: float = 60.0):
+        self.count = count
+        self.window = window
+        self._lock = threading.Lock()
+        self._used: dict[str, list[float]] = {}
+
+    def wait(self, *keys: str) -> float:
+        """The seconds until every key has a use left; 0 now. Counts nothing."""
+        now = time.monotonic()
+        with self._lock:
+            longest = 0.0
+            for key in keys:
+                times = [t for t in self._used.get(key, [])
+                         if now - t < self.window]
+                if len(times) >= self.count:
+                    longest = max(longest, self.window - (now - times[0]))
+            return max(0.1, longest) if longest > 0 else 0.0
+
+    def give_back(self, *keys: str) -> None:
+        """Return the use `take` last counted under each key."""
+        with self._lock:
+            for key in keys:
+                times = self._used.get(key)
+                if times:
+                    times.pop()
+
+    def take(self, *keys: str) -> float:
+        """0, with one use counted under every key; or the seconds to wait,
+        with nothing counted."""
+        now = time.monotonic()
+        with self._lock:
+            recent = {key: [t for t in self._used.get(key, [])
+                            if now - t < self.window] for key in keys}
+            full = [times for times in recent.values()
+                    if len(times) >= self.count]
+            if full:
+                return max(0.1, max(self.window - (now - times[0])
+                                    for times in full))
+            for key, times in recent.items():
+                times.append(now)
+                self._used[key] = times
+            if len(self._used) > 5000:          # bounded under a flood
+                self._used = {k: v for k, v in self._used.items()
+                              if v and now - v[-1] < self.window}
+            return 0.0
 
 
 # --- who is asking ---------------------------------------------------------
@@ -209,35 +329,77 @@ class Throttle:
     FREE = 5
     BASE_S = 30.0
     MAX_S = 15 * 60.0
+    #: Attempts under one key that may be checked at the same time. A failure
+    #: is only counted once its password has been checked, so without this
+    #: a burst sent in parallel would all pass `wait` before any counted.
+    AT_ONCE = 2
+    #: What a caller over AT_ONCE is told to wait.
+    BUSY_S = 2.0
 
     def __init__(self):
         self._lock = threading.Lock()
         self._failures: dict[str, tuple[int, float]] = {}
+        self._flight: dict[str, int] = {}
 
-    def wait(self, *keys: str) -> float:
-        now = time.monotonic()
+    def _owed(self, keys, now: float) -> float:
+        """The longest wait any of `keys` still owes. Caller holds the lock."""
         longest = 0.0
-        with self._lock:
-            for key in keys:
-                count, last = self._failures.get(key, (0, 0.0))
-                if count < self.FREE:
-                    continue
-                delay = min(self.BASE_S * 2 ** (count - self.FREE), self.MAX_S)
-                longest = max(longest, last + delay - now)
+        for key in keys:
+            count, last = self._failures.get(key, (0, 0.0))
+            if count < self.FREE:
+                continue
+            delay = min(self.BASE_S * 2 ** (count - self.FREE), self.MAX_S)
+            longest = max(longest, last + delay - now)
         return max(0.0, longest)
 
-    def fail(self, *keys: str) -> None:
-        now = time.monotonic()
+    def wait(self, *keys: str) -> float:
+        with self._lock:
+            return self._owed(keys, time.monotonic())
+
+    def begin(self, *keys: str) -> float:
+        """Start one attempt: 0 with it counted as in flight under every key,
+        or the seconds to wait first, with nothing started. Every 0 must be
+        followed by `end`."""
+        with self._lock:
+            owed = self._owed(keys, time.monotonic())
+            if owed > 0:
+                return owed
+            if any(self._flight.get(key, 0) >= self.AT_ONCE for key in keys):
+                return self.BUSY_S
+            for key in keys:
+                self._flight[key] = self._flight.get(key, 0) + 1
+            return 0.0
+
+    def end(self, *keys: str, failed: bool) -> None:
+        """Finish an attempt `begin` started, counting it if it failed --
+        both under one lock, so no attempt slips in between the slot being
+        freed and the failure being counted."""
         with self._lock:
             for key in keys:
-                count, last = self._failures.get(key, (0, 0.0))
-                if now - last > 2 * self.MAX_S:
-                    count = 0
-                self._failures[key] = (count + 1, now)
-            if len(self._failures) > 5000:        # bounded under a flood
-                cutoff = now - 2 * self.MAX_S
-                self._failures = {k: v for k, v in self._failures.items()
-                                  if v[1] > cutoff}
+                left = self._flight.get(key, 0) - 1
+                if left > 0:
+                    self._flight[key] = left
+                else:
+                    self._flight.pop(key, None)
+            if failed:
+                self._fail(keys)
+
+    def fail(self, *keys: str) -> None:
+        with self._lock:
+            self._fail(keys)
+
+    def _fail(self, keys) -> None:
+        """Count one failure under each key. Caller holds the lock."""
+        now = time.monotonic()
+        for key in keys:
+            count, last = self._failures.get(key, (0, 0.0))
+            if now - last > 2 * self.MAX_S:
+                count = 0
+            self._failures[key] = (count + 1, now)
+        if len(self._failures) > 5000:        # bounded under a flood
+            cutoff = now - 2 * self.MAX_S
+            self._failures = {k: v for k, v in self._failures.items()
+                              if v[1] > cutoff}
 
     def clear(self, *keys: str) -> None:
         with self._lock:
@@ -269,6 +431,12 @@ class Auth:
         #: Returns the username that started the run in progress, or None.
         self.runner = runner
         self.throttle = Throttle()
+        #: Password checks per address and per account, right or wrong.
+        self.hashes = Budget(HASHES_PER_MINUTE)
+        #: Whether network time keeps the wall clock right (replaceable, for
+        #: the tests); asked at most every CLOCK_CHECK_S.
+        self.clock_check = clock_synchronised
+        self._clock_checked: tuple[float, bool] | None = None
         self._lock = threading.RLock()
         self._control: dict | None = None
         self._pairing: dict[str, tuple[int, float]] = {}
@@ -278,6 +446,13 @@ class Auth:
         self._touched: dict[str, float] = {}
         self._written: dict[str, float] = {}
         self._dummy: str | None = None
+        #: The latest wall-clock time this rig has seen, kept across restarts
+        #: (see _wall).
+        try:
+            self._high_water = float(database.meta("wall_high_water") or 0)
+        except (TypeError, ValueError):
+            self._high_water = 0.0
+        self._high_water_written = time.monotonic() - HIGH_WATER_WRITE_S
 
     # --- sessions -----------------------------------------------------------
 
@@ -288,6 +463,65 @@ class Auth:
         except Exception:
             running = None
         return self.run_idle_s if running and running == username else self.idle_s
+
+    def _wall(self) -> float:
+        """The wall clock, never earlier than the latest time already seen.
+
+        A Raspberry Pi boots with whatever time it had when it lost power,
+        until the network corrects it. Measured on that clock, a session
+        touched just before a reboot would look fresh for as long as the
+        clock is behind. Only the idle timer uses this: if the clock was ever
+        set ahead, sessions need their password once more after a restart
+        until real time catches up -- the safe direction -- while expiry keeps
+        the plain clock, which a stuck mark could otherwise end for everyone.
+        """
+        now = time.time()
+        if now > self._high_water:
+            self._high_water = now
+            mono = time.monotonic()
+            if mono - self._high_water_written >= HIGH_WATER_WRITE_S:
+                self._high_water_written = mono
+                try:
+                    self.db.set_meta("wall_high_water", repr(now))
+                except Exception:
+                    pass
+        return self._high_water
+
+    def _clock_trusted(self) -> bool:
+        mono = time.monotonic()
+        checked = self._clock_checked
+        if checked is None or mono - checked[0] > CLOCK_CHECK_S:
+            try:
+                trusted = bool(self.clock_check())
+            except Exception:
+                trusted = False
+            checked = self._clock_checked = (mono, trusted)
+        return checked[1]
+
+    def _write(self, what: str, write) -> None:
+        """A session's bookkeeping write. A failure -- a full SD card -- is
+        said on stderr and never raised: it must not cost a Stop or a Make
+        safe its answer, and every request resolves its session first."""
+        try:
+            write()
+        except Exception as exc:
+            sys.stderr.write(f"  !! could not record {what} ({exc})\n")
+
+    def _hash_budget(self, *keys: str) -> dict | None:
+        """The refusal once these keys have asked for too many password
+        checks this minute, or None (and the check counted). Loopback has
+        no address budget: it is the kiosk tablet on its cable, where one
+        person after another signs in, and the machine itself."""
+        keys = tuple(k for k in keys if not (k.startswith("addr:")
+                                             and _loopback(k[5:])))
+        if not keys:
+            return None
+        wait = self.hashes.take(*keys)
+        if wait <= 0:
+            return None
+        seconds = math.ceil(wait)
+        return refusal(f"Too many password checks from here. Try again in "
+                       f"{seconds} s.", 429, retry_after=seconds)
 
     def resolve(self, token: str | None, address: str = "") -> Principal | None:
         """The principal behind a session token, or None if it is not valid."""
@@ -301,7 +535,7 @@ class Auth:
             return None
         now = time.time()
         if row["expires_at"] is not None and row["expires_at"] < now:
-            self.db.delete_session(hashed)
+            self._end_session(hashed)
             return None
         user = self.db.user(row["user_id"])
         if not user or user["status"] != "active":
@@ -313,18 +547,46 @@ class Auth:
             if role is None:
                 return None
         if now - row["seen_at"] > 60:
-            self.db.touch_session(hashed, seen_at=now, address=address or None)
+            self._write("a session's last poll", lambda: self.db.touch_session(
+                hashed, seen_at=now, address=address or None))
         # Since the last touch: from memory when this process saw it, which
         # no clock correction can stretch; from the database only after a
-        # restart, and never negative.
+        # restart, and then only when network time vouches for the clock --
+        # a box that boots with the time it had when the power went cannot
+        # say how long it was off. Even then, against the high-water mark,
+        # and a touch dated after it (a clock that was ahead) counts as long
+        # ago.
         touched = self._touched.get(hashed)
-        inactive = (time.monotonic() - touched if touched is not None
-                    else max(0.0, now - row["active_at"]))
-        return Principal(user["id"], user["username"],
-                         user["display_name"] or user["username"], user["kind"],
-                         role, hashed, inactive,
-                         self.idle_limit(user["username"]),
-                         bool(user["must_change"]))
+        if touched is not None:
+            inactive = time.monotonic() - touched
+        elif not self._clock_trusted():
+            inactive = FUTURE_TOUCH_S
+        else:
+            wall = self._wall()
+            inactive = (wall - row["active_at"] if row["active_at"] <= wall
+                        else FUTURE_TOUCH_S)
+        principal = Principal(user["id"], user["username"],
+                              user["display_name"] or user["username"],
+                              user["kind"], role, hashed, inactive,
+                              self.idle_limit(user["username"]),
+                              bool(user["must_change"]))
+        # On a paired tablet, a person who walked away is signed out: the
+        # next one to pick the tablet up gets the tablet's own session, not
+        # theirs. Timed here, not in the browser, which a reload resets.
+        if row.get("device_id") is not None and principal.idle():
+            self._end_session(hashed)
+            return None
+        return principal
+
+    def _end_session(self, hashed: str) -> None:
+        # Refused from now on whether or not the row goes: if it stays, the
+        # next request finds it expired or idle again and tries once more.
+        self._write("a session ending", lambda: self.db.delete_session(hashed))
+        self._forget(hashed)
+        with self._lock:
+            holder = self._control
+            if holder and holder["session"] == hashed:
+                self._control = None
 
     def _touch(self, session: str, write: bool = False) -> None:
         """Record a deliberate touch: in memory always, in the database at
@@ -333,7 +595,9 @@ class Auth:
         self._touched[session] = mono
         if write or mono - self._written.get(session, 0.0) > ACTIVE_WRITE_S:
             self._written[session] = mono
-            self.db.touch_session(session, active_at=time.time())
+            self._write("a touch", lambda: self.db.touch_session(
+                session, active_at=time.time()))
+            self._wall()
 
     def _forget(self, session: str | None) -> None:
         self._touched.pop(session, None)
@@ -353,25 +617,68 @@ class Auth:
         self._refresh_holder(principal)
         return True
 
+    def _paired_device(self, token: str | None) -> int | None:
+        """The tablet a paired browser's own session belongs to, or None."""
+        if not token:
+            return None
+        row = self.db.session(token_hash(str(token)))
+        user = self.db.user(row["user_id"]) if row else None
+        if user and user["kind"] == "device" and user["status"] == "active":
+            return user["id"]
+        return None
+
     def login(self, username: str, password: str, address: str = "",
-              agent: str = "") -> dict:
+              agent: str = "", device_token: str | None = None) -> dict:
+        """Sign a person in. `device_token` is the session of the paired
+        tablet this is happening on, if any: the person's session is then
+        tied to it, ends when idle, and lasts TABLET_SESSION_S at most."""
         if not self.enabled:
             return {"ok": True, "token": None, "me": self.me(LOCAL)}
         name = str(username or "").strip().lower()
-        keys = (f"user:{name}", f"addr:{address}")
-        wait = self.throttle.wait(*keys)
+        # Per name *and* address: a wrong guess from elsewhere must not lock
+        # the owner out of their own account. The address key still slows
+        # one machine trying many names.
+        keys = (f"login:{name}@{address}", f"addr:{address}")
+        # Per address only: a budget kept per name would let anybody spend
+        # the owner's from elsewhere -- the lock-out the keys above avoid.
+        busy = self._hash_budget(f"addr:{address}")
+        if busy:
+            return busy
+        wait = self.throttle.begin(*keys)
         if wait > 0:
             seconds = math.ceil(wait)
             return refusal(f"Too many failed sign-ins. Try again in {seconds} s.",
                            429, retry_after=seconds)
-        user = self.db.user_by_name(name) if name else None
-        if user is None or user["kind"] != "person" or not user["password_hash"]:
-            verify_password(str(password), self._dummy_hash())   # same cost
-            self.throttle.fail(*keys)
-            return refusal("Wrong username or password.", 401)
-        if not verify_password(str(password), user["password_hash"]):
-            self.throttle.fail(*keys)
-            sys.stderr.write(f"  failed sign-in for {name!r} from {address}\n")
+        wrong = False
+        try:
+            user = self.db.user_by_name(name) if name else None
+            # Sign-ins that succeed are budgeted per account -- from loopback
+            # too, which has no address budget. Only somebody who knows the
+            # password can spend it, so it locks nobody else out.
+            # Checked before hashing, charged only for a right password: a
+            # stranger's guesses -- even ones waiting for a hashing slot --
+            # must hold none of it, or a few addresses guessing would lock
+            # the person out. Parallel sign-ins can overshoot it by the two
+            # per name and address in flight; it matters on loopback only.
+            account = f"user:{user['id']}" if user else None
+            full = self.hashes.wait(account) if account else 0.0
+            if full > 0:
+                seconds = math.ceil(full)
+                return refusal(f"Too many sign-ins to this account. Try again "
+                               f"in {seconds} s.", 429, retry_after=seconds)
+            if user is None or user["kind"] != "person" \
+                    or not user["password_hash"]:
+                verify_password(str(password), self._dummy_hash())  # same cost
+                wrong = True
+            elif not verify_password(str(password), user["password_hash"]):
+                wrong = True
+                sys.stderr.write(f"  failed sign-in for {name!r} from "
+                                 f"{address}\n")
+            else:
+                self.hashes.take(account)
+        finally:
+            self.throttle.end(*keys, failed=wrong)
+        if wrong:
             return refusal("Wrong username or password.", 401)
         self.throttle.clear(keys[0])
         if user["status"] == "pending":
@@ -384,8 +691,11 @@ class Auth:
                            "admin.", 403)
         token = new_token()
         hashed = token_hash(token)
-        self.db.create_session(hashed, user["id"], time.time() + SESSION_S,
-                               address, agent)
+        device = self._paired_device(device_token)
+        self.db.create_session(
+            hashed, user["id"],
+            time.time() + (TABLET_SESSION_S if device else SESSION_S),
+            address, agent, device_id=device)
         self.db.update_user(user["id"], last_login_at=time.time())
         # Signing in is a touch; the new row already carries the time.
         self._touched[hashed] = self._written[hashed] = time.monotonic()
@@ -398,36 +708,81 @@ class Auth:
             self._forget(principal.session)
         return {"ok": True}
 
-    def reauth(self, principal: Principal, password: str) -> dict:
-        """Type the password again to act after an idle spell."""
-        if principal.kind != "person":
-            return refusal("Only a person signs in with a password.", 403)
-        user = self.db.user(principal.user_id)
-        key = f"user:{principal.username}"
-        wait = self.throttle.wait(key)
+    def _check_own_password(self, principal: Principal, password: str,
+                            address: str) -> dict | None:
+        """The refusal if `password` is not this person's, or None.
+
+        Throttled per session -- guesses on one screen must not lock the
+        person out of signing in, or out of waking a session elsewhere --
+        and budgeted per address and per session, right or wrong. A check
+        the server was too busy to make (Busy, raised on) is not a failure.
+        """
+        key = f"session:{principal.session}"
+        wait = self.throttle.begin(key)
         if wait > 0:
             return refusal(f"Too many failed attempts. Try again in "
                            f"{math.ceil(wait)} s.", 429)
-        if not user or not verify_password(str(password), user["password_hash"]):
-            self.throttle.fail(key)
+        wrong = False
+        try:
+            # Spent only on a check that will run, and per session: somebody
+            # at an abandoned screen must not use up the account's checks on
+            # the owner's other devices.
+            busy = self._hash_budget(f"addr:{address}", key)
+            if busy:
+                return busy
+            # And per account, charged only for a right password -- which
+            # a stranger at the screen cannot spend -- so that sessions
+            # opened one after another do not multiply what one account may
+            # ask of the hashing slots (loopback has no address budget).
+            # Reserved before hashing, so checks sent in parallel cannot all
+            # pass first; given back for a wrong password or a check that
+            # never ran.
+            account = f"user:{principal.user_id}"
+            full = self.hashes.take(account)
+            if full > 0:
+                seconds = math.ceil(full)
+                return refusal(f"Too many password checks for this account. "
+                               f"Try again in {seconds} s.", 429,
+                               retry_after=seconds)
+            right = False
+            try:
+                user = self.db.user(principal.user_id)
+                right = bool(user) and verify_password(str(password),
+                                                       user["password_hash"])
+            finally:
+                if not right:
+                    self.hashes.give_back(account)
+            wrong = not right
+        finally:
+            self.throttle.end(key, failed=wrong)
+        if wrong:
             return refusal("Wrong password.", 401)
         self.throttle.clear(key)
+        return None
+
+    def reauth(self, principal: Principal, password: str,
+               address: str = "") -> dict:
+        """Type the password again to act after an idle spell."""
+        if principal.kind != "person":
+            return refusal("Only a person signs in with a password.", 403)
+        problem = self._check_own_password(principal, password, address)
+        if problem:
+            return problem
         self._touch(principal.session, write=True)
         principal.inactive_s = 0.0
         self._refresh_holder(principal)
         return {"ok": True, "me": self.me(principal)}
 
     def change_password(self, principal: Principal, current: str,
-                        new: str) -> dict:
+                        new: str, address: str = "") -> dict:
         if principal.kind != "person":
             return refusal("Only a person has a password.", 403)
+        problem = self._check_own_password(principal, current, address)
+        if problem:
+            if problem["status"] == 401:
+                problem["error"] = "The current password is wrong."
+            return problem
         user = self.db.user(principal.user_id)
-        key = f"user:{principal.username}"
-        if self.throttle.wait(key) > 0:
-            return refusal("Too many failed attempts. Try again later.", 429)
-        if not user or not verify_password(str(current), user["password_hash"]):
-            self.throttle.fail(key)
-            return refusal("The current password is wrong.", 401)
         problem = check_password(new, user["username"])
         if problem:
             return refusal(problem, 400)
@@ -471,9 +826,12 @@ class Auth:
                                 note=str(note or "")[:300])
         except sqlite3.IntegrityError:
             return refusal("That username is taken.", 409)
-        self.db.add_event(None, "action",
-                          f"Account requested: {display} ({name}). An admin "
-                          "approves it in Settings -> People.", user=name)
+        # Only the username, which check_username has limited to letters,
+        # digits and . _ - : the rest was typed by somebody nobody has
+        # vouched for yet, and the activity feed is on every screen.
+        self.db.add_event(None, "info",
+                          f"An account was requested ({name}). An admin "
+                          "approves it in Settings -> People.")
         return {"ok": True, "pending": True}
 
     def me(self, principal: Principal) -> dict:
@@ -643,8 +1001,9 @@ class Auth:
 
     def create_device(self, actor: Principal, label: str) -> dict:
         """An account for one tablet, and the code that pairs it."""
-        if not self._admin(actor):
-            return refusal("Pairing a tablet needs the admin role.", 403)
+        problem = self._not_admin(actor, "Pairing a tablet needs the admin role.")
+        if problem:
+            return problem
         label = " ".join(str(label or "").split())[:40] or "Tablet"
         taken = {u["username"] for u in self.db.users(self.chamber)}
         number = 1
@@ -660,8 +1019,9 @@ class Auth:
                 "device": self._public(self.db.user(user["id"]))}
 
     def renew_code(self, actor: Principal, user_id: int) -> dict:
-        if not self._admin(actor):
-            return refusal("Pairing a tablet needs the admin role.", 403)
+        problem = self._not_admin(actor, "Pairing a tablet needs the admin role.")
+        if problem:
+            return problem
         user = self.db.user(user_id)
         if not user or user["kind"] != "device":
             return refusal("No such tablet.", 404)
@@ -696,6 +1056,9 @@ class Auth:
             self.throttle.fail(key)
             return refusal("That code is wrong or has expired. Ask an admin "
                            "for a new one.", 401)
+        # Pairing again replaces the tablet's session: the old one never
+        # expires, so left alone it would watch for ever from wherever it is.
+        self.db.delete_sessions(user["id"])
         token = new_token()
         self.db.create_session(token_hash(token), user["id"], None, address,
                                agent)
@@ -708,7 +1071,21 @@ class Auth:
 
     def _admin(self, actor: Principal) -> bool:
         return (actor.kind in ("person", "local") and actor.at_least("admin")
-                and not actor.must_change)
+                and not actor.must_change and not actor.idle())
+
+    def _not_admin(self, actor: Principal, message: str) -> dict | None:
+        """Why `actor` may not administer now, or None. An idle session is
+        asked for its password -- the panel opens that dialog by itself --
+        rather than told it lacks a role it has."""
+        if self._admin(actor):
+            return None
+        if actor.kind == "person" and actor.at_least("admin"):
+            if actor.must_change:
+                return refusal("Choose a new password first.", 403,
+                               must_change=True)
+            return refusal("Your session has been idle. Enter your password "
+                           "to act again.", 401, reauth=True)
+        return refusal(message, 403)
 
     def _public(self, user: dict | None) -> dict | None:
         if not user:
@@ -717,8 +1094,10 @@ class Auth:
         return {k: v for k, v in user.items() if k not in hidden}
 
     def users_report(self, actor: Principal) -> dict:
-        if not self._admin(actor):
-            return refusal("Managing accounts needs the admin role.", 403)
+        problem = self._not_admin(actor, "Managing accounts needs the admin "
+                                         "role.")
+        if problem:
+            return problem
         now = time.monotonic()
         with self._lock:
             # Shown as a wall-clock time; kept on the monotonic one.
@@ -745,8 +1124,10 @@ class Auth:
     def _target(self, actor: Principal, user_id: int,
                 person: bool = True) -> tuple[dict | None, dict | None]:
         """The account an admin action is about, or the reason it is refused."""
-        if not self._admin(actor):
-            return None, refusal("Managing accounts needs the admin role.", 403)
+        problem = self._not_admin(actor, "Managing accounts needs the admin "
+                                         "role.")
+        if problem:
+            return None, problem
         user = self.db.user(int(user_id))
         if not user or (person and user["kind"] != "person"):
             return None, refusal("No such account.", 404)
@@ -791,9 +1172,9 @@ class Auth:
             return refusal("Only a request still waiting can be declined; "
                            "disable an account instead.", 409)
         self.db.delete_user(user["id"])
+        # The name only: the rest was typed by somebody nobody vouched for.
         self._log(actor, "action", f"{actor.name} declined the account request "
-                                   f"of {user['display_name']} "
-                                   f"({user['username']})")
+                                   f"of {user['username']}")
         return {"ok": True}
 
     def set_role(self, actor: Principal, user_id: int, role: str) -> dict:
@@ -856,12 +1237,16 @@ class Auth:
         return {"ok": True, "temporary": temporary}
 
     def transfer_owner(self, actor: Principal, user_id: int,
-                       password: str) -> dict:
+                       password: str, address: str = "") -> dict:
         if actor.kind != "person" or not actor.at_least("owner"):
             return refusal("Only the owner hands the chamber over.", 403)
-        me = self.db.user(actor.user_id)
-        if not me or not verify_password(str(password), me["password_hash"]):
-            return refusal("Wrong password.", 401)
+        problem = self._not_admin(actor, "Only the owner hands the chamber "
+                                         "over.")
+        if problem:
+            return problem
+        problem = self._check_own_password(actor, password, address)
+        if problem:
+            return problem
         user = self.db.user(int(user_id))
         if not user or user["kind"] != "person" or user["status"] != "active" \
                 or user["id"] == actor.user_id:
@@ -876,6 +1261,9 @@ class Auth:
     def request_role(self, actor: Principal, role: str, note: str = "") -> dict:
         if actor.kind != "person":
             return refusal("Only a person asks for a role.", 403)
+        if actor.idle():
+            return refusal("Your session has been idle. Enter your password "
+                           "to act again.", 401, reauth=True)
         if role not in ("operator", "admin") or RANK[role] <= actor.rank:
             return refusal("Ask for a role above the one you have.", 400)
         self.db.create_role_request(actor.user_id, self.chamber, role,
@@ -895,6 +1283,18 @@ class Auth:
             problem = self._grantable(actor, request["role"])
             if problem:
                 return problem
+            # Asked for under other circumstances: since then the account
+            # may have been disabled, or given that role or a higher one --
+            # approving now would re-enable a role, or demote somebody.
+            if user["status"] != "active" or user["role"] is None \
+                    or RANK[request["role"]] <= RANK.get(user["role"], -1):
+                self.db.decide_role_request(request["id"], "withdrawn",
+                                            actor.username)
+                return refusal(
+                    f"This request is out of date: {user['display_name']} is "
+                    + (f"now {user['role']}" if user["status"] == "active"
+                       and user["role"] else f"{user['status']}")
+                    + ". It has been closed.", 409)
             self.db.set_role(user["id"], self.chamber, request["role"],
                              actor.username)
         self.db.decide_role_request(request["id"],

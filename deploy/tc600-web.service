@@ -1,11 +1,20 @@
-# Optional: run the control panel automatically at boot.
+# Run the control panel automatically at boot.
 #
 #   sudo cp deploy/tc600-web.service /etc/systemd/system/
-#   sudo systemctl enable --now tc600-web
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tc600-web
 #
-# Not installed by default. Read the security note in README.md first: with no
-# --token, anyone who can reach port 8600 can start and stop the pump and the
-# magnetron, and a service starts that exposure automatically on every boot.
+# Everybody signs in: the first account, the chamber's owner, is made on this
+# machine BEFORE the first start with accounts --
+#   ./tools/users.py owner NAME
+# -- against the same database the service uses (~/.local/share/vacuum-lab/
+# lab.db unless --db says otherwise). Until an owner exists nobody can sign
+# in; the rig keeps running, only the panel is locked.
+#
+# Until the panel has TLS, passwords cross the network in clear. Once the lab
+# has its own router, add to ExecStart:
+#   --allow-from 192.168.50.0/24     (nobody else reaches the panel at all)
+#   --admin-from 192.168.50.0/24     (accounts and overrides only from there)
+# Loopback -- the kiosk tablet on its USB cable -- always passes both.
 #
 # Both ports are "auto": the panel finds each instrument by asking every
 # serial port what is on it (read-only queries -- the TC 600's type, the TPG's
@@ -32,9 +41,12 @@ Group=dialout
 WorkingDirectory=/home/esarodriguezm/tc600-control
 # Without this, Python block-buffers stdout when it is a journal socket rather
 # than a terminal, and the startup banner -- which ports were opened, what the
-# interlocks are set to, and whether the panel is running with no token --
-# never reaches `journalctl -u tc600-web`.
+# interlocks are set to, and whether an owner exists -- never reaches
+# `journalctl -u tc600-web`.
 Environment=PYTHONUNBUFFERED=1
+# The code directory is read-only to the service (below); this stops Python
+# trying to write __pycache__ there on every start.
+Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/bin/python3 /home/esarodriguezm/tc600-control/webserver.py \
     --serial auto --address 1 \
     --gauge auto \
@@ -46,6 +58,31 @@ RestartSec=5
 # shutdown (Application.CLOSE_BUDGET_S). This is how long systemd waits
 # before killing it, so keep it above that.
 TimeoutStopSec=90
+
+# --- what the service may touch ---------------------------------------------
+# Files it creates are its own only: the database holds the password hashes.
+UMask=0077
+# Everything read-only but the data directory (database, equipment.json,
+# ports.json). /dev -- the serial ports -- is not affected. The directory MUST
+# exist before the service starts: under this setting the panel cannot make
+# it, and systemd refuses to start the unit at all (status 226/NAMESPACE),
+# leaving nothing watching the rig. `./tools/users.py owner NAME`, run first,
+# makes it; or `install -d -m 700 ~/.local/share/vacuum-lab`.
+ProtectSystem=strict
+ReadWritePaths=/home/esarodriguezm/.local/share/vacuum-lab
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+# Threads: up to 64 connections from the network and 16 from loopback
+# (lab/api.py), the samplers, the engine, the supervisor, the recorder, and
+# room to spare: at the limit a thread cannot start, and the supervisor's
+# automatic recovery would have to run on its own watching thread.
+TasksMax=256
 
 [Install]
 WantedBy=multi-user.target

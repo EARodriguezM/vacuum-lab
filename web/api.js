@@ -75,18 +75,22 @@ function loadSessions() {
 let sessions = loadSessions();
 const listeners = new Set();
 
-function storeSessions(next) {
+function storeSessions(next, reason = "") {
   sessions = { ...sessions, ...next };
   try {
     localStorage.setItem(SESSION_KEY, JSON.stringify(sessions));
   } catch { /* kept in memory for this page only */ }
-  listeners.forEach((listener) => listener(sessions));
+  listeners.forEach((listener) => listener(sessions, reason));
 }
 
 /** The sessions this browser holds: { person, device }. */
 export function sessionTokens() { return sessions; }
 
-/** Called whenever a session is gained or lost. Returns the unsubscribe. */
+/**
+ * Called whenever a session is gained or lost, with the sessions and why:
+ * "ended" when the server refused one that was in use (expired, signed out
+ * when idle on a tablet, reset elsewhere). Returns the unsubscribe.
+ */
 export function onSessionChange(listener) {
   listeners.add(listener);
   return () => listeners.delete(listener);
@@ -147,7 +151,7 @@ async function request(path, options = {}) {
   if (response.status === 401 && payload.login) {
     // The session is gone -- expired, signed out elsewhere, password reset.
     // Drop whichever one was used; a tablet falls back to watching.
-    if (sessions.person && token === sessions.person) setPersonSession(null);
+    if (sessions.person && token === sessions.person) storeSessions({ person: null }, "ended");
     else if (token && token === sessions.device) setDeviceSession(null);
     throw new AuthError(payload.error || "sign in", payload);
   }
@@ -236,7 +240,8 @@ export const api = {
   events:     (limit = 200) => get(`/api/events?limit=${limit}`),
 
   deviceState: (key) => get(`/api/device/${key}/state`),
-  accessories: (key = "pump") => get(`/api/device/${key}/accessories`),
+  accessories: (key = "pump", fresh = false) =>
+    get(`/api/device/${key}/accessories${fresh ? "?fresh=1" : ""}`),
   gaugeDetails: (key = "gauge") => get(`/api/device/${key}/details`),
 
   command: (device, action, value, extra = {}) =>
@@ -253,7 +258,9 @@ export const api = {
   securePump: (reason = "requested by the operator") =>
     post("/api/pump/secure", { reason, confirm: true }),
   cancelShutdown: () => post("/api/pump/cancel-shutdown", { confirm: true }),
-  pumpDiagnostics: (key = "pump") => get(`/api/device/${key}/diagnostics`),
+  // `fresh`: a person asked -- read the drive now, not a minute-old reading.
+  pumpDiagnostics: (key = "pump", fresh = false) =>
+    get(`/api/device/${key}/diagnostics${fresh ? "?fresh=1" : ""}`),
   acknowledgeAlarms: (id = "all") => post("/api/alarms/ack", { id }),
   setAutoRecovery: (on) => post("/api/supervisor", { auto_recover: !!on, confirm: true }),
   acknowledgeStep: (note = "") => post("/api/run/acknowledge", { note }),
@@ -285,7 +292,10 @@ export const api = {
   deleteRun:  (id) => post(`/api/runs/${id}/delete`, { confirm: true }),
 
   // --- accounts (lab/auth.py) ---
-  login:   (username, password) => post("/api/login", { username, password }),
+  // On a paired tablet the tablet's own session goes along: the server then
+  // signs the person out when they walk away, whatever this page does.
+  login:   (username, password) =>
+    post("/api/login", { username, password, device: sessions.device || undefined }),
   signup:  (body) => post("/api/signup", body),
   pair:    (code) => post("/api/pair", { code }),
   logout:  () => post("/api/logout", {}),

@@ -348,7 +348,7 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
       <${Tablets} me=${me} notify=${notify} />
 
       <${Card} title="Connection"
-               hint="Leave the address empty when this page is served by the lab PC itself. Fill it in to drive that machine from another one — the API sends permissive CORS headers so that works.">
+               hint="Leave the address empty when this page is served by the lab PC itself. To drive that machine from a page served elsewhere, fill it in — and start that server with --allow-origin naming this page's origin, or it refuses the requests.">
         <label class="field">
           <span>Controller address</span>
           <input value=${draft.host} placeholder="e.g. 172.16.2.69:8600"
@@ -463,7 +463,7 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
                 ...Object.entries(stats.stats.by_procedure || {}).map(
                   ([name, count]) => [fmt.titleCase(name), fmt.integer(count)]),
               ]} />
-              <div class="small muted mono">${stats.stats.path}</div>`
+              ${stats.stats.path && html`<div class="small muted mono">${stats.stats.path}</div>`}`
             : html`<${Empty}>Not available.<//>`}
         <//>
       </div>

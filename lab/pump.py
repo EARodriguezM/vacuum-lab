@@ -52,6 +52,19 @@ NO_FAULT = ("", "000000", "000", "0")
 #: reading and take the next; a command lost to one dropped reply would leave
 #: the operator -- or a safety sequence -- believing it was refused.
 COMMAND_RETRIES = 2
+#: The accessory settings and the diagnostics are read on demand, ~14 and
+#: ~26 telegrams each, holding the serial line while the sampler waits. A
+#: page opened, reloaded or left polling reuses a reading this recent.
+ON_DEMAND_KEEP_S = 60.0
+#: ...but an operator pressing "Read the drive" gets a fresh one, unless the
+#: last is younger than this. A new fault code or a reconnect always reads.
+ON_DEMAND_MIN_S = 30.0
+#: Telegrams an on-demand read sends per hold of the serial line, and the
+#: pause after each batch: the sampler's own cycle gets in between, so the
+#: speed and the fault flags the 1 s safety tick reads do not age while a
+#: page reads the drive's settings.
+ON_DEMAND_BATCH = 3
+ON_DEMAND_GAP_S = 0.05
 
 #: The accessory connectors, and the parameters behind them.
 ACCESSORY_VIEW = (
@@ -313,6 +326,20 @@ class PumpService(DeviceService):
         #: one that came from the drive, its front panel or its remote plug.
         self.commanded: dict[str, float] = {}
         self._secure_lock = threading.Lock()
+        #: The on-demand reads (accessories, diagnostics): monotonic time,
+        #: drive state and result of the last good one. `_kept_lock` guards
+        #: only the dict, briefly; `_reading` lets one such read run at a
+        #: time, so two pages asking at once cost one read, not two -- and is
+        #: never taken by a write, which must not wait seconds behind a read
+        #: (a bake-out's heater-off comes from the run's own thread).
+        self._kept: dict[str, tuple[float, tuple, dict]] = {}
+        self._kept_lock = threading.Lock()
+        self._reading = threading.Lock()
+        #: Counts writes, so a read that a write overtook is not kept.
+        self._writes = 0
+        #: Counts the link being dropped: a reading kept from before a
+        #: reconnect -- or a replaced adapter -- is not reused.
+        self._link_generation = 0
         super().__init__(key, port, address=address, **options)
 
     # --- where the chamber pressure comes from -----------------------------
@@ -772,33 +799,88 @@ class PumpService(DeviceService):
 
     # --- accessories ------------------------------------------------------
 
-    def accessories(self) -> dict:
+    def drop(self) -> None:
+        super().drop()
+        self._link_generation += 1
+
+    def _on_demand(self, name: str, read, fresh: bool = False) -> dict:
+        """`read()`, or its result from under ON_DEMAND_KEEP_S ago -- as long
+        as the drive's fault code and the link are what they were then. A
+        fault, or a reconnect, is exactly when the fault history and the
+        drive's settings have to be read again. `fresh` asks for a new
+        reading unless the last is under ON_DEMAND_MIN_S old."""
+        with self._reading:
+            # The drive's state as it is now -- after any read this one
+            # queued behind -- so a fault meanwhile is not answered from
+            # before it.
+            state = (self.snapshot().get("status", {}).get("ErrorCode"),
+                     self._link_generation)
+            with self._kept_lock:
+                kept = self._kept.get(name)
+                writes = self._writes
+            now = time.monotonic()
+            if kept and kept[1] == state and now - kept[0] < (
+                    ON_DEMAND_MIN_S if fresh else ON_DEMAND_KEEP_S):
+                return {**kept[2], "kept": True,
+                        "read_s_ago": round(now - kept[0], 1)}
+            result = read()
+            if result.get("ok"):
+                with self._kept_lock:
+                    if self._writes == writes:
+                        self._kept[name] = (time.monotonic(), state, result)
+            return {**result, "kept": False, "read_s_ago": 0.0}
+
+    def accessories(self, fresh: bool = False) -> dict:
+        """The accessory-connector parameters, read at most once a minute."""
+        return self._on_demand("accessories", self._read_accessories, fresh)
+
+    def diagnostics(self, fresh: bool = False) -> dict:
+        """The drive's protections and fault history, at most once a minute."""
+        return self._on_demand("diagnostics", self._read_diagnostics, fresh)
+
+    def _read_view(self, names) -> dict:
+        """Read the named parameters, a few telegrams per hold of the line.
+
+        Returns {"ok", "values", "units", "missing"}, or the error. Anything
+        the firmware does not implement answers NO_DEF and is listed as
+        missing rather than guessed.
+        """
+        values, units, missing = {}, {}, []
+        names = list(names)
+        for start in range(0, len(names), ON_DEMAND_BATCH):
+            if start:
+                time.sleep(ON_DEMAND_GAP_S)        # the sampler's turn
+            with self.lock:
+                try:
+                    pump = self.driver()
+                except (serial.SerialException, OSError) as exc:
+                    self.drop()
+                    return {"ok": False,
+                            "error": f"cannot open {self.port}: {exc}"}
+                for name in names[start:start + ON_DEMAND_BATCH]:
+                    parameter = params.BY_NAME[name.lower()]
+                    try:
+                        values[name] = parameter.decode(
+                            pump.read_raw(parameter.number))
+                        units[name] = parameter.unit
+                    except protocol.ProtocolError:
+                        missing.append(name)
+                    except (serial.SerialException, OSError) as exc:
+                        self.drop()
+                        return {"ok": False, "error": str(exc)}
+        return {"ok": True, "values": values, "units": units,
+                "missing": missing}
+
+    def _read_accessories(self) -> dict:
         """Read the accessory-connector parameters.
 
         Served on demand rather than in the status poll: they change rarely
         and reading them costs another fourteen round trips.
         """
-        with self.lock:
-            try:
-                pump = self.driver()
-            except (serial.SerialException, OSError) as exc:
-                self.drop()
-                return {"ok": False, "error": f"cannot open {self.port}: {exc}"}
-
-            values, units, missing = {}, {}, []
-            for name in ACCESSORY_VIEW:
-                parameter = params.BY_NAME[name.lower()]
-                try:
-                    values[name] = parameter.decode(pump.read_raw(parameter.number))
-                    units[name] = parameter.unit
-                except protocol.ProtocolError:
-                    missing.append(name)
-                except (serial.SerialException, OSError) as exc:
-                    self.drop()
-                    return {"ok": False, "error": str(exc)}
-
-            return {"ok": True, "values": values, "units": units,
-                    "missing": missing, "writable": sorted(ALLOWED_WRITES)}
+        result = self._read_view(ACCESSORY_VIEW)
+        if result.get("ok"):
+            result["writable"] = sorted(ALLOWED_WRITES)
+        return result
 
     # --- commands ---------------------------------------------------------
 
@@ -1106,7 +1188,7 @@ class PumpService(DeviceService):
         finally:
             self._secure_lock.release()
 
-    def diagnostics(self) -> dict:
+    def _read_diagnostics(self) -> dict:
         """The drive's protective settings and its fault history, on demand.
 
         Run-up time monitoring (P4) and its limit (P700) are what decide
@@ -1115,23 +1197,11 @@ class PumpService(DeviceService):
         does not implement answers NO_DEF and is listed as missing rather
         than guessed.
         """
-        with self.lock:
-            try:
-                pump = self.driver()
-            except (serial.SerialException, OSError) as exc:
-                self.drop()
-                return {"ok": False, "error": f"cannot open {self.port}: {exc}"}
-            values, units, missing = {}, {}, []
-            for name in DIAGNOSTIC_VIEW:
-                parameter = params.BY_NAME[name.lower()]
-                try:
-                    values[name] = parameter.decode(pump.read_raw(parameter.number))
-                    units[name] = parameter.unit
-                except protocol.ProtocolError:
-                    missing.append(name)
-                except (serial.SerialException, OSError) as exc:
-                    self.drop()
-                    return {"ok": False, "error": str(exc)}
+        result = self._read_view(DIAGNOSTIC_VIEW)
+        if not result.get("ok"):
+            return result
+        values, units, missing = (result["values"], result["units"],
+                                  result["missing"])
         history = []
         for index in range(1, 11):
             code = values.get(f"ErrHist{index}")
@@ -1175,6 +1245,11 @@ class PumpService(DeviceService):
         except Interlock as stop:
             return refused(stop)
 
+        # Forgotten before and after: a write that fails half-way may still
+        # have changed the drive, and the next page must read it afresh.
+        with self._kept_lock:
+            self._kept.clear()
+            self._writes += 1
         with self.lock:
             try:
                 pump = self.driver()
@@ -1195,5 +1270,8 @@ class PumpService(DeviceService):
                 return {"ok": False, "error": str(exc)}
 
         self.note_success()
+        with self._kept_lock:
+            self._kept.clear()          # what the pages show has changed
+            self._writes += 1
         return {"ok": True, "action": "param", "name": name, "result": result,
                 "previous": previous, "overridden": sorted(used)}
