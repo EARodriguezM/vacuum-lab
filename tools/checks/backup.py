@@ -224,6 +224,22 @@ def _sections(root: Path) -> None:
                 "refused over an existing database; restored elsewhere 0600")
     attempt("a restore never overwrites a database unasked", restore_guards)
 
+    def tilde_destination():
+        home = root / "home"
+        backupmod.init(home / "bk", log=quiet)
+        saved = os.environ.get("HOME")
+        os.environ["HOME"] = str(home)
+        try:
+            code = backupmod.main(["make", "--db", str(db), "--dest", "~/bk"])
+        finally:
+            if saved is None:
+                del os.environ["HOME"]
+            else:
+                os.environ["HOME"] = saved
+        return (code == 0 and len(backupmod.backups_in(home / "bk" / "chamber-1")) == 1,
+                f"exit {code}")
+    attempt("a destination given as ~/folder is the home folder's", tilde_destination)
+
     def drill():
         good = backupmod.backups_in(root / "usb1" / "chamber-1")[0]
         opened = backupmod.drill(good, log=quiet)

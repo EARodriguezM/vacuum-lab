@@ -700,8 +700,9 @@ def _prune(args) -> int:
 def _make(args) -> int:
     keep = _keep(args.keep)
     db = Path(args.db).expanduser()
+    dests = [d if is_remote(d) else os.path.expanduser(d) for d in args.dest]
     print(f"Backing up {db}")
-    record = make(db, args.dest, args.chamber_id, keep)
+    record = make(db, dests, args.chamber_id, keep)
     try:
         write_status(db, record)
     except OSError as exc:

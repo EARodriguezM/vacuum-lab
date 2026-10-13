@@ -17,6 +17,28 @@ from tools.checks.common import (
     ROOT, wait_until, attempt, Rig, watching, FailingDatabase, _try, _QuietEngine)
 
 
+def _events_without_origin(raw) -> None:
+    """Make the events table what it was before `origin` -- rebuilt as the
+    old code created it, not altered: DROP COLUMN fails on the SQLite of
+    Ubuntu 24.04 (3.45, the lab PC's) for a table whose definition carries
+    comments, as this one does."""
+    raw.executescript("""
+        PRAGMA foreign_keys=OFF;
+        CREATE TABLE events_old (
+            id          INTEGER PRIMARY KEY,
+            run_id      INTEGER REFERENCES runs(id) ON DELETE CASCADE,
+            at          REAL    NOT NULL,
+            level       TEXT    NOT NULL,
+            message     TEXT    NOT NULL,
+            detail      TEXT,
+            user        TEXT);
+        INSERT INTO events_old
+            SELECT id, run_id, at, level, message, detail, user FROM events;
+        DROP TABLE events;
+        ALTER TABLE events_old RENAME TO events;
+    """)
+
+
 def test_lifecycle(pump_port: str, gauge_port: str) -> None:
     print("\nHow a run starts, ends, and survives what goes wrong around it")
     from lab import alarms, process
@@ -1763,7 +1785,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         ended = store.run(made["id"])["ended_at"]
         store.close()
         with sqlite3.connect(path) as raw:       # a store from before `origin`
-            raw.execute("ALTER TABLE events DROP COLUMN origin")
+            _events_without_origin(raw)
             raw.executemany(
                 "INSERT INTO events (run_id, at, level, message, user) "
                 "VALUES (?,?,?,?,?)",
@@ -2022,7 +2044,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         store.finish_run(made["id"], dbmod.COMPLETED, {})
         store.close()
         with sqlite3.connect(path) as raw:       # a store from before `origin`
-            raw.execute("ALTER TABLE events DROP COLUMN origin")
+            _events_without_origin(raw)
             raw.execute("INSERT INTO events (run_id, at, level, message) "
                         "VALUES (?, 1.0, 'info', 'old: its own log')",
                         (made["id"],))

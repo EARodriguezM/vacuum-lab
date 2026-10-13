@@ -551,7 +551,7 @@ def deploy(args, log=print, target: Target | None = None,
         else:
             code, out = target.run(
                 f"cd {_q(folder)} && python3 tools/backup.py make "
-                + " ".join(f"--dest {shlex.quote(d)}" for d in args.backup_dest),
+                + " ".join(f"--dest {_q(d)}" for d in args.backup_dest),
                 timeout=1800)
         if code != 0:
             raise ReleaseError(f"the backup failed (pass --no-backup to deploy "
