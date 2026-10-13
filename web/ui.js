@@ -63,8 +63,8 @@ export function Confirm({ open, title, body, confirmLabel = "Confirm",
         <div class="small">${body}</div>
         ${extra}
         <div class="actions">
-          <button onClick=${onCancel}>Cancel</button>
-          <button class=${tone} onClick=${onConfirm}>${confirmLabel}</button>
+          <button data-test="confirm-cancel" onClick=${onCancel}>Cancel</button>
+          <button class=${tone} data-test="confirm-ok" onClick=${onConfirm}>${confirmLabel}</button>
         </div>
       </div>
     </div>`;
@@ -152,6 +152,7 @@ export function Field({ field, value, onChange }) {
       <span>${field.label}</span>
       <span class="suffix">
         <input id=${id} type=${isExponent ? "text" : "number"}
+               data-test=${`recipe-field-${field.key}`}
                inputmode=${isExponent ? "text" : "decimal"}
                value=${value ?? ""}
                min=${field.min} max=${field.max} step=${field.step || "any"}

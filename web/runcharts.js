@@ -236,6 +236,24 @@ function WorkingPressure({ samples, config, phases, cursor, onCursor }) {
     <//>`;
 }
 
+/** What a rate-of-rise curve says, by the engine's verdict codes. */
+const RISE_VERDICTS = {
+  linear: "straight enough to be a leak rate",
+  bent: "bent: an outgassing transient, not a leak rate",
+  falling: "falling: something is still pumping the chamber — is the gate shut? Not a leak rate",
+  frozen: "no rise at all: the gauge has stopped measuring — not a leak-tight chamber",
+};
+
+/** The same verdict as RateOfRise.summarise, while the run is still measuring. */
+function riseVerdict(measuring, fit) {
+  if (!fit) return null;
+  // Not one reading changed: a gauge that stopped measuring. Its fit is
+  // "R² 1, no rise" -- a perfect leak-tight chamber, which it is not.
+  if (measuring.every((s) => s.p_best === measuring[0].p_best)) return "frozen";
+  if (fit.slope < 0) return "falling";
+  return fit.r2 >= A.JUDGEMENT.linear_r2 ? "linear" : "bent";
+}
+
 /**
  * The rise, on linear axes, with the straight line fitted to it.
  *
@@ -265,15 +283,24 @@ function RateOfRiseChart({ samples, run, config }) {
     points: fit ? measuring.map((s) => [s.t, s.p_best - (fit.intercept + fit.slope * s.t)]) : [],
   }], [measuring, fit]);
   const volume = config.volume_l;
+  // Once the run has ended, its verdict is the engine's (lab/runs.py), not
+  // a second fit made here; while it runs, the same maths on the same rows.
   const result = run?.result || {};
-  const leak = result.leak_rate_mbar_l_s ?? (fit && volume ? fit.slope * volume : null);
+  const judged = "r_squared" in result;
+  const r2 = judged ? result.r_squared : fit?.r2;
+  const verdict = judged && result.verdict ? result.verdict
+    : judged ? (r2 === null ? "frozen" : r2 >= A.JUDGEMENT.linear_r2 ? "linear" : "bent")
+      : riseVerdict(measuring, fit);
+  const leak = judged ? result.leak_rate_mbar_l_s
+    : (fit && volume && verdict !== "frozen" && verdict !== "falling"
+      ? fit.slope * volume : null);
+  const said = verdict ? RISE_VERDICTS[verdict] : null;
 
   return html`
     <div class="chart-stack">
       <${ChartPanel} title="Rate of rise"
-        subtitle=${fit ? `R² = ${fmt.number(fit.r2, 4)}${fit.r2 < 0.95
-          ? " — bent: an outgassing transient, not a leak rate" : " — straight enough to be a leak rate"}`
-          : "needs the measuring phase"}
+        subtitle=${!said ? "needs the measuring phase"
+          : finite(r2) && verdict !== "frozen" ? `R² = ${fmt.number(r2, 4)} — ${said}` : said}
         readout=${leak != null ? `${fmt.pressure(leak, 2)} mbar·L/s` : null}
         legend=${html`<${Legend} series=${series} />`}
         table=${() => html`<${DataTable} series=${series} x=${{ kind: "elapsed" }} unit="mbar"

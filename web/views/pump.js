@@ -47,11 +47,12 @@ function Guarded({ action, label, interlocks, onRun, tone = "", disabled, onOver
   return html`
     <span class="guarded">
       <button class=${tone} disabled=${disabled || blocked} title=${reason}
-              onClick=${() => onRun(action, label, reason)}>
+              data-test=${`pump-${action}`} onClick=${() => onRun(action, label, reason)}>
         ${label}${blocked && rule.wait ? html` <span class="muted">${rule.wait}s</span>` : null}
       </button>
       ${blocked && onOverride && !disabled && rule.rule && html`
         <button class="small danger" title="Admins only: waive this one rule and send it"
+                data-test="override-open"
                 onClick=${() => onOverride(action, label, reason, rule.rule)}>Override…</button>`}
     </span>`;
 }
@@ -381,7 +382,7 @@ function PumpTrends({ pump, gauge }) {
     states.forEach((state, i) => {
       if (state === "held" && i > 0) held += Math.min(30, samples[i].t - samples[i - 1].t);
     });
-    const quiet = samples.filter((s) => limits.nominal && s.speed >= 0.95 * limits.nominal
+    const quiet = samples.filter((s) => A.atFullSpeed(s.speed, limits.nominal)
       && s.p_best > 0 && s.p_best < 1e-4 && s.power > 0).map((s) => s.power);
     quiet.sort((a, b) => a - b);
     const loaded = samples.filter((s) => s.power > 0 && Number.isFinite(s.voltage))

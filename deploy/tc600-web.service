@@ -1,5 +1,9 @@
 # Run the control panel automatically at boot.
 #
+# It runs the release that ~/vacuum-lab/current points at; tools/release.py
+# copies each release there, switches the link, restarts this unit and
+# checks it came back, and installs this file when it changes
+# (`release.py deploy --to HOST --install-units`). By hand:
 #   sudo cp deploy/tc600-web.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now tc600-web
 #
@@ -38,7 +42,7 @@ After=network.target
 Type=simple
 User=esarodriguezm
 Group=dialout
-WorkingDirectory=/home/esarodriguezm/tc600-control
+WorkingDirectory=/home/esarodriguezm/vacuum-lab/current
 # Without this, Python block-buffers stdout when it is a journal socket rather
 # than a terminal, and the startup banner -- which ports were opened, what the
 # interlocks are set to, and whether an owner exists -- never reaches
@@ -47,7 +51,7 @@ Environment=PYTHONUNBUFFERED=1
 # The code directory is read-only to the service (below); this stops Python
 # trying to write __pycache__ there on every start.
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/usr/bin/python3 /home/esarodriguezm/tc600-control/webserver.py \
+ExecStart=/usr/bin/python3 /home/esarodriguezm/vacuum-lab/current/webserver.py \
     --serial auto --address 1 \
     --gauge auto \
     --port 8600
@@ -70,6 +74,11 @@ UMask=0077
 # makes it; or `install -d -m 700 ~/.local/share/vacuum-lab`.
 ProtectSystem=strict
 ReadWritePaths=/home/esarodriguezm/.local/share/vacuum-lab
+# /run/vacuum-lab, in RAM: the panel's status.json, rewritten every few
+# seconds -- what it is doing, for tools/release.py and anyone on the
+# machine -- without wearing the SD card.
+RuntimeDirectory=vacuum-lab
+RuntimeDirectoryMode=0700
 PrivateTmp=yes
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes

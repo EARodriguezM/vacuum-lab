@@ -29,14 +29,24 @@ else (it never touches a serial port), and does two things:
 
 It never switches the station off, and it never restarts the turbopump:
 restarting is a person's decision, through the crossover interlock.
+
+It also watches the panel itself: the chart recorder's heartbeat, the
+backups (`backup_status`, written by tools/backup.py), and -- with
+`persist` -- the gap a restart left: its own heartbeat is kept in the
+database, so the next start can say how long nothing was watching, and
+whether the last one stopped cleanly. With `persist` the alarms nobody has
+acknowledged are kept there too, and are back on screen after a restart.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from collections import deque
 
+from . import logs
 from .pump import NO_FAULT, TURBO_START_MAX_MBAR, describe_error
 from .runs import within
 
@@ -101,15 +111,43 @@ class Supervisor:
     #: hung on something.
     CLEANUP_STALL_S = 60.0
     KEEP = 200
+    #: How often the heartbeat is written to the database, with `persist`.
+    ALIVE_EVERY_S = 60.0
+    #: How often the backup status is read, and how old a good backup may be.
+    BACKUP_CHECK_S = 60.0
+    BACKUP_MAX_AGE_S = 48 * 3600.0
+    #: A chart recorder silent this long has stopped.
+    RECORDER_STALL_S = 30.0
+    #: How often `on_tick` (the status file) is called, at most.
+    TICK_HOOK_S = 5.0
 
     def __init__(self, registry, engine, database, auto_recover: bool = True,
-                 pump_key: str = "pump", gauge_key: str = "gauge"):
+                 pump_key: str = "pump", gauge_key: str = "gauge",
+                 persist: bool = False, backup_status: str | None = None,
+                 recorder=None):
         self.registry = registry
         self.engine = engine
         self.db = database
         self.auto_recover = auto_recover
         self.pump_key = pump_key
         self.gauge_key = gauge_key
+        #: Keep the alarms and the heartbeat in the database (the real panel;
+        #: tests that share a database between supervisors leave it off).
+        self.persist = persist
+        #: tools/backup.py's status beside the database, or None to not watch.
+        self.backup_status = backup_status
+        self._backup_checked = None
+        #: The chart recorder, whose heartbeat is watched; or None.
+        self.recorder = recorder
+        #: Called every TICK_HOOK_S from the watching thread (the status
+        #: file); its failures are logged, never raised.
+        self.on_tick = None
+        self._ticked = None
+        #: When the watching loop last went round (monotonic), for the panel.
+        self.beat = None
+        self._alive_written = None
+        self._alarms_dirty = False
+        self._alarms_saved = None
 
         self._alarms: list[dict] = []
         self._next_id = 1
@@ -145,15 +183,25 @@ class Supervisor:
         self._storage_seen = None
         #: The current or last automatic recovery, for the panel.
         self.recovering: dict | None = None
+        #: What the last panel left: its heartbeat, read once, announced at
+        #: the first look (`_announce_restart`).
+        self._previous_life = None
+        if persist:
+            self._restore()
 
     # --- lifecycle ----------------------------------------------------------
 
     def start(self) -> "Supervisor":
         if self._thread is None:
+            self._write_alive(clean=False)
             self._thread = threading.Thread(target=self._loop, name="supervisor",
                                             daemon=True)
             self._thread.start()
         return self
+
+    def beat_age(self) -> float | None:
+        """Seconds since the watching loop last went round, or None."""
+        return None if self.beat is None else time.monotonic() - self.beat
 
     def close(self, timeout: float = 5.0, deadline: float | None = None) -> None:
         """Stop watching; nothing here waits past `deadline` (monotonic)."""
@@ -168,11 +216,239 @@ class Supervisor:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
+            self.beat = time.monotonic()
             try:
                 self.check()
-            except Exception:                 # never kill the watcher
-                pass
+            except Exception as exc:          # never kill the watcher --
+                logs.error("supervisor", exc)  # but never say nothing either
+            self._tick_hook()
             self._stop.wait(self.INTERVAL_S)
+
+    def _tick_hook(self) -> None:
+        now = time.monotonic()
+        if self.on_tick is None or (self._ticked is not None
+                                    and now - self._ticked < self.TICK_HOOK_S):
+            return
+        self._ticked = now
+        try:
+            self.on_tick()
+        except Exception as exc:
+            logs.error("status file", exc)
+
+    # --- what outlives the process -------------------------------------------
+
+    def _store(self, write, what: str) -> None:
+        """A database write through the run engine's writer, so a download
+        holding the database never holds up the watching."""
+        queue = getattr(self.engine, "_write", None)
+        try:
+            if queue is not None:
+                queue(write, what)
+            else:
+                write()
+        except Exception as exc:
+            logs.error(f"supervisor: {what}", exc)
+
+    def _write_alive(self, clean: bool) -> None:
+        """The heartbeat: when this panel was last watching. Written every
+        ALIVE_EVERY_S -- which also finds out, without a run going, that the
+        database cannot be written."""
+        if not self.persist:
+            return
+        self._alive_written = time.monotonic()
+        value = json.dumps({"at": time.time(), "clean": clean,
+                            "pid": os.getpid()})
+        self._store(lambda: self.db.set_meta("alive", value), "heartbeat")
+
+    def mark_clean_stop(self) -> None:
+        """The last thing written before the database closes, and written
+        here and now rather than queued: a clean stop that never reached the
+        disk reads, at the next start, as a crash. The alarms nobody
+        acknowledged go with it."""
+        if not self.persist:
+            return
+        try:
+            self._flush_alarms(force=True, now=True)
+            self.db.set_meta("alive", json.dumps(
+                {"at": time.time(), "clean": True, "pid": os.getpid()}))
+        except Exception as exc:
+            logs.error("supervisor: the clean stop", exc)
+
+    #: The alarms are kept at most this often: a link flapping all night
+    #: would otherwise rewrite them on every flap, on an SD card.
+    SAVE_EVERY_S = 5.0
+
+    def _save_alarms(self) -> None:
+        """Mark the alarms for keeping; the watching loop writes them."""
+        if self.persist:
+            self._alarms_dirty = True
+
+    def _flush_alarms(self, force: bool = False, now: bool = False) -> None:
+        if not self.persist or not getattr(self, "_alarms_dirty", False):
+            return
+        if not force and self._alarms_saved is not None and \
+                time.monotonic() - self._alarms_saved < self.SAVE_EVERY_S:
+            return
+        self._alarms_dirty = False
+        self._alarms_saved = time.monotonic()
+        with self._lock:
+            kept = [{k: a.get(k) for k in ("id", "key", "level", "title",
+                                           "detail", "raised_at", "cleared_at",
+                                           "actions", "restored")}
+                    for a in self._alarms if not a["acknowledged"]]
+            value = json.dumps({"next_id": self._next_id, "alarms": kept})
+        if now:
+            self.db.set_meta("alarms", value)
+        else:
+            self._store(lambda: self.db.set_meta("alarms", value), "alarms")
+
+    #: Added to an alarm kept across a restart -- once.
+    RESTORED_NOTE = " (Raised before the panel was restarted.)"
+
+    def _restore(self) -> None:
+        """What the last panel left: its heartbeat and its alarms. Whatever is
+        in the database, this never stops the panel starting -- a store
+        written by another release, say, after a rollback."""
+        try:
+            alive = self.db.meta("alive")
+            kept = self.db.meta("alarms")
+        except Exception as exc:
+            logs.error("supervisor: reading what the last panel left", exc)
+            return
+        try:
+            life = json.loads(alive) if alive else None
+            self._previous_life = life if isinstance(life, dict) else None
+        except ValueError:
+            self._previous_life = None
+        try:
+            kept = json.loads(kept) if kept else []
+        except ValueError:
+            kept = []
+        if isinstance(kept, dict):
+            next_id, kept = kept.get("next_id"), kept.get("alarms")
+        else:
+            next_id = None
+        if isinstance(next_id, int) and next_id > self._next_id:
+            self._next_id = next_id            # ids never repeat across starts
+        for old in kept if isinstance(kept, list) else []:
+            try:
+                self._restore_one(old)
+            except Exception as exc:
+                logs.error("supervisor: an alarm kept from before", exc)
+
+    def _restore_one(self, old) -> None:
+        if not isinstance(old, dict):
+            return
+
+        def text(value, default):
+            return value if isinstance(value, str) and value else default
+
+        def stamp(value):
+            return value if isinstance(value, (int, float)) else time.time()
+        detail = text(old.get("detail"), "")
+        if not detail.endswith(self.RESTORED_NOTE):
+            detail += self.RESTORED_NOTE
+        level = old.get("level") if old.get("level") in ("warning",
+                                                          "critical") else "warning"
+        actions = old.get("actions") if isinstance(old.get("actions"), list) else []
+        with self._lock:
+            # Its condition is not known yet: shown as cleared, kept until
+            # acknowledged. If it still holds, it is raised again, new.
+            self._alarms.append({
+                "id": self._next_id, "key": text(old.get("key"), "restored"),
+                "level": level, "title": text(old.get("title"), "Alarm"),
+                "detail": detail, "raised_at": stamp(old.get("raised_at")),
+                "cleared_at": stamp(old.get("cleared_at")), "active": False,
+                "acknowledged": False, "restored": True,
+                "actions": [a for a in actions if isinstance(a, str)]})
+            self._next_id += 1
+
+    def _announce_restart(self) -> None:
+        """Once, at the first look: the panel was not watching for a while."""
+        life, self._previous_life = self._previous_life, None
+        if not life or not isinstance(life.get("at"), (int, float)):
+            return
+        stopped = life["at"]
+        gap = time.time() - stopped
+        clock = time.strftime("%H:%M", time.localtime(stopped))
+        span = (f"for about {gap / 60:.0f} min" if 0 <= gap < 7 * 86400 else
+                "for an unknown time (the clock has moved)")
+        key = "panel_restarted"
+        if life.get("clean"):
+            self.raise_alarm(
+                "panel_restarted", "warning", "The panel was restarted",
+                f"It stopped at {clock} and was not watching the rig {span}. "
+                f"Nothing was recorded or alarmed in that time; the pump kept "
+                f"doing what it was last told.")
+        else:
+            self.raise_alarm(
+                "panel_restarted", "critical", "The panel stopped unexpectedly",
+                f"Its last sign of life was at {clock}, and it did not stop "
+                f"cleanly -- a crash or a power cut. Nothing watched the rig "
+                f"{span}. Check the pump and the chamber, and the journal "
+                f"(journalctl -u tc600-web) for why.")
+        # An event, not a condition: on screen until acknowledged, never
+        # "active" -- nothing will ever clear it, and a release counts the
+        # active critical alarms a restart leaves.
+        self.clear(key)
+
+    def _watch_backup(self) -> None:
+        if not self.backup_status:
+            return
+        now = time.monotonic()
+        if self._backup_checked is not None and \
+                now - self._backup_checked < self.BACKUP_CHECK_S:
+            return
+        self._backup_checked = now
+        try:
+            with open(self.backup_status, encoding="utf-8") as fh:
+                status = json.load(fh)
+        except FileNotFoundError:
+            status = None
+        except (OSError, ValueError) as exc:
+            status = {"last_ok": False, "last_error": f"its status is "
+                      f"unreadable: {exc}", "last_attempt": time.time()}
+        how = ("Set the backups up (deploy/tc600-backup.service) and check "
+               "with ./tools/backup.py status.")
+        if not status:
+            self.raise_alarm("backup", "warning",
+                             "No backup of this database has been made",
+                             f"The runs, the accounts and the rig's settings "
+                             f"exist only here. {how}")
+            return
+        success = status.get("last_success")
+        if not status.get("last_ok"):
+            self.raise_alarm("backup", "warning", "The last backup failed",
+                             f"{status.get('last_error') or 'no reason given'}. "
+                             + (f"The last good one is "
+                                f"{(time.time() - success) / 3600:.0f} h old."
+                                if isinstance(success, (int, float)) else
+                                "There is no good one yet."))
+        elif not isinstance(success, (int, float)) or \
+                time.time() - success > self.BACKUP_MAX_AGE_S:
+            age = (time.time() - success) / 86400 \
+                if isinstance(success, (int, float)) else None
+            self.raise_alarm("backup", "warning",
+                             "The last good backup is "
+                             + (f"{age:.0f} days old" if age is not None
+                                else "of unknown age"),
+                             f"Backups are made every six hours; none has worked "
+                             f"for more than {self.BACKUP_MAX_AGE_S / 3600:.0f} h. "
+                             f"{how}")
+        else:
+            self.clear("backup")
+
+    def _watch_recorder(self) -> None:
+        age = self.recorder.beat_age() if self.recorder is not None and \
+            hasattr(self.recorder, "beat_age") else None
+        if age is not None and age > self.RECORDER_STALL_S:
+            self.raise_alarm(
+                "recorder_stalled", "warning", "The chart recorder has stopped",
+                f"Nothing has been added to the charts for {age:.0f} s. Runs "
+                f"still record; the pump and gauge pages do not. The journal "
+                f"says why (journalctl -u tc600-web -p err).")
+        else:
+            self.clear("recorder_stalled")
 
     # --- alarms -------------------------------------------------------------
 
@@ -185,14 +461,7 @@ class Supervisor:
         def write():
             self.db.add_event(run_id, level, message, detail, user=user, at=at)
 
-        queue = getattr(self.engine, "_write", None)
-        try:
-            if queue is not None:
-                queue(write, f"{level}: {message}")
-            else:
-                write()
-        except Exception:
-            pass
+        self._store(write, f"{level}: {message}")
 
     def raise_alarm(self, key: str, level: str, title: str, detail: str,
                     actions: list | None = None) -> dict:
@@ -209,6 +478,7 @@ class Supervisor:
                         alarm["actions"] = actions
                     if escalated:
                         alarm["acknowledged"] = False
+                        self._alarms_dirty = True
                     return dict(alarm)
             alarm = {"id": self._next_id, "key": key, "level": level,
                      "title": title, "detail": detail, "raised_at": now,
@@ -220,6 +490,7 @@ class Supervisor:
                 self._alarms = self._alarms[-self.KEEP:]
         self._log("error" if level == "critical" else "warning",
                   f"ALARM: {title}. {detail}")
+        self._save_alarms()
         return dict(alarm)
 
     def clear(self, key: str) -> None:
@@ -233,6 +504,8 @@ class Supervisor:
                     cleared.append(alarm["title"])
         for title in cleared:
             self._log("info", f"Cleared: {title}")
+        if cleared:
+            self._save_alarms()
 
     def acknowledge(self, which="all", user=None) -> dict:
         """`user` is whoever acknowledged (lab/auth.py's Principal), or None."""
@@ -251,6 +524,7 @@ class Supervisor:
             self._log("action", f"{who} acknowledged {count} alarm"
                                 f"{'s' if count != 1 else ''}",
                       user=getattr(user, "username", None))
+            self._save_alarms()
         return {"ok": True, "acknowledged": count}
 
     def describe(self) -> dict:
@@ -289,10 +563,18 @@ class Supervisor:
                 and psnap.get("seq") != self._pump_seq):
             self._pump_seq = psnap.get("seq")
             self._watch_pump(pump, psnap)
+        if self._previous_life is not None:
+            self._announce_restart()
+        if self.persist and (self._alive_written is None or time.monotonic()
+                             - self._alive_written >= self.ALIVE_EVERY_S):
+            self._write_alive(clean=False)
+        self._flush_alarms()
         self._watch_runs()
         self._watch_engine()
         self._watch_orphans()
         self._watch_storage()
+        self._watch_backup()
+        self._watch_recorder()
         if gauge and gsnap and gsnap.get("connected"):
             self._watch_pressure(gauge, gsnap, psnap)
 
@@ -318,6 +600,11 @@ class Supervisor:
             why = (snap.get("error") if not snap.get("connected") else
                    f"its last reading is {age:.0f} s old" if isinstance(
                        age, (int, float)) else "its reading has no age")
+            sampler = getattr(service, "_thread", None)
+            if sampler is not None and not sampler.is_alive():
+                why = ("the panel's own sampler for it has stopped -- a fault "
+                       "in the panel, not the instrument: restart the panel, "
+                       "and see journalctl -u tc600-web -p err")
             self.raise_alarm(
                 f"{key}_offline", "critical" if key == "pump" else "warning",
                 f"No contact with the {label}",

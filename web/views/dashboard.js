@@ -104,7 +104,7 @@ function rotorState(pump) {
                      : { word: "stopped", tone: "idle" };
   }
   if (s.PumpAccel) return { word: "accelerating", tone: "accent" };
-  if (nominal && speed >= 0.95 * nominal) return { word: "at full speed", tone: "good" };
+  if (A.atFullSpeed(speed, nominal)) return { word: "at full speed", tone: "good" };
   if (sp.Standby) return { word: "in standby", tone: "idle" };
   return { word: "held down by gas load", tone: "crit" };
 }
@@ -165,6 +165,12 @@ function Stepper({ phases, current, title, off = [] }) {
     </ol>`;
 }
 
+/** The rate of change the run engine judged on its last sample, %/min, or null. */
+function engineRate(run) {
+  const rate = run?.latest?.rate_pct_min;
+  return finite(rate) ? rate : null;
+}
+
 /** What ends the current phase, and about when -- phase by phase. */
 function nextStep(run, config, samples, pump) {
   const phase = run.phase;
@@ -189,17 +195,20 @@ function nextStep(run, config, samples, pump) {
     case "crossover":
       return { text: "Waiting for the drive to accept the turbopump start." };
     case "spinup": {
-      const target = limits.nominal ? 0.95 * limits.nominal : null;
+      const target = limits.nominal ? A.JUDGEMENT.full_speed_fraction * limits.nominal : null;
       const eta = target ? A.etaToSpeed(samples, target) : null;
       return { text: target ? `Full speed (${fmt.integer(target)} Hz)`
         + (eta !== null ? ` in ${about(eta)}.` : " soon.") : "Waiting for full speed." };
     }
     case "basepressure": {
-      const rate = A.latestRate(samples);
+      // The engine's own rate -- the number it calls base pressure on --
+      // never a second fit made here from the same samples.
+      const rate = engineRate(run);
       const limit = Number(config.base_rate_pct) || 2;
       return { text: `Base pressure is called once the pressure improves by less than `
         + `${fmt.number(limit, 1)} %/min for ${fmt.number(Number(config.base_settle_min) || 3, 1)} min`
-        + (rate !== null ? ` — now ${rate < 0 ? "falling" : "rising"} ${fmt.number(Math.abs(rate), Math.abs(rate) < 10 ? 1 : 0)} %/min.` : ".") };
+        + (rate !== null ? ` — now ${rate < 0 ? "falling" : "rising"} ${fmt.number(Math.abs(rate), Math.abs(rate) < 10 ? 1 : 0)} %/min.`
+          : " — not enough readings yet to judge the rate.") };
     }
     case "backfill": {
       const working = Number(config.working_mbar);
@@ -252,7 +261,7 @@ function idleStage(pump, gaugeState, pressure, rate) {
       ? "The station is on, but the pressure is not falling: is the backing pump running, and the chamber closed?"
       : "The station is on and the turbopump is off." };
   }
-  if (nominal && speed >= 0.95 * nominal) {
+  if (A.atFullSpeed(speed, nominal)) {
     return { stage: "basepressure", text: `The turbopump is at full speed and the chamber at ${finite(pressure) ? `${fmt.pressure(pressure, 2)} mbar` : "an unknown pressure"}.` };
   }
   return { stage: "spinup", text: `The turbopump is spinning up (${fmt.integer(speed)} Hz).` };
@@ -659,9 +668,11 @@ export function DashboardView({ state, live }) {
   const limits = pumpLimits(pump);
   const rotor = rotorState(pump);
   const speed = Number(s.ActualSpd) || 0;
-  const rate = useMemo(() => A.latestRate(samples), [samples]);
+  // While a run judges the curve, quote its number; otherwise the history's.
+  const judged = run?.running ? engineRate(run) : null;
+  const rate = useMemo(() => judged ?? A.latestRate(samples), [samples, judged]);
   const spinEta = rotor.word === "accelerating" && limits.nominal
-    ? A.etaToSpeed(samples, 0.95 * limits.nominal) : null;
+    ? A.etaToSpeed(samples, A.JUDGEMENT.full_speed_fraction * limits.nominal) : null;
 
   const pressureTrend = samples.map((x) => x.p_best).filter(Boolean);
   const speedTrend = samples.map((x) => x.speed).filter(Number.isFinite);

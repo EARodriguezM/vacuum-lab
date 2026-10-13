@@ -5,6 +5,7 @@
 // snapshot; nothing talks to the network.
 
 import * as fmt from "./format.js";
+import { JUDGEMENT } from "./analysis.js";
 
 const NO_ERROR = new Set(["000000", "000", "0", ""]);
 
@@ -95,7 +96,7 @@ export function pumpSummary(pump) {
   } else if (nominal && Number(setpoints.OpModeTMP) === 1) {
     expected = nominal * (Number(setpoints.SpdSVal) || 100) / 100;
   }
-  if (motor && expected && speed > 0 && speed < expected * 0.95 && !status.PumpAccel) {
+  if (motor && expected && speed > 0 && speed < expected * JUDGEMENT.full_speed_fraction && !status.PumpAccel) {
     return {
       tone: "crit",
       headline: `Held down by gas load — ${fmt.integer(speed)} Hz`,
@@ -105,7 +106,7 @@ export function pumpSummary(pump) {
       dragged: true,
     };
   }
-  if (motor && (status.PumpAccel || (target && speed < target * 0.95))) {
+  if (motor && (status.PumpAccel || (target && speed < target * JUDGEMENT.full_speed_fraction))) {
     const share = nominal ? Math.round((speed / nominal) * 100) : null;
     return {
       tone: "warn",

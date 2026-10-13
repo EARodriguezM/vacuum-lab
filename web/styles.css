@@ -652,7 +652,8 @@ details[open] > summary { margin-bottom:10px; }
    sizes above stay for a mouse, where they read better. */
 @media (pointer: coarse) {
   button.small, button.ghost, .btn.small, .segmented button { min-height:40px; }
-  button.tiny { min-height:36px; padding:4px 10px; }
+  button.tiny { min-height:40px; padding:4px 10px; }
+  select { min-height:40px; }
   nav.tabs button { min-height:44px; }
   label.check input[type=checkbox] { width:20px; height:20px; }
 }

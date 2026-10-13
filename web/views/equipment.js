@@ -154,7 +154,7 @@ export function EquipmentView({ state, sub, onSelect, pumpProps, gaugeProps }) {
       <nav class="tabs subtabs" aria-label="Equipment">
         ${tabs.map((tab) => html`
           <button key=${tab.key} aria-current=${tab.key === active.key ? "page" : null}
-                  onClick=${() => onSelect(tab.key)}>
+                  data-test=${`subtab-${tab.key}`} onClick=${() => onSelect(tab.key)}>
             <span class=${`dot-mark ${tab.tone}`} aria-hidden="true" />${tab.label}
             ${tab.type === "actuator" && !tab.actuator.available
               ? html`<span class="off-tag">manual</span>` : null}

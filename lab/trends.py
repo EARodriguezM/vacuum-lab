@@ -24,7 +24,8 @@ summary that was wrong does not propagate: run 26 of 2026-10-08 recorded a
 `base_valid` is how that reading is kept off the trend.
 
 Finished runs never change, so each is computed once and cached by its id
-and sample count.
+and sample count. A speed that did not come back is unknown, never 0 Hz: it
+neither starts a run-up from rest nor counts as time held down.
 """
 
 from __future__ import annotations
@@ -32,13 +33,15 @@ from __future__ import annotations
 import statistics
 import threading
 
+from . import judgement
+
 #: Below this pressure the gas load on the rotor is negligible, so the
 #: drive's power at full speed is its own friction and windage.
 NO_GAS_MBAR = 1.0e-4
 
-#: The rotor counts as at full speed from this fraction of nominal, as in
-#: lab/runs.py.
-FULL_SPEED = 0.95
+#: The rotor counts as at full speed from this fraction of nominal: the run
+#: engine's own threshold (lab/judgement.py).
+FULL_SPEED = judgement.FULL_SPEED_FRACTION
 
 _cache: dict[tuple[int, int], dict] = {}
 _lock = threading.Lock()
@@ -55,20 +58,21 @@ def metrics(samples: list[dict], nominal: float | None) -> dict:
     if not samples:
         return out
     if not nominal:
-        speeds = [_number(s.get("speed")) or 0.0 for s in samples]
+        speeds = [v for s in samples if (v := _number(s.get("speed"))) is not None]
         nominal = max(speeds) if max(speeds, default=0) >= 300 else None
 
     # Run-up: motor switched on with the rotor at rest, to full speed.
     if nominal:
         for index in range(1, len(samples)):
             before, sample = samples[index - 1], samples[index]
-            speed = _number(sample.get("speed")) or 0.0
-            if before.get("motor") or not sample.get("motor") or speed > 0.05 * nominal:
+            speed = _number(sample.get("speed"))
+            if (before.get("motor") or not sample.get("motor") or speed is None
+                    or speed > 0.05 * nominal):
                 continue
             for later in samples[index:]:
                 if not later.get("motor"):
                     break
-                if (_number(later.get("speed")) or 0.0) >= FULL_SPEED * nominal:
+                if judgement.at_full_speed(_number(later.get("speed")), nominal):
                     out["runup_s"] = round(later["t"] - sample["t"], 1)
                     break
             if out["runup_s"] is not None:
@@ -77,7 +81,7 @@ def metrics(samples: list[dict], nominal: float | None) -> dict:
     # Friction: power at full speed with nothing to pump.
     if nominal:
         quiet = [_number(s.get("power")) for s in samples
-                 if (_number(s.get("speed")) or 0) >= FULL_SPEED * nominal
+                 if judgement.at_full_speed(_number(s.get("speed")), nominal)
                  and isinstance(s.get("p_best"), (int, float))
                  and 0 < s["p_best"] < NO_GAS_MBAR
                  and (_number(s.get("power")) or 0) > 0]
@@ -103,11 +107,14 @@ def metrics(samples: list[dict], nominal: float | None) -> dict:
         reached = False
         held = 0.0
         for before, sample in zip(samples, samples[1:]):
-            speed = _number(sample.get("speed")) or 0.0
-            if not sample.get("motor"):
+            speed = _number(sample.get("speed"))
+            motor = sample.get("motor")
+            if speed is None or motor is None:
+                continue                    # not read: neither held nor not
+            if not motor:
                 reached = False
                 continue
-            if speed >= FULL_SPEED * nominal:
+            if judgement.at_full_speed(speed, nominal):
                 reached = True
             elif reached and (_number(sample.get("power")) or 0) > 0:
                 held += max(0.0, sample["t"] - before["t"])
@@ -120,11 +127,11 @@ def base_valid(samples: list[dict], result: dict, nominal: float | None) -> bool
     at = (result or {}).get("time_to_base_s")
     if not isinstance(at, (int, float)) or not samples:
         return None
-    nearest = min(samples, key=lambda s: abs(s["t"] - at))
-    speed = _number(nearest.get("speed")) or 0.0
-    if not nominal:
+    read = [s for s in samples if _number(s.get("speed")) is not None]
+    if not nominal or not read:
         return None
-    return speed >= FULL_SPEED * nominal
+    nearest = min(read, key=lambda s: abs(s["t"] - at))
+    return judgement.at_full_speed(_number(nearest.get("speed")), nominal)
 
 
 def trends(database, nominal: float | None = None, limit: int = 500) -> list[dict]:

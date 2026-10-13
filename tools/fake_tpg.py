@@ -84,11 +84,14 @@ class Chamber:
         speed = self.ROUGHING_SPEED if self.station_on else 0.0
         # A turbopump only pumps usefully once the foreline is roughed out;
         # below ~1 mbar it takes over, above that it contributes nothing.
-        # The gate valve throttles what reaches it.
         if self.rotor_fraction > 0 and self.pressure < 1.0:
-            speed += (self.FULL_SPEED * self.rotor_fraction
-                      * max(0.0, min(100.0, self.gate_percent)) / 100.0)
-        return speed
+            speed += self.FULL_SPEED * self.rotor_fraction
+        # Everything reaches the pumps through the gate valve: this rig has
+        # no roughing line of its own -- it roughs through the turbopump --
+        # so a shut gate isolates the chamber. Throttling only the turbopump
+        # left a "closed" chamber pumped by the backing pump, and a rate of
+        # rise that fell.
+        return speed * max(0.0, min(100.0, self.gate_percent)) / 100.0
 
     def turbo_load(self) -> float:
         """Gas throughput the turbopump would carry at nominal speed, mbar l/s.

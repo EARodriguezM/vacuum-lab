@@ -35,7 +35,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import auth as authmod
 from . import db as dbmod
-from . import discovery, export, history, runs, trends
+from . import discovery, export, history, judgement, logs, runs, trends
 from .pump import GUARDED, OPERATOR_WRITES
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -316,7 +316,8 @@ class Application:
                  history=None, supervisor=None, finder=None,
                  chamber: dict | None = None, allow: list | None = None,
                  hosts: set[str] | None = None, origins: list | None = None,
-                 admin_from: list | None = None):
+                 admin_from: list | None = None, status_file: str | None = None,
+                 version: dict | None = None):
         self.registry = registry
         self.db = database
         self.engine = engine
@@ -349,6 +350,15 @@ class Application:
         #: One download built at a time: each reads the whole store, and two
         #: at once double the memory and the disk the rig shares with them.
         self.export_slot = threading.BoundedSemaphore(1)
+        #: Which release this is (VERSION.json, written by tools/release.py);
+        #: {"release": "dev"} when run from a working copy.
+        self.version = version or {"release": "dev"}
+        #: Where the panel says what it is doing, for tools/release.py and
+        #: anyone on the machine: in /run (RAM), so it costs the SD card
+        #: nothing. Written from the supervisor's thread, every few seconds.
+        self.status_file = status_file
+        if status_file and supervisor is not None:
+            supervisor.on_tick = self.write_status
 
     #: The longest an orderly shutdown may take, all of it. Below the unit's
     #: TimeoutStopSec (90 s), so systemd never kills the process in the
@@ -388,6 +398,9 @@ class Application:
             if self.history is not None:
                 self.history.close()
             self.registry.close()
+            # Last, and written now: a clean stop the next start can trust.
+            if self.supervisor is not None:
+                self.supervisor.mark_clean_stop()
             self.db.close()
 
     # --- composed views ---------------------------------------------------
@@ -409,11 +422,78 @@ class Application:
             # Procedures this rig cannot run, and what each is missing.
             "unavailable": self.engine.unavailable(),
             "alarms": self.supervisor.describe() if self.supervisor else None,
+            # The thresholds the engine judges by, so the panel draws with
+            # the same ones (lab/judgement.py).
+            "judgement": judgement.published(),
             "ports": {"search": bool(self.finder and self.finder.enabled),
                       "devices": self.registry.descriptors()},
             "server_time": time.time(),
             "uptime_s": round(time.time() - self.started_at, 1),
+            "release": self.version.get("release"),
+            "health": self.health(),
         }
+
+    def health(self) -> dict:
+        """How long since each of the panel's own threads last went round,
+        and how many errors they have met: a watcher that has died says
+        nothing by itself, so its silence is what the panel shows."""
+        def age(thing):
+            beat = getattr(thing, "beat_age", None)
+            value = beat() if beat else None
+            return round(value, 1) if value is not None else None
+        samplers = {}
+        for service in self.registry:
+            snap = service.snapshot()
+            thread = getattr(service, "_thread", None)
+            samplers[service.key] = {
+                "age_s": snap.get("age"),
+                "alive": bool(thread and thread.is_alive())}
+        tick = getattr(self.engine, "tick_age", None)
+        return {"supervisor_s": age(self.supervisor),
+                "history_s": age(self.history),
+                "engine_tick_s": tick() if tick else None,
+                "samplers": samplers,
+                "errors": logs.total()}
+
+    def status(self) -> dict:
+        """What the status file holds: whether the rig may be restarted."""
+        engine = self.engine.status()
+        run = engine.get("run") if engine.get("running") else None
+        shutdown = self.engine.shutdown_status()
+        alarms = (self.supervisor.describe()["alarms"]
+                  if self.supervisor is not None else [])
+        recovering = getattr(self.supervisor, "recovering", None) or {}
+        return {
+            "written": time.time(),
+            "pid": os.getpid(),
+            "release": self.version.get("release"),
+            "build": self.build,
+            "run": {"id": run.get("id"), "procedure": engine.get("procedure")}
+            if run else None,
+            "shutdown": shutdown if shutdown and shutdown.get("active") else None,
+            "securing": bool(recovering.get("active")
+                             or (engine.get("secure") or {}).get("active")),
+            "ports": {s.key: s.port for s in self.registry},
+            "connected": {s.key: bool(s.snapshot().get("connected"))
+                          for s in self.registry},
+            "critical": sum(1 for a in alarms if a.get("level") == "critical"
+                            and a.get("active")),
+            "alarms": len(alarms),
+        }
+
+    def write_status(self) -> None:
+        """Replace the status file in one rename; readable by this user only."""
+        if not self.status_file:
+            return
+        folder = os.path.dirname(self.status_file)
+        if folder and not os.path.isdir(folder):
+            os.makedirs(folder, mode=0o700, exist_ok=True)
+        temporary = self.status_file + ".tmp"
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                             0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
+            json.dump(self.status(), fh)
+        os.replace(temporary, self.status_file)
 
     def live(self, limit: int = 600, points: int | None = None,
              since: float | None = None) -> dict:
@@ -437,11 +517,9 @@ class Application:
 
     def trends(self) -> dict:
         """Health indicators of every finished run, oldest first."""
-        nominal = None
-        if "pump" in self.registry:
-            value = self.registry.get("pump").snapshot().get("identity", {}) \
-                .get("NominalSpd")
-            nominal = value if isinstance(value, (int, float)) else None
+        # The run engine's own full speed: never unknown while a pump is
+        # configured (the drive's, else its setpoint, else its rating).
+        nominal = self.engine.nominal_speed()
         return {"ok": True, "runs": trends.trends(self.db, nominal)}
 
     def history_window(self, seconds: float | None, points: int,

@@ -30,9 +30,12 @@ import time
 from collections import deque
 
 from . import db as dbmod
+from . import judgement
 from . import process
 from . import pump as pumpmod
 from .history import SHAPE_KEYS, decimate
+# Kept importable from here: the curve maths moved to lab/judgement.py.
+from .judgement import linear_fit, relative_rate  # noqa: F401
 from .pump import TURBO_START_MAX_MBAR
 
 #: Payload of a TC 600 error-code parameter when nothing is wrong. (It read
@@ -70,52 +73,6 @@ class Abort(Exception):
 
 
 # --- analysis helpers -----------------------------------------------------
-
-
-def linear_fit(points: list[tuple[float, float]]) -> dict | None:
-    """Least-squares fit of p = a + b*t, with the coefficient of determination.
-
-    R² is reported because a rate-of-rise measurement is only meaningful when
-    the rise is linear: a curve that bends is still outgassing or still
-    settling, and its slope is not a leak rate.
-    """
-    n = len(points)
-    if n < 3:
-        return None
-    sum_t = sum(t for t, _ in points)
-    sum_p = sum(p for _, p in points)
-    mean_t, mean_p = sum_t / n, sum_p / n
-
-    variance = sum((t - mean_t) ** 2 for t, _ in points)
-    if variance == 0:
-        return None
-    covariance = sum((t - mean_t) * (p - mean_p) for t, p in points)
-    slope = covariance / variance
-    intercept = mean_p - slope * mean_t
-
-    total = sum((p - mean_p) ** 2 for _, p in points)
-    residual = sum((p - (intercept + slope * t)) ** 2 for t, p in points)
-    r_squared = 1.0 - residual / total if total > 0 else 1.0
-    return {"slope": slope, "intercept": intercept, "r_squared": r_squared,
-            "points": n}
-
-
-def relative_rate(points: list[tuple[float, float]]) -> float | None:
-    """How fast a pressure is changing, in percent per minute.
-
-    Fits ln(p) against time rather than p, because d(ln p)/dt is exactly
-    (dp/dt)/p -- a fractional rate. On a quantity that spans decades that is
-    the only rate worth quoting: 1e-4 mbar falling by 1e-5 mbar/min and 1e-6
-    falling by 1e-7 mbar/min are the same process at different depths, and an
-    absolute threshold would call one "still pumping" and the other "flat".
-
-    Negative means falling. Returns None if there is not enough to fit.
-    """
-    usable = [(t, math.log(p)) for t, p in points if p > 0]
-    fit = linear_fit(usable)
-    if fit is None:
-        return None
-    return fit["slope"] * 60.0 * 100.0
 
 
 def statistics(values: list[float]) -> dict:
@@ -164,6 +121,12 @@ class Procedure:
     #: natural end, so that stopping is the intended way to finish and
     #: filing it under failures would be wrong.
     stop_is_completion = False
+
+    @classmethod
+    def config_problems(cls, config: dict) -> list[str]:
+        """What is wrong with a configuration whose every field is in range:
+        fields that cannot work together. Nothing, unless a recipe says."""
+        return []
 
     #: Seconds between repeats of the same "waiting for the interlock" note.
     HOLD_LOG_S = 60.0
@@ -373,7 +336,7 @@ class PumpDown(Procedure):
 
         elif self.phase == "turbo":
             nominal = engine.nominal_speed() or 0
-            if nominal and speed >= 0.95 * nominal:
+            if nominal and speed >= judgement.FULL_SPEED_FRACTION * nominal:
                 engine.log("info", f"Turbopump at full speed ({speed:.0f} Hz)")
                 self.enter("pumping")
             elif not nominal and speed > 0:
@@ -519,18 +482,53 @@ class RateOfRise(Procedure):
             "start_mbar": points[0][1] if points else None,
             "end_mbar": points[-1][1] if points else None,
         }
-        if fit:
+        if fit and len({p for _, p in points}) == 1:
+            summary["verdict"] = "frozen"
+            # Not one reading changed. An isolated chamber always rises, if
+            # only by outgassing, and the gauge reports five significant
+            # digits: a curve this flat is a gauge that has stopped
+            # measuring. Its fit is "R² 1, no rise at all" -- a perfect
+            # leak-tight chamber, which is the one thing it is not evidence of.
+            summary.update({
+                "rise_mbar_per_s": None, "rise_mbar_per_h": None,
+                "leak_rate_mbar_l_s": None, "r_squared": None,
+                "linear": False,
+                "caveat": (
+                    f"The pressure did not change at all over {len(points)} "
+                    f"readings ({points[0][1]:.2E} mbar each time). An "
+                    f"isolated chamber always rises, so the gauge has "
+                    f"stopped measuring: check it before trusting any "
+                    f"leak rate."),
+            })
+        elif fit and fit["slope"] < 0:
+            # Falling: something is still pumping the chamber -- a gate not
+            # shut, or a second pump. Its slope is not a leak rate at all.
+            summary.update({
+                "rise_mbar_per_s": fit["slope"],
+                "rise_mbar_per_h": fit["slope"] * 3600.0,
+                "leak_rate_mbar_l_s": None, "r_squared": fit["r_squared"],
+                "linear": False, "verdict": "falling",
+                "caveat": (
+                    "The pressure fell while the chamber was meant to be "
+                    "isolated, so something was still pumping it: check that "
+                    "the gate valve is shut. A falling curve has no leak "
+                    "rate."),
+            })
+        elif fit:
             rise = fit["slope"]                       # mbar per second
             summary.update({
                 "rise_mbar_per_s": rise,
                 "rise_mbar_per_h": rise * 3600.0,
                 "leak_rate_mbar_l_s": rise * self.volume,
                 "r_squared": fit["r_squared"],
-                "linear": fit["r_squared"] >= 0.95,
+                "linear": fit["r_squared"] >= judgement.LINEAR_R2,
+                "verdict": ("linear" if fit["r_squared"] >= judgement.LINEAR_R2
+                            else "bent"),
             })
-            if fit["r_squared"] < 0.95:
+            if fit["r_squared"] < judgement.LINEAR_R2:
                 summary["caveat"] = (
-                    "The rise is not linear (R² < 0.95), so this figure is an "
+                    f"The rise is not linear (R² < {judgement.LINEAR_R2}), so "
+                    "this figure is an "
                     "outgassing transient rather than a leak rate. Pump "
                     "longer before isolating, or extend the settling time.")
         else:
@@ -774,12 +772,73 @@ class VacuumSequence(Procedure):
          "default": DEFAULT_INTERVAL_S, "unit": "s", "min": 1, "max": 60},
     )
 
-    #: Rolling window used to judge whether the pressure has flattened.
-    RATE_WINDOW_S = 120.0
+    #: Rolling window used to judge whether the pressure has flattened. The
+    #: thresholds here are lab/judgement.py's, which the panel draws with.
+    RATE_WINDOW_S = judgement.RATE_WINDOW_S
+
+    @classmethod
+    def rate_window_for(cls, interval: float) -> float:
+        """The window the rate is fitted over at this sample interval.
+
+        The shared 120 s, or wide enough to hold the readings a rate needs --
+        and one more, so a single lost reading does not restart the settle --
+        when they come further apart. At 30 s and more a fixed 120 s window
+        never held five readings, and base pressure was never declared.
+        """
+        return max(cls.RATE_WINDOW_S,
+                   (judgement.RATE_MIN_POINTS + 1) * max(1.0, interval))
+
+    @classmethod
+    def base_minimum_s(cls, interval: float, settle: float) -> float:
+        """The soonest base pressure can be called on a flat curve, counted
+        the way the engine steps: the first reading one interval in, then
+        enough readings for a rate -- the minimum number, spanning their
+        share of the window -- then the settle, in whole intervals; and one
+        interval and one tick more, for a reading lost and one taken late."""
+        interval = max(1.0, interval)
+        span = judgement.RATE_MIN_SPAN * cls.rate_window_for(interval)
+        readings = max((judgement.RATE_MIN_POINTS - 1) * interval,
+                       math.ceil(span / interval) * interval)
+        return (interval + readings + math.ceil(settle / interval) * interval
+                + interval + RunEngine.TICK_S)
+
+    @classmethod
+    def config_problems(cls, config: dict) -> list[str]:
+        """A base timeout too short for base pressure ever to be called."""
+        try:
+            timeout = float(config.get("base_timeout_min") or 0) * 60.0
+            interval = max(1.0, float(config.get("interval_s")
+                                      or cls.DEFAULT_INTERVAL_S))
+            settle = float(config.get("base_settle_min")
+                           or cls.DEFAULT_BASE_SETTLE_MIN) * 60.0
+        except (TypeError, ValueError):
+            return []
+        if timeout <= 0:                    # no limit
+            return []
+        needed = cls.base_minimum_s(interval, settle)
+        if timeout >= needed:
+            return []
+        return [f'"Give up looking for base after" must be at least '
+                f"{math.ceil(needed / 60)} min with these settings: with a "
+                f"reading every {interval:g} s the rate needs a while to be "
+                f"known, and must then stay flat for {settle / 60:g} min"]
+
+    def _recent_rate(self, now: float) -> float | None:
+        """The rate over the last two minutes alone (at least two readings'
+        worth): at long sample intervals the window widens to hold its
+        readings, and a wide window lags -- a curve that has just turned
+        upward still averages flat. None with fewer than three readings."""
+        span = max(self.RATE_WINDOW_S, 2 * self.interval) + self.interval / 2
+        recent = [(t, math.log(p)) for t, p in self._window
+                  if now - t <= span and p > 0]
+        if len(recent) < 3:
+            return None
+        fit = linear_fit(recent)
+        return fit["slope"] * 6000.0 if fit else None
 
     #: The rotor counts as "at full speed" from this fraction of nominal. Spin-up
     #: ends here, and base pressure is only judged while the rotor stays here.
-    FULL_SPEED_FRACTION = 0.95
+    FULL_SPEED_FRACTION = judgement.FULL_SPEED_FRACTION
 
     #: How long the gas load may hold the rotor below full speed, once it has
     #: reached it, before the run ends. Run 26 (2026-10-08) sat there twelve
@@ -793,7 +852,7 @@ class VacuumSequence(Procedure):
     #: after its rotor crossed 1200 Hz -- and only 65 s after it first left
     #: full speed -- so a dwell timer alone protects nothing there. At the
     #: drag rate that run showed, 85 % comes about half a minute before 80 %.
-    PROTECT_FRACTION = 0.85
+    PROTECT_FRACTION = judgement.PROTECT_FRACTION
 
     #: Why the rotor is held at its final rotation speed for this recipe.
     #: Overridden where the reason is not the deposition one.
@@ -803,6 +862,7 @@ class VacuumSequence(Procedure):
     def begin_vacuum(self, engine: "RunEngine") -> None:
         self.interval = max(1.0, self.number("interval_s",
                                              self.DEFAULT_INTERVAL_S))
+        self.rate_window = self.rate_window_for(self.interval)
         # A recipe may cross over deeper than the interlock demands, never
         # shallower: asking for a value above TURBO_START_MAX_MBAR would leave
         # the run stuck in the crossover phase asking for a start the pump
@@ -921,10 +981,10 @@ class VacuumSequence(Procedure):
         now = sample["t"]
         if isinstance(pressure, (int, float)) and pressure > 0:
             self._window.append((now, pressure))
-            while self._window and now - self._window[0][0] > self.RATE_WINDOW_S:
+            while self._window and now - self._window[0][0] > self.rate_window:
                 self._window.popleft()
 
-        rate = relative_rate(list(self._window))
+        rate = relative_rate(list(self._window), self.rate_window)
         sample["rate_pct_min"] = rate
 
         # A flat curve is only a base pressure if the pump is doing its full
@@ -935,9 +995,14 @@ class VacuumSequence(Procedure):
         # rotor dragged down to 1160 Hz of 1500, twelve minutes before it
         # tripped on over-temperature. That plateau describes the gas
         # coming in, not the chamber, so it must not be recorded as either.
-        speed = sample.get("speed") or 0
+        speed = sample.get("speed")
+        # A speed that did not come back is not a rotor held down -- it used
+        # to read as 0 Hz, log "held below full speed by the gas load" and
+        # restart the settle -- but nor does it show full speed, so base
+        # pressure is never called on that sample.
+        speed_read = isinstance(speed, (int, float))
         nominal = engine.nominal_speed() or 0
-        if nominal and speed < self.FULL_SPEED_FRACTION * nominal:
+        if nominal and speed_read and speed < self.FULL_SPEED_FRACTION * nominal:
             self._flat_since = None
             self.note_hold(
                 engine,
@@ -947,11 +1012,14 @@ class VacuumSequence(Procedure):
                 + (f" (the chamber is at {pressure:.2E} mbar)."
                    if isinstance(pressure, (int, float)) else "."),
                 "rotor_dragged")
-        elif rate is not None and abs(rate) <= self.base_rate_limit:
+        elif rate is not None and abs(rate) <= self.base_rate_limit and (
+                (recent := self._recent_rate(now)) is None
+                or abs(recent) <= self.base_rate_limit):
             if self._flat_since is None:
                 self._flat_since = now
             elif now - self._flat_since >= self.base_settle and \
-                    isinstance(pressure, (int, float)):
+                    isinstance(pressure, (int, float)) and \
+                    (speed_read or not nominal):
                 # The base pressure is this sample's reading, so it waits
                 # for a sample that has one: a gauge dropout here used to
                 # crash the run on formatting None.
@@ -967,16 +1035,32 @@ class VacuumSequence(Procedure):
             self._flat_since = None
 
         if self.base_timeout and self.phase_age(engine) >= self.base_timeout:
-            where = (f"at {pressure:.2E} mbar" if isinstance(pressure, (int, float))
-                     else "without a reading at this moment")
-            raise Abort(
-                f"gave up after {self.base_timeout / 60:.0f} min: the chamber "
-                f"is {where} and still improving by {abs(rate):.1f} %/min. "
-                f"Suspect a leak, a wet chamber, or a target that needs "
-                f"baking." if rate is not None else
-                f"gave up after {self.base_timeout / 60:.0f} min without a "
-                f"usable pressure reading")
+            raise Abort(self._base_timeout_message(pressure, rate, now))
         return None
+
+    def _base_timeout_message(self, pressure, rate, now: float) -> str:
+        """Why base pressure was not reached in time -- each cause by name."""
+        after = f"gave up after {self.base_timeout / 60:.0f} min"
+        where = (f"at {pressure:.2E} mbar" if isinstance(pressure, (int, float))
+                 else "without a reading at this moment")
+        if rate is None and not self._window:
+            return f"{after} without a usable pressure reading"
+        if rate is None:
+            return (f"{after} with too few readings to judge the rate: "
+                    f"{len(self._window)} in the last {self.rate_window:.0f} s, "
+                    f"where it needs {judgement.RATE_MIN_POINTS} spanning "
+                    f"{judgement.RATE_MIN_SPAN * self.rate_window:.0f} s. "
+                    f"Look for gauge dropouts, or sample more often.")
+        if abs(rate) <= self.base_rate_limit:
+            flat = now - self._flat_since if self._flat_since is not None else 0
+            return (f"{after}: the chamber is {where} and flat ({rate:+.2f} "
+                    f"%/min), but had stayed flat for only {flat:.0f} s of the "
+                    f"{self.base_settle:.0f} s needed. Allow more time, or "
+                    f"shorten the settle.")
+        return (f"{after}: the chamber is {where} and still "
+                + ("improving" if rate < 0 else "rising")
+                + f" by {abs(rate):.1f} %/min. Suspect a leak, a wet chamber, "
+                  f"or a target that needs baking.")
 
     def after_base_pressure(self) -> str:
         """What happens once base pressure is reached. Recipes override this."""
@@ -1518,9 +1602,10 @@ class FullVacuum(VacuumSequence):
         pressure = sample.get("p_best")
         if isinstance(pressure, (int, float)) and pressure > 0:
             self._window.append((now, pressure))
-            while self._window and now - self._window[0][0] > self.RATE_WINDOW_S:
+            while self._window and now - self._window[0][0] > self.rate_window:
                 self._window.popleft()
-        sample["rate_pct_min"] = relative_rate(list(self._window))
+        sample["rate_pct_min"] = relative_rate(list(self._window),
+                                               self.rate_window)
         return None
 
     # -- watching, in every phase -----------------------------------------
@@ -1680,6 +1765,9 @@ def settle_config(procedure: type[Procedure], given) -> tuple[dict, list[str]]:
                 config[key] = number
         else:
             config[key] = value
+    if not problems:
+        # Fields that are each in range can still not work together.
+        problems.extend(procedure.config_problems(config))
     return config, problems
 
 

@@ -28,6 +28,7 @@ import { HistoryView } from "./views/history.js";
 import { SettingsView } from "./views/settings.js";
 import { ChangePassword, LoginView, ReauthDialog } from "./views/login.js";
 import * as fmt from "./format.js";
+import { setJudgement } from "./analysis.js";
 
 const TABS = [
   { key: "dashboard", label: "Dashboard" },
@@ -116,7 +117,7 @@ function OverrideDialog({ request, onCancel, onConfirm }) {
   if (!request) return null;
   return html`
     <div class="overlay" onClick=${(e) => e.target === e.currentTarget && onCancel()}>
-      <div class="dialog" role="dialog" aria-modal="true">
+      <div class="dialog" role="dialog" aria-modal="true" data-test="override-dialog">
         <h2>Override: ${request.label}</h2>
         <div class="small">
           <p><strong>The interlock refuses this:</strong> ${request.reason}</p>
@@ -130,16 +131,17 @@ function OverrideDialog({ request, onCancel, onConfirm }) {
         <label class="field">
           <span>Why it is safe now</span>
           <input value=${why} maxlength="300" placeholder="What you checked, in a sentence"
-                 onInput=${(e) => setWhy(e.target.value)} />
+                 data-test="override-reason" onInput=${(e) => setWhy(e.target.value)} />
         </label>
         <label class="check">
-          <input type="checkbox" checked=${sure} onChange=${(e) => setSure(e.target.checked)} />
+          <input type="checkbox" checked=${sure} data-test="override-checked"
+                 onChange=${(e) => setSure(e.target.checked)} />
           <span>I have checked the chamber and the pump myself.</span>
         </label>
         <div class="actions">
-          <button onClick=${onCancel}>Cancel</button>
+          <button data-test="override-cancel" onClick=${onCancel}>Cancel</button>
           <button class="danger" disabled=${!sure || !request.rule || why.trim().length < 3}
-                  onClick=${() => onConfirm(why.trim())}>
+                  data-test="override-confirm" onClick=${() => onConfirm(why.trim())}>
             Override and send</button>
         </div>
       </div>
@@ -225,7 +227,7 @@ function WatchingNotice({ me, control, onReauth, onTakeOver }) {
       <${Banner} tone="warn">
         <strong>Watching only.</strong> Nothing was touched for a while, so the
         controls wait for your password.
-        <button class="small" style="margin-left:10px" onClick=${onReauth}>
+        <button data-test="reauth-open" class="small" style="margin-left:10px" onClick=${onReauth}>
           Enter password</button>
       <//>`;
   }
@@ -398,6 +400,7 @@ function App() {
           }
         }
         // Everything in one synchronous block: Preact redraws once.
+        setJudgement(next.judgement);
         setState(next);
         setError(null);
         applyOthers();
@@ -777,7 +780,7 @@ function App() {
       <nav class="tabs">
         ${TABS.map((entry) => html`
           <button key=${entry.key} aria-current=${tab === entry.key ? "page" : null}
-                  onClick=${() => navigate(entry.key)}>
+                  data-test=${`tab-${entry.key}`} onClick=${() => navigate(entry.key)}>
             ${entry.label}
             ${entry.key === "tests" && run?.running
               ? html`<span class="badge pill accent"><span class="dot" />live</span>`
@@ -793,6 +796,16 @@ function App() {
 
       <${AlarmBar} alarms=${state?.alarms} onAcknowledge=${acknowledgeAlarms}
                    busy=${safeLocked} />
+      ${state?.health && !(Number.isFinite(state.health.supervisor_s)
+                            && state.health.supervisor_s < 10) && html`
+        <${Banner} tone="crit">
+          <strong>Nothing is raising alarms.</strong> The panel's watcher has
+          ${!Number.isFinite(state.health.supervisor_s) ? "not started"
+            : `not looked at the rig for ${fmt.integer(state.health.supervisor_s)} s`}:
+          faults, a lost link or a dragged rotor will not be announced, and
+          a drive fault will not be made safe. Restart the panel, and see
+          <span class="mono">journalctl -u tc600-web -p err</span> for why.
+        <//>`}
 
       ${showShutdown && html`
         <${Banner} tone=${shutdown.active ? "warn"

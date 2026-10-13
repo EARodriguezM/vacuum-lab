@@ -31,9 +31,9 @@ function ResultSummary({ procedure, result }) {
     rows.push(["Ultimate pressure", p(result.ultimate_mbar) + " mbar"]);
     rows.push(["Final pressure", p(result.final_mbar) + " mbar"]);
   } else if (procedure === "rate_of_rise") {
-    rows.push(["Leak rate", result.leak_rate_mbar_l_s !== undefined
+    rows.push(["Leak rate", result.leak_rate_mbar_l_s != null
       ? `${p(result.leak_rate_mbar_l_s, 3)} mbar·L/s` : "—"]);
-    rows.push(["Rise", result.rise_mbar_per_h !== undefined
+    rows.push(["Rise", result.rise_mbar_per_h != null
       ? `${p(result.rise_mbar_per_h, 3)} mbar/h` : "—"]);
     rows.push(["Chamber volume", `${fmt.number(result.volume_l, 2)} L`]);
     rows.push(["Fit quality R²", fmt.number(result.r_squared, 4)]);
@@ -78,7 +78,7 @@ function OperatorPrompt({ prompt, onAcknowledge, busy }) {
   if (!prompt) return null;
   const waiting = prompt.since ? (Date.now() / 1000) - prompt.since : 0;
   return html`
-    <section class="card prompt-card">
+    <section class="card prompt-card" data-test="prompt">
       <div class="prompt-head">
         <span class="pill warn"><span class="dot" />Waiting for you</span>
         <span class="small muted">${fmt.duration(waiting)}</span>
@@ -86,7 +86,8 @@ function OperatorPrompt({ prompt, onAcknowledge, busy }) {
       <p class="prompt-text">${prompt.instruction}</p>
       ${prompt.note && html`<p class="hint">${prompt.note}</p>`}
       <div class="row">
-        <button class="primary" disabled=${busy} onClick=${onAcknowledge}>
+        <button class="primary" disabled=${busy} onClick=${onAcknowledge}
+                data-test="prompt-done">
           Done — continue the run
         </button>
         <span class="small muted">
@@ -140,7 +141,8 @@ function LiveRun({ run, samples, events, onStop, onAcknowledge, busy, stopBusy,
                hint=${`${run.label} · ${run.mode === "auto" ? "automatic" : "guided"}` +
                       ` · started ${fmt.dateTime(run.run?.started_at)}`}
                actions=${html`
-                 <button class="danger" disabled=${stopBusy ?? busy} onClick=${onStop}>
+                 <button class="danger" disabled=${stopBusy ?? busy} onClick=${onStop}
+                         data-test="run-stop">
                    ${run.stopping ? "Stopping…" : "Stop run"}</button>`}>
         <div class="phases">
           ${phases.map((phase, position) => html`
@@ -283,7 +285,7 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
       <${Card}>
         <div class="row">
           <button class="primary" disabled=${busy || absent.length > 0 || problems.length > 0}
-                  onClick=${start}>
+                  data-test="run-start" onClick=${start}>
             Start ${procedure.label.toLowerCase()}
           </button>
           <span class="small muted">
@@ -386,7 +388,7 @@ function AfterRun({ last, state, onDismiss }) {
             Run ${last.id} ${last.status}: ${last.name || last.label}</span>
           <div class="row">
             <a class="btn" href=${`#history/${last.id}`}>Open in History</a>
-            <button class="primary" onClick=${onDismiss}>Start a new run</button>
+            <button class="primary" data-test="run-new" onClick=${onDismiss}>Start a new run</button>
           </div>
         </div>
         ${last.message && html`<div>${last.message}</div>`}

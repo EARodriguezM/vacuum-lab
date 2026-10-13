@@ -26,6 +26,7 @@ everyone else's sign-up from Settings -> People.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import sys
@@ -121,10 +122,16 @@ def build(args) -> api.Application:
     # whole rig, kept whether or not a run is recording. Memory only.
     recorder = history.History(devices, hardware).start()
     # Alarms, and the pump's safe state after a fault -- whether or not a run
-    # is recording. It never switches the forevacuum pump off.
+    # is recording. It never switches the forevacuum pump off. It keeps the
+    # alarms and its own heartbeat in the database, so a restart is said
+    # and nothing unacknowledged is lost; and it watches the backups --
+    # except in the simulator, whose database is a scratch one.
+    backups = None if (args.simulate or args.no_backup_alarm) else \
+        os.path.join(data_dir, "backup-status.json")
     supervisor = alarms.Supervisor(
         devices, engine, database,
-        auto_recover=not args.no_auto_recovery).start()
+        auto_recover=not args.no_auto_recovery, persist=True,
+        backup_status=backups, recorder=recorder)
     # Who may watch and who may drive, per chamber. Sessions outlive a
     # restart -- they are in the database -- so a deploy does not sign every
     # tablet out; the expired ones are swept here.
@@ -133,7 +140,7 @@ def build(args) -> api.Application:
                          run_idle_s=args.run_idle_minutes * 60,
                          runner=engine.runner)
     database.purge_sessions()
-    return api.Application(devices, database, engine, auth=accounts,
+    application = api.Application(devices, database, engine, auth=accounts,
                            history=recorder, supervisor=supervisor,
                            finder=finder,
                            chamber={"id": args.chamber_id,
@@ -142,10 +149,38 @@ def build(args) -> api.Application:
                            hosts=api.machine_names(
                                [n for n in args.host_name.split(",") if n]),
                            origins=[o for o in args.allow_origin.split(",") if o],
-                           admin_from=api.parse_networks(args.admin_from))
+                           admin_from=api.parse_networks(args.admin_from),
+                           status_file=status_path(args),
+                           version=read_version())
+    # Started once the Application has set its status hook.
+    supervisor.start()
+    return application
 
 
-def main() -> int:
+def read_version() -> dict:
+    """VERSION.json beside this file, written by tools/release.py; a working
+    copy has none, and calls itself "dev"."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "VERSION.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            version = json.load(fh)
+        return version if isinstance(version, dict) else {"release": "dev"}
+    except (OSError, ValueError):
+        return {"release": "dev"}
+
+
+def status_path(args) -> str | None:
+    """Where the panel says what it is doing: --status-file, else systemd's
+    runtime directory for the unit (/run/vacuum-lab), else nowhere."""
+    if args.status_file:
+        return args.status_file
+    runtime = os.environ.get("RUNTIME_DIRECTORY")
+    return os.path.join(runtime.split(":")[0], "status.json") if runtime else None
+
+
+def parse(argv: list[str] | None = None) -> argparse.Namespace:
+    """The command line, checked. tools/uitest.py builds a panel from it too."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--serial", default="auto",
                         help="serial port of the TC 600 (via RS-485), or "
@@ -220,18 +255,29 @@ def main() -> int:
     parser.add_argument("--no-port-search", action="store_true",
                         help="use exactly the ports given; never probe other "
                              "ports for the instruments")
+    parser.add_argument("--status-file", default="",
+                        help="where to write what the panel is doing, every "
+                             "few seconds (default: the systemd runtime "
+                             "directory, /run/vacuum-lab/status.json)")
+    parser.add_argument("--no-backup-alarm", action="store_true",
+                        help="do not alarm about this database's backups -- "
+                             "for a machine whose backups are made elsewhere")
     parser.add_argument("--no-auto-recovery", action="store_true",
                         help="raise alarms on a drive fault but do not make "
                              "the pump safe automatically (motor off, fault "
                              "acknowledged, forevacuum pump kept on)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     for flag, value in (("--allow-from", args.allow_from),
                         ("--admin-from", args.admin_from)):
         try:
             api.parse_networks(value)
         except ValueError as exc:
             parser.error(f"{flag}: {exc}")
+    return args
 
+
+def main() -> int:
+    args = parse()
     application = build(args)
     api.Handler.app = application
 
@@ -241,6 +287,9 @@ def main() -> int:
     for device in application.registry:
         print(f"  {device.label}: {device.port}")
     print(f"  database: {application.db.path}")
+    print(f"  release: {application.version.get('release')}"
+          + (f", status in {application.status_file}"
+             if application.status_file else ""))
     print(f"  interlocks: the turbopump may not start above "
           f"{pump.TURBO_START_MAX_MBAR:.0E} mbar; the station may not stop "
           f"until {pump.STOP_DWELL_SECONDS:.0f}s after the rotor reads 0 Hz")

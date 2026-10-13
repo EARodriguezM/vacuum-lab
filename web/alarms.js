@@ -38,12 +38,13 @@ export function AlarmBar({ alarms, onAcknowledge, busy }) {
   if (!list.length) return null;
   const critical = list.filter((a) => a.level === "critical").length;
   return html`
-    <section class=${`alarm-bar ${critical ? "crit" : "warn"}`} role="alert">
+    <section class=${`alarm-bar ${critical ? "crit" : "warn"}`} role="alert" data-test="alarm-bar">
       <header>
         <strong>${critical ? `${critical} critical alarm${critical > 1 ? "s" : ""}` : "Warning"}
           ${list.length > critical ? ` · ${list.length - critical} warning${list.length - critical > 1 ? "s" : ""}` : ""}</strong>
         ${list.length > 1 && html`
-          <button class="small" disabled=${busy} onClick=${() => onAcknowledge("all")}>
+          <button class="small" disabled=${busy} onClick=${() => onAcknowledge("all")}
+                  data-test="alarm-ack-all">
             Acknowledge all</button>`}
       </header>
       ${list.slice(0, 4).map((alarm) => html`
@@ -54,7 +55,7 @@ export function AlarmBar({ alarms, onAcknowledge, busy }) {
             <strong class="alarm-title">${alarm.title}</strong>
             <span class="small muted">${fmt.clock(alarm.raised_at)} · ${since(alarm.raised_at)} ago
               ${!alarm.active && alarm.cleared_at ? ` · cleared ${fmt.clock(alarm.cleared_at)}` : ""}</span>
-            <button class="small right" disabled=${busy}
+            <button class="small right" disabled=${busy} data-test="alarm-ack"
                     onClick=${() => onAcknowledge(alarm.id)}>Acknowledge</button>
           </div>
           <p class="alarm-detail">${alarm.detail}</p>

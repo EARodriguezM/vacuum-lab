@@ -21,6 +21,8 @@ import threading
 import time
 from collections import deque
 
+from . import logs
+
 #: Columns kept for every row, in order. `at` is the wall-clock time; the
 #: rest match the run-sample columns of the same name.
 FIELDS = (
@@ -93,6 +95,8 @@ class History:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        #: When the loop last went round (monotonic), for the supervisor.
+        self.beat: float | None = None
 
     # --- recording ----------------------------------------------------------
 
@@ -106,12 +110,16 @@ class History:
     def close(self) -> None:
         self._stop.set()
 
+    def beat_age(self) -> float | None:
+        return None if self.beat is None else time.monotonic() - self.beat
+
     def _loop(self) -> None:
         while not self._stop.is_set():
+            self.beat = time.monotonic()
             try:
                 self.record()
-            except Exception:                 # never kill the recorder
-                pass
+            except Exception as exc:          # never kill the recorder --
+                logs.error("history", exc)    # but say why it is missing rows
             self._stop.wait(self.interval)
 
     def record(self, now: float | None = None) -> dict:

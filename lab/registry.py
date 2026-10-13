@@ -131,6 +131,11 @@ class DeviceService:
     def driver(self):
         """The live driver object, opening the link if it is not up yet."""
         if self._driver is None:
+            if self._stop.is_set():
+                # Closed: a late command -- a thread finishing after the
+                # shutdown -- must not open the port again behind it.
+                raise ConnectionError(f"{self.label}: closed, the panel is "
+                                      f"stopping")
             self._driver = self._open()
         return self._driver
 

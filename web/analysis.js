@@ -7,6 +7,35 @@
 
 const finite = (value) => typeof value === "number" && Number.isFinite(value);
 
+/**
+ * The thresholds a curve and a rotor are judged by, as the server publishes
+ * them (`judgement` in /api/state, from lab/judgement.py). These are the same
+ * numbers, for the moments before the first poll; the selftest checks they
+ * agree. The run engine decides with the server's copy, so the panel must not
+ * keep one of its own.
+ */
+export const JUDGEMENT = {
+  full_speed_fraction: 0.95,
+  protect_fraction: 0.85,
+  linear_r2: 0.95,
+  rate_window_s: 120,
+  rate_min_points: 5,
+  rate_min_span: 0.4,
+};
+
+/** Take the server's thresholds; anything missing or not a number is kept. */
+export function setJudgement(published) {
+  for (const key of Object.keys(JUDGEMENT)) {
+    if (finite(published?.[key])) JUDGEMENT[key] = published[key];
+  }
+}
+
+/** Whether the rotor is at full speed; null when the speed or nominal is unknown. */
+export function atFullSpeed(speed, nominal) {
+  if (!finite(speed) || !finite(nominal) || nominal <= 0) return null;
+  return speed >= JUDGEMENT.full_speed_fraction * nominal;
+}
+
 /** History rows ({fields, rows}) into sample objects with `t` = wall clock. */
 export function historySamples(payload) {
   if (!payload?.fields || !payload?.rows) return [];
@@ -71,11 +100,13 @@ export function linearFit(points) {
  * Fractional rate of change of pressure, %/min, over a trailing window.
  *
  * A fit of ln(p) against t, exactly what the run engine's base-pressure
- * judgement uses (`relative_rate` in lab/runs.py): d(ln p)/dt is (dp/dt)/p,
- * a rate that means the same thing at 1e-3 mbar and at 1e-7. Negative is
- * falling. Running sums keep it linear in the number of samples.
+ * judgement uses (`relative_rate` in lab/judgement.py), with the same
+ * minimum -- `rate_min_points` readings spanning `rate_min_span` of the
+ * window: d(ln p)/dt is (dp/dt)/p, a rate that means the same thing at
+ * 1e-3 mbar and at 1e-7. Negative is falling. Running sums keep it linear in
+ * the number of samples.
  */
-export function fractionalRate(samples, windowS = 120, key = "p_best") {
+export function fractionalRate(samples, windowS = JUDGEMENT.rate_window_s, key = "p_best") {
   const out = [];
   const window = [];
   let head = 0;
@@ -89,7 +120,8 @@ export function fractionalRate(samples, windowS = 120, key = "p_best") {
     const n = window.length - head;
     // Times are taken relative to the window's first sample: epoch seconds
     // squared would lose every significant digit a two-minute window has.
-    if (usable && n >= 5 && window[window.length - 1][0] - window[head][0] >= windowS * 0.4) {
+    if (usable && n >= JUDGEMENT.rate_min_points
+        && window[window.length - 1][0] - window[head][0] >= windowS * JUDGEMENT.rate_min_span) {
       const t0 = window[head][0];
       let sx = 0;
       let sy = 0;
@@ -277,7 +309,7 @@ export function loadState(samples, nominal) {
       states.push(null);
       continue;
     }
-    if (nominal && s.speed >= 0.95 * nominal) { states.push("full"); continue; }
+    if (atFullSpeed(s.speed, nominal)) { states.push("full"); continue; }
     // Rising over the last ~10 s means running up; otherwise held down.
     let j = i - 1;
     while (j > 0 && finite(samples[j].t) && s.t - samples[j].t < 8) j--;
@@ -294,7 +326,7 @@ export const LOAD_STATES = {
   runup: { label: "running up", color: "--series-3" },
 };
 
-/** Run-up time, from motor-on with the rotor at rest to 95 % of nominal. */
+/** Run-up time, from motor-on with the rotor at rest to full speed. */
 export function runupTime(samples, nominal) {
   if (!nominal) return null;
   for (let i = 1; i < samples.length; i++) {
@@ -304,7 +336,7 @@ export function runupTime(samples, nominal) {
     if (!start || !finite(s.speed) || s.speed > 0.05 * nominal) continue;
     for (let j = i; j < samples.length; j++) {
       if (!samples[j].motor) break;
-      if (finite(samples[j].speed) && samples[j].speed >= 0.95 * nominal) {
+      if (atFullSpeed(samples[j].speed, nominal)) {
         return { seconds: samples[j].t - s.t, from: s.t, to: samples[j].t };
       }
     }
@@ -427,7 +459,7 @@ export function etaToSpeed(samples, target, windowS = 20) {
 }
 
 /** The latest fractional rate of change, %/min, or null. */
-export function latestRate(samples, windowS = 120) {
+export function latestRate(samples, windowS = JUDGEMENT.rate_window_s) {
   const rates = fractionalRate(samples.slice(-400), windowS);
   for (let i = rates.length - 1; i >= 0; i--) if (finite(rates[i].rate)) return rates[i].rate;
   return null;

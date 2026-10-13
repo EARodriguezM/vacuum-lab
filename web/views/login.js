@@ -50,15 +50,15 @@ function SignIn({ onSignedIn }) {
     <form class="grid" style="gap:12px" onSubmit=${submit}>
       <label class="field"><span>Username</span>
         <input ref=${first} value=${username} autocomplete="username"
-               autocapitalize="none" spellcheck="false"
+               autocapitalize="none" spellcheck="false" data-test="signin-username"
                onInput=${(e) => setUsername(e.target.value)} />
       </label>
       <label class="field"><span>Password</span>
         <input type="password" value=${password} autocomplete="current-password"
-               onInput=${(e) => setPassword(e.target.value)} />
+               data-test="signin-password" onInput=${(e) => setPassword(e.target.value)} />
       </label>
       ${error && html`<${Banner} tone="crit">${error}<//>`}
-      <button class="primary" type="submit"
+      <button class="primary" type="submit" data-test="signin-submit"
               disabled=${working || !username.trim() || !password}>
         ${working ? "Signing in…" : "Sign in"}</button>
       <p class="hint">Forgot the password? An admin can set a temporary one
@@ -259,13 +259,14 @@ export function ReauthDialog({ open, me, onDone, onCancel }) {
           from acting in your name on a screen you walked away from.</div>
         <label class="field"><span>Password</span>
           <input ref=${input} type="password" value=${password}
-                 autocomplete="current-password"
+                 autocomplete="current-password" data-test="reauth-password"
                  onInput=${(e) => setPassword(e.target.value)} />
         </label>
         ${error && html`<${Banner} tone="crit">${error}<//>`}
         <div class="actions">
           <button type="button" onClick=${onCancel}>Keep watching</button>
-          <button class="primary" type="submit" disabled=${working || !password}>
+          <button class="primary" type="submit" disabled=${working || !password}
+                  data-test="reauth-submit">
             Continue</button>
         </div>
       </form>
