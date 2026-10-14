@@ -1,0 +1,13 @@
+# Downloaded by build.sh (JDK, SDK build-tools, platform, platform-tools)
+.toolchain/
+build/
+dist/
+
+# Chrome 138 and WebView 155 APKs: large and Google's, so not for git --
+# but keep them on disk, a wiped tablet cannot load the panel without them.
+vendor/
+
+# The kiosk's signing key. A device-owner app only accepts updates signed with
+# the same key, so it must never be lost -- and never published. Keep a copy
+# off this machine.
+kiosk/signing/

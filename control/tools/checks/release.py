@@ -169,9 +169,32 @@ def _sections(folder: Path) -> None:
         state = rel.git_state(repo)
         return (files == ["lab/kept.py", "lab/new.py", "top.py"]
                 and state["dirty"], f"{files}, dirty {state['dirty']}")
+    def from_its_folder():
+        # The panel is one folder of the repository, beside the tablet and
+        # the manuals: a release made there carries that folder and no other.
+        repo = folder / "mono"
+        (repo / "control" / "lab").mkdir(parents=True)
+        (repo / "control" / "lab" / "kept.py").write_text("x = 1\n")
+        (repo / "tablet").mkdir()
+        (repo / "tablet" / "build.sh").write_text("true\n")
+        for command in (["init", "-q"], ["add", "."],
+                        ["-c", "user.name=t", "-c", "user.email=t@t", "commit",
+                         "-qm", "start"]):
+            subprocess.run(["git", *command], cwd=repo, check=True,
+                           capture_output=True)
+        (repo / "control" / "lab" / "new.py").write_text("z = 3\n")
+        (repo / "tablet" / "probe.py").write_text("w = 4\n")
+        (repo / "README.md").write_text("mine\n")
+        control = repo / "control"
+        files = rel.tracked_files(control)
+        return (rel.has_git(control)
+                and files == ["lab/kept.py", "lab/new.py"],
+                f"{files}, git {rel.has_git(control)}")
     if rel.has_git(ROOT):
         attempt("a release carries what git tracks and new code beside it, "
                 "never a person's own files", what_travels)
+        attempt("a release made in the panel's folder carries that folder "
+                "only, not the tablet's or the top of the tree", from_its_folder)
     else:
         # A release on the lab PC: no git there, and nothing to ship from.
         print("  note  no git here: what a release carries is checked where "

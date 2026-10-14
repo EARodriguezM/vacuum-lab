@@ -149,7 +149,12 @@ def tracked_files(root: Path = ROOT) -> list[str]:
 
 
 def has_git(root: Path = ROOT) -> bool:
-    return shutil.which("git") is not None and (Path(root) / ".git").exists()
+    """Git is at hand and `root` is in a work tree: its own, or the one just
+    above it -- the panel is the `control/` folder of the repository, and git
+    run there sees that folder only."""
+    root = Path(root)
+    return shutil.which("git") is not None and any(
+        (folder / ".git").exists() for folder in (root, root.parent))
 
 
 def code_files(root: Path = ROOT) -> list[str]:
