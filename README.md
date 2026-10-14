@@ -5,8 +5,8 @@
 
 <br><br>
 
-<a href="https://github.com/EARodriguezM/sputtering-deposition-labcontrol/commits/main"><img src="https://img.shields.io/github/last-commit/EARodriguezM/sputtering-deposition-labcontrol" alt="Last commit"/></a>
-<a href="https://github.com/EARodriguezM/sputtering-deposition-labcontrol/issues"><img src="https://img.shields.io/github/issues/EARodriguezM/sputtering-deposition-labcontrol" alt="Issues"/></a>
+<a href="https://github.com/EARodriguezM/vacuum-lab/commits/main"><img src="https://img.shields.io/github/last-commit/EARodriguezM/vacuum-lab" alt="Last commit"/></a>
+<a href="https://github.com/EARodriguezM/vacuum-lab/issues"><img src="https://img.shields.io/github/issues/EARodriguezM/vacuum-lab" alt="Issues"/></a>
 <img src="https://img.shields.io/badge/python-3.11%E2%80%933.14-3776AB?logo=python&logoColor=white" alt="Python 3.11 to 3.14"/>
 <img src="https://img.shields.io/badge/dependencies-pyserial%20only-2b9348" alt="Only pyserial"/>
 <img src="https://img.shields.io/badge/web%20UI-Preact%20%2B%20htm%2C%20no%20build%20step-673AB8" alt="Preact and htm, no build step"/>
