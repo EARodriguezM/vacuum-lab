@@ -7,6 +7,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.os.UserManager;
 import android.provider.Settings;
 import android.util.Log;
 
@@ -51,6 +52,13 @@ final class Kiosk {
             // tablet is provisioned: a lock screen in front of a control panel
             // only slows down whoever has to stop the pump.
             dpm.setKeyguardDisabled(admin, true);
+            // No "... keeps stopping" or "isn't responding" dialog over the
+            // panel: Android closes the app instead. A system app crashing
+            // in the background (the setup wizard, once Play services was
+            // removed) covered the rig's readings until somebody tapped it
+            // away. If the kiosk itself stops answering it is restarted, as
+            // the home screen, rather than frozen behind a dialog.
+            dpm.addUserRestriction(admin, UserManager.DISALLOW_SYSTEM_ERROR_DIALOGS);
 
             IntentFilter home = new IntentFilter(Intent.ACTION_MAIN);
             home.addCategory(Intent.CATEGORY_HOME);
@@ -130,6 +138,7 @@ final class Kiosk {
             dpm.clearPackagePersistentPreferredActivities(admin, context.getPackageName());
             dpm.setStatusBarDisabled(admin, false);
             dpm.setKeyguardDisabled(admin, false);
+            dpm.clearUserRestriction(admin, UserManager.DISALLOW_SYSTEM_ERROR_DIALOGS);
             dpm.setLockTaskPackages(admin, new String[0]);
         } catch (RuntimeException e) {
             Log.w(TAG, "clearing device-owner policy failed", e);

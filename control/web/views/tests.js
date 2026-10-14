@@ -179,9 +179,6 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
                  unconfigured = {}, me = null }) {
   const [name, setName] = useState("");
   const [chosen, setChosen] = useState("");
-  // Whoever is signed in, unless they type somebody else's name: a student
-  // running a run for a supervisor. The account is recorded either way.
-  const [operator, setOperator] = useState(() => me?.name || "");
   const [notes, setNotes] = useState("");
   const [config, setConfig] = useState({});
 
@@ -213,7 +210,6 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
     onStart({
       procedure: procedure.name,
       name: name || procedure.label,
-      operator,
       notes,
       config: coerceConfig(procedure.fields, config),
     });
@@ -282,10 +278,14 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
             <input value=${name} placeholder=${procedure.label}
                    onInput=${(e) => setName(e.target.value)} />
           </label>
-          <label class="field">
+          <div class="field">
             <span>Operator</span>
-            <input value=${operator} onInput=${(e) => setOperator(e.target.value)} />
-          </label>
+            <div class="fixed-value" data-test="run-operator">
+              ${me && me.kind !== "device" ? me.name : "—"}</div>
+            <span class="help">${me && me.kind !== "device"
+              ? "Whoever is signed in and starts the run. To run under your own name, sign in as yourself."
+              : "A paired tablet only watches: sign in to start a run under your name."}</span>
+          </div>
           <label class="field">
             <span>Notes</span>
             <textarea value=${notes} onInput=${(e) => setNotes(e.target.value)}

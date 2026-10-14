@@ -54,9 +54,9 @@ CREATE TABLE IF NOT EXISTS runs (
     ended_at    REAL,
     result      TEXT,
     created_at  REAL    NOT NULL,
-    -- The account that started it. `operator` above is free text typed on
-    -- the form (a student running a run for somebody else); this is who was
-    -- signed in. NULL for runs recorded before accounts existed.
+    -- The account that started it: its username here, its display name in
+    -- `operator` above. Before 2026-10-14 `operator` was typed on the form
+    -- and could name somebody else. NULL for runs recorded before accounts.
     started_by  TEXT,
     -- Which chamber recorded it, so runs from two rigs can be told apart
     -- once their records meet.
@@ -376,10 +376,10 @@ class Database:
             self._db.commit()
 
     def update_run(self, run_id: int, **fields) -> dict | None:
-        """Edit the operator-supplied metadata of an existing run. A field
-        given as None is left as it is -- an edit of the notes alone must not
-        write NULL over the name."""
-        allowed = {"name", "operator", "notes"}
+        """Edit the name or notes of an existing run. A field given as None
+        is left as it is -- an edit of the notes alone must not write NULL
+        over the name. Who ran it (`operator`, `started_by`) never changes."""
+        allowed = {"name", "notes"}
         changes = {k: v for k, v in fields.items()
                    if k in allowed and v is not None}
         if not changes:
@@ -411,8 +411,9 @@ class Database:
             clauses.append("status = ?")
             args.append(status)
         if search:
-            clauses.append("(name LIKE ? OR operator LIKE ? OR notes LIKE ?)")
-            args.extend([f"%{search}%"] * 3)
+            clauses.append("(name LIKE ? OR operator LIKE ? OR started_by LIKE ? "
+                           "OR notes LIKE ?)")
+            args.extend([f"%{search}%"] * 4)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
             rows = self._db.execute(

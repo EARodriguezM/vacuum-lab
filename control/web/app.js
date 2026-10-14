@@ -293,6 +293,10 @@ function App() {
     setWhere(parseHash());
   }, []);
 
+  // A new page starts at its top, not at whatever height the last one was
+  // scrolled to -- a link from low on the Dashboard opened History halfway.
+  useEffect(() => { window.scrollTo(0, 0); }, [where.tab, where.sub]);
+
   // --- accounts -------------------------------------------------------------
 
   useEffect(() => { api.ping().then(setPing).catch(() => {}); }, [held]);

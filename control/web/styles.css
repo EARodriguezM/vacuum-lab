@@ -95,7 +95,12 @@ nav.tabs .badge { margin-left:6px; }
 .card > header { display:flex; gap:10px; align-items:baseline;
                  justify-content:space-between; flex-wrap:wrap; }
 .card .hint { color:var(--ink-faint); font-size:12.5px; margin:0; }
-.grid { display:grid; gap:14px; }
+/* One column unless told otherwise, and never wider than the page: an
+   `auto` column grows to its widest content, so a card holding a table that
+   does not wrap pushed every card in the grid off the screen (History on the
+   8" tablet). The table scrolls inside its card instead. */
+.grid { display:grid; gap:14px; grid-template-columns:minmax(0,1fr); }
+.grid > * { min-width:0; }
 .grid.two   { grid-template-columns: repeat(auto-fit, minmax(310px,1fr)); }
 .grid.three { grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); }
 .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
@@ -155,8 +160,12 @@ button.danger:hover:not(:disabled) { background:var(--crit-bg); }
 button.ghost { background:none; border-color:transparent; padding:6px 9px; min-height:32px; }
 button.small { font-size:12.5px; padding:5px 10px; min-height:30px; }
 
-label.field { display:flex; flex-direction:column; gap:4px; font-size:12.5px;
+label.field, div.field { display:flex; flex-direction:column; gap:4px; font-size:12.5px;
               color:var(--ink-soft); font-weight:560; min-width:0; }
+/* A value the form shows but nobody types: who is running the run. */
+.fixed-value { font-size:14px; padding:8px 10px; border-radius:7px; min-height:38px;
+               border:1px dashed var(--rule); background:var(--sunk); color:var(--ink);
+               display:flex; align-items:center; }
 /* Only share width when sitting beside siblings in a row. As a direct child
    of a column-flex card, a grow factor would stretch the label vertically to
    fill whatever height the tallest card in the grid row happens to be. */
@@ -651,7 +660,10 @@ details[open] > summary { margin-bottom:10px; }
    is tapped gets at least 40 px (the tablet's own guidance); the compact
    sizes above stay for a mouse, where they read better. */
 @media (pointer: coarse) {
-  button.small, button.ghost, .btn.small, .segmented button { min-height:40px; }
+  /* Every button, not only the compact ones: a plain one is at least 38 px
+     and its text and padding made it 39.7 -- but at the 8" tablet's device-
+     pixel ratio of 1.25 a 1 px border is 0.8 CSS px, and it came out 39.3. */
+  button, .btn, button.small, button.ghost, .btn.small, .segmented button { min-height:40px; }
   button.tiny { min-height:40px; padding:4px 10px; }
   select { min-height:40px; }
   nav.tabs button { min-height:44px; }
