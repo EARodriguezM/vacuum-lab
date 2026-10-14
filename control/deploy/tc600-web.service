@@ -1,0 +1,97 @@
+# Run the control panel automatically at boot.
+#
+# It runs the release that ~/vacuum-lab/current points at; tools/release.py
+# copies each release there, switches the link, restarts this unit and
+# checks it came back, and installs this file when it changes
+# (`release.py deploy --to HOST --install-units`). By hand:
+#   sudo cp deploy/tc600-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tc600-web
+#
+# Everybody signs in: the first account, the chamber's owner, is made on this
+# machine BEFORE the first start with accounts --
+#   ./tools/users.py owner NAME
+# -- against the same database the service uses (~/.local/share/vacuum-lab/
+# lab.db unless --db says otherwise). Until an owner exists nobody can sign
+# in; the rig keeps running, only the panel is locked.
+#
+# Until the panel has TLS, passwords cross the network in clear. Once the lab
+# has its own router, add to ExecStart:
+#   --allow-from 192.168.50.0/24     (nobody else reaches the panel at all)
+#   --admin-from 192.168.50.0/24     (accounts and overrides only from there)
+# Loopback -- the kiosk tablet on its USB cable -- always passes both.
+#
+# Both ports are "auto": the panel finds each instrument by asking every
+# serial port what is on it (read-only queries -- the TC 600's type, the TPG's
+# firmware), so a replugged or replaced USB adapter, or a renumbered
+# /dev/ttyUSBn, does not matter. It tries the udev names /dev/tc600 and
+# /dev/tpg252 first when deploy/99-vacuum-lab.rules is installed, then the
+# adapter it found each instrument on last time (ports.json, next to the
+# database), then every other port. An instrument that goes quiet is looked
+# for again, about once a minute. --no-port-search pins the ports instead.
+#
+# This unit used to name /dev/ttyS0 and /dev/ttyS1, which stopped working when
+# the onboard UARTs vanished on 2026-08-31 -- a unit naming a dead port starts
+# cleanly and reports both instruments offline, which reads as a dead rig
+# rather than a stale config file. Finding the ports removes that trap.
+
+[Unit]
+Description=Vacuum lab control panel (TC 600 turbopump + TPG 252 A gauge)
+After=network.target
+
+[Service]
+Type=simple
+User=esarodriguezm
+Group=dialout
+WorkingDirectory=/home/esarodriguezm/vacuum-lab/current
+# Without this, Python block-buffers stdout when it is a journal socket rather
+# than a terminal, and the startup banner -- which ports were opened, what the
+# interlocks are set to, and whether an owner exists -- never reaches
+# `journalctl -u tc600-web`.
+Environment=PYTHONUNBUFFERED=1
+# The code directory is read-only to the service (below); this stops Python
+# trying to write __pycache__ there on every start.
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /home/esarodriguezm/vacuum-lab/current/webserver.py \
+    --serial auto --address 1 \
+    --gauge auto \
+    --port 8600
+Restart=on-failure
+RestartSec=5
+# A stop or restart ends a run in progress first, with its clean-up, and lets
+# a make-safe sequence finish: up to 45 s for those, 75 s for the whole
+# shutdown (Application.CLOSE_BUDGET_S). This is how long systemd waits
+# before killing it, so keep it above that.
+TimeoutStopSec=90
+
+# --- what the service may touch ---------------------------------------------
+# Files it creates are its own only: the database holds the password hashes.
+UMask=0077
+# Everything read-only but the data directory (database, equipment.json,
+# ports.json). /dev -- the serial ports -- is not affected. The directory MUST
+# exist before the service starts: under this setting the panel cannot make
+# it, and systemd refuses to start the unit at all (status 226/NAMESPACE),
+# leaving nothing watching the rig. `./tools/users.py owner NAME`, run first,
+# makes it; or `install -d -m 700 ~/.local/share/vacuum-lab`.
+ProtectSystem=strict
+ReadWritePaths=/home/esarodriguezm/.local/share/vacuum-lab
+# /run/vacuum-lab, in RAM: the panel's status.json, rewritten every few
+# seconds -- what it is doing, for tools/release.py and anyone on the
+# machine -- without wearing the SD card.
+RuntimeDirectory=vacuum-lab
+RuntimeDirectoryMode=0700
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+# Threads: up to 64 connections from the network and 16 from loopback
+# (lab/api.py), the samplers, the engine, the supervisor, the recorder, and
+# room to spare: at the limit a thread cannot start, and the supervisor's
+# automatic recovery would have to run on its own watching thread.
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

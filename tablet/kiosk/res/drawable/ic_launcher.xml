@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A gauge dial: the app is only ever seen in the app list during setup. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <path
+        android:fillColor="#1F5FBF"
+        android:pathData="M24,2a22,22 0,1 0,0.01 0z" />
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:pathData="M10,32a15,15 0,1 1,28 0" />
+    <path
+        android:strokeColor="#FFB000"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:pathData="M24,30L33,18" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M24,27a3,3 0,1 0,0.01 0z" />
+</vector>

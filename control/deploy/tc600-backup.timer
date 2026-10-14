@@ -1,0 +1,11 @@
+# Every six hours; a run missed while the machine was off happens at boot.
+[Unit]
+Description=Back up the vacuum lab database every six hours
+
+[Timer]
+OnCalendar=*-*-* 00/6:17:00
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

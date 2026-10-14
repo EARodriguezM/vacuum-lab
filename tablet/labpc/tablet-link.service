@@ -1,0 +1,27 @@
+# USB link from the lab PC to the kiosk tablet: forwards the tablet's
+# 127.0.0.1:8600 to the control panel here, so the tablet needs no network,
+# and the lab PC's IP moving around does not matter to it.
+#
+# Installed by labpc/install.sh (from the laptop), which fills in the user.
+#   systemctl status tablet-link
+#   journalctl -u tablet-link
+
+[Unit]
+Description=USB link to the vacuum lab kiosk tablet (adb reverse tcp:8600)
+After=tc600-web.service
+
+[Service]
+Type=simple
+User=@USER@
+# The udev rule gives plugdev the tablet's USB device. systemd sets this group
+# whether or not the user is a member.
+SupplementaryGroups=plugdev
+Environment=HOME=@HOME@
+ExecStart=@HOME@/vacuum-lab-tablet/tablet-link.sh run
+# The adb server it starts lives in this unit's cgroup and stops with it.
+KillMode=control-group
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

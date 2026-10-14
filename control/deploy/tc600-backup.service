@@ -1,0 +1,57 @@
+# Back up the rig's database every six hours (with tc600-backup.timer).
+#
+#   sudo cp deploy/tc600-backup.service deploy/tc600-backup.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tc600-backup.timer
+#   systemctl list-timers tc600-backup      # when it runs next
+#   journalctl -u tc600-backup              # how the last one went
+#
+# The destinations are the lab's decision (2026-10-11): a USB stick on each
+# Pi, the other Pi once chamber 2 exists, the laptop when it is connected --
+# never this machine alone, which may be off. The stick is mounted at
+# /mnt/vacuum-backup; format it ext4 (a FAT stick cannot keep the files 0600,
+# and a backup holds the password hashes), label it VACUUMBAK, and add to
+# /etc/fstab:
+#   LABEL=VACUUMBAK /mnt/vacuum-backup ext4 nofail,noatime,x-systemd.automount 0 2
+# then, with the stick mounted, prepare it once:
+#   ./tools/backup.py init /mnt/vacuum-backup/vacuum-lab
+# A destination without that mark is refused -- so a stick that is not
+# mounted fails the backup (and the panel alarms) instead of the backup
+# filling the system disk under the empty mount point.
+# Another machine is one more --dest HOST:FOLDER (rsync over SSH, with this
+# user's key). A destination that cannot be written fails the backup and is
+# recorded beside the database, and the panel raises an alarm.
+#
+# Check and restore by hand:
+#   ./tools/backup.py status
+#   ./tools/backup.py verify /mnt/vacuum-backup/vacuum-lab
+#   ./tools/backup.py drill --folder /mnt/vacuum-backup/vacuum-lab   (quarterly)
+
+[Unit]
+Description=Vacuum lab database backup
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=esarodriguezm
+WorkingDirectory=/home/esarodriguezm/vacuum-lab/current
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /home/esarodriguezm/vacuum-lab/current/tools/backup.py make \
+    --db /home/esarodriguezm/.local/share/vacuum-lab/lab.db \
+    --dest /mnt/vacuum-backup/vacuum-lab
+# Lowest priority: the panel's sampling and safety tick come first.
+Nice=19
+IOSchedulingClass=idle
+UMask=0077
+ProtectSystem=strict
+# The status file goes beside the database. The "-" lets a missing stick
+# through to the tool, which records it as a failed backup (and the panel
+# alarms) instead of systemd refusing to start the unit unseen.
+ReadWritePaths=/home/esarodriguezm/.local/share/vacuum-lab -/mnt/vacuum-backup
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes

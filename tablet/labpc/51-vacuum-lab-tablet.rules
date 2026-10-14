@@ -1,0 +1,12 @@
+# adb access to the kiosk tablets for the tablet-link service, which runs
+# with the plugdev group. The TB-7305X shows up as MediaTek (0e8d), the
+# TB-8505X as Lenovo (17ef).
+#
+#   sudo cp labpc/51-vacuum-lab-tablet.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# The whole vendor, not one product id: the tablet's id changes with its USB
+# mode (charging only, file transfer, debugging), and nothing else MediaTek
+# is plugged into the lab PC. The rule only lets plugdev open the device.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0e8d", MODE="0660", GROUP="plugdev"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="17ef", MODE="0660", GROUP="plugdev"
