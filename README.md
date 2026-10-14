@@ -37,6 +37,12 @@
 
 **2026-10-13**
 
+* Each chamber's instruments are now in its own file in `control/chambers/`
+  instead of being assumed: a chamber without a TC 600 starts with what it
+  has, and the procedures it cannot run are switched off, saying why.
+* The instrument drivers moved to `control/drivers/`; the lab PC's services
+  are renamed `vacuum-lab-web` and `vacuum-lab-backup`, and the next deploy
+  moves the machine over by itself.
 * The repository is organised by subsystem: the control software moved to
   `control/`, the kiosk tablet joined as `tablet/`, the manuals moved to
   `docs/manuals/`.
@@ -79,10 +85,12 @@ The software that runs on the lab PC. Pure Python plus `pyserial`; the web UI
 is Preact and htm vendored as plain ES modules, so there is no build step and
 no Node toolchain.
 
-* **`tc600/`, `tpg/`** — drivers for the Pfeiffer TC 600 drive unit (RS-485
-  telegrams, the parameter table) and the TPG 252 A gauge controller
-  (RS-232 mnemonics), each with its own command-line tool (`tc600ctl.py`,
-  `tpgctl.py`).
+* **`chambers/`** — one file per chamber saying which instruments it has,
+  on which ports, with which settings.
+* **`drivers/`** — one package per instrument controller: the Pfeiffer TC 600
+  drive unit (`tc600/`: RS-485 telegrams, the parameter table) and the
+  TPG 252 A gauge controller (`tpg/`: RS-232 mnemonics), each with its own
+  command-line tool (`tc600ctl.py`, `tpgctl.py`).
 * **`lab/`** — the application: one service per instrument and actuator,
   the interlocks, the run engine and its recipes, the alarm supervisor, the
   SQLite store, accounts and the HTTP API.
@@ -169,10 +177,19 @@ rough → crossover → spin-up → base pressure → backfill → pre-sputter �
 
 #### 2.2 More chambers
 
-Accounts and roles are already per chamber, every instrument is a plug-in
-of one device registry, and the process actuators sit behind one small
-interface whether software or a person drives them. A second chamber, with a
-different pump controller, is being prepared.
+Each chamber has its own file in `control/chambers/` naming its instruments
+by role — `pump`, `gauge` — and the driver that fills each one. The run
+engine, the interlocks, the alarms and the pages ask for a role, never a
+model, so a chamber without a TC 600 starts with what it has: the procedures
+it cannot run are listed but switched off, saying which instrument is
+missing. Accounts and roles are per chamber too. A second chamber, with a
+different pump controller, is being prepared; its controller becomes one more
+driver in `control/drivers/` and one more kind in its file.
+
+```bash
+cd control
+./webserver.py --chamber chambers/chamber-2.toml --port 8601
+```
 
 ---
 
@@ -187,10 +204,12 @@ lab/api.py           who may post what, sessions, downloads
         │
 lab/runs.py          recipes and the run engine ── lab/db.py (SQLite: runs, samples, events)
         │
-lab/registry.py      one service per instrument and actuator
+lab/registry.py      one service per instrument and actuator, by role
 lab/pump.py  lab/gauge.py  lab/process.py      interlocks live here
+        │                          ▲
+        │            lab/chamber.py + chambers/*.toml: which driver fills each role
         │
-tc600/  tpg/         drivers: framing, checksums, parameter tables
+drivers/tc600  drivers/tpg         framing, checksums, parameter tables
         │
 pyserial             /dev/tc600, /dev/tpg252 (found automatically on any port)
 ```
@@ -210,9 +229,9 @@ pyserial             /dev/tc600, /dev/tpg252 (found automatically on any port)
 
 #### 3.3 Testing
 
-* `control/tools/selftest.py` — about 590 checks with no hardware: drivers,
+* `control/tools/selftest.py` — about 610 checks with no hardware: drivers,
   analysis, database, accounts, the run engine, bus faults, timing, restarts,
-  backups and releases. The simulators can drop, corrupt and delay replies
+  chambers' files, backups and releases. The simulators can drop, corrupt and delay replies
   on purpose.
 * `control/tools/uitest.py` — the panel in headless Chrome as every role, at
   tablet and phone size, through the main flows.

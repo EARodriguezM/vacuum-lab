@@ -13,7 +13,7 @@ protocol detail comes from them.
 | [`manuals/HXSP-485_RS-232_RS-485_UserManual.pdf`](manuals/HXSP-485_RS-232_RS-485_UserManual.pdf) | the **HXSP-485** RS-232 ↔ RS-485 converter between the lab PC and the TC 600 | its pinout and D+/D− wiring |
 
 The TC 600's full parameter list lives in Pfeiffer's **PM 0488 BN** and
-**PM 0547 BN**, which are not here. The table in `control/tc600/params.py`
+**PM 0547 BN**, which are not here. The table in `control/drivers/tc600/params.py`
 was checked against the firmware instead (`./tc600ctl.py verify`). The real
 TPG 252 A firmware also differs from the published protocol in a few places;
 `control/README.md` lists them.

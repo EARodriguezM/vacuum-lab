@@ -74,7 +74,8 @@ def test_authority(pump_port: str) -> None:
     devices = registry.Registry()
     pump_service = devices.add(pumpmod.PumpService("pump", pump_port, address=1))
     pump_service.interval = 0.3
-    engine = runs.RunEngine(database, devices, chamber="chamber-1")
+    engine = runs.RunEngine(database, devices,
+                            roles=runs.ALL_ROLES, chamber="chamber-1")
     application = apimod.Application(devices, database, engine, auth=accounts,
                                      chamber={"id": "chamber-1", "name": "C1"})
     handler = type("AuthorityHandler", (apimod.Handler,),

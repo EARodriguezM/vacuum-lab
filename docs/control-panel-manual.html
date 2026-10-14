@@ -532,43 +532,29 @@ curl -X POST http://172.16.2.69:8600/api/command \
     <section id="server">
       <h2><span class="num">08</span>Running the server</h2>
       <hr class="sechr">
-      <p>The panel is served by <code>webserver.py</code> on the machine wired to the pump.</p>
-<pre><code># start
-cd ~/tc600-control
-(setsid python3 webserver.py --serial /dev/ttyS1 --address 1 --port 8600 \
-    &gt; ~/tc600-web.log 2&gt;&amp;1 &amp; echo $! &gt; ~/tc600-web.pid)
+      <p>The panel is served by <code>control/webserver.py</code> on the lab PC, the machine
+        wired to the instruments, as the systemd service <code>vacuum-lab-web</code>. It
+        starts at boot and is restarted if it stops.</p>
+<pre><code># state, and the last lines it logged
+systemctl status vacuum-lab-web
+journalctl -u vacuum-lab-web -e
 
-# stop
-kill $(cat ~/tc600-web.pid)
-
-# log
-tail -f ~/tc600-web.log</code></pre>
+# restart (a run in progress is ended properly first)
+sudo systemctl restart vacuum-lab-web</code></pre>
       <div class="note">
-        Use the PID file rather than <code>pkill -f webserver.py</code>. That pattern also
-        matches the SSH command carrying it, so it kills your own session.
+        Until October 2026 the service was called <code>tc600-web</code>. The two never
+        run together: starting either stops the other.
       </div>
-      <p>Useful options:</p>
-      <div class="tw">
-        <table>
-          <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
-          <tbody>
-            <tr><td class="k mono">--serial</td><td>Serial port. <code>/dev/ttyS1</code> here &mdash; onboard COM2.</td></tr>
-            <tr><td class="k mono">--address</td><td>RS-485 address, 1 on this pump.</td></tr>
-            <tr><td class="k mono">--port</td><td>HTTP port, default 8600.</td></tr>
-            <tr><td class="k mono">--token</td><td>Require <code>X-Token</code> on API calls. Strongly advised off an isolated network.</td></tr>
-            <tr><td class="k mono">--bind</td><td>Interface to listen on. Default all.</td></tr>
-          </tbody>
-        </table>
-      </div>
+      <p>New versions are installed with <code>control/tools/release.py</code>, which checks
+        the rig is idle, makes a backup, and switches back by itself if the new version
+        does not come up healthy. The database is backed up every six hours by
+        <code>vacuum-lab-backup.timer</code>.</p>
+      <p>To try the panel without the rig, on any Linux machine:</p>
+<pre><code>cd control
+./webserver.py --simulate --no-auth --db /tmp/lab.db    # http://localhost:8600/</code></pre>
       <p>
-        Editing <code>web/index.html</code> takes effect on the next page load &mdash; the
-        server reads it from disk per request, so no restart is needed for UI changes.
-        Changes to <code>webserver.py</code> or the <code>tc600</code> package do need one.
-      </p>
-      <p>
-        The server does not survive a reboot as run above.
-        <code>deploy/tc600-web.service</code> is a systemd unit for that, deliberately
-        not installed &mdash; enabling it starts unauthenticated pump control on every boot.
+        <code>--no-auth</code> switches accounts off and is for the simulator only. On the
+        rig everybody signs in; see the guide in <code>control/README.md</code>.
       </p>
     </section>
 

@@ -39,7 +39,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tc600 import params, protocol  # noqa: E402
+from drivers.tc600 import params, protocol  # noqa: E402
 
 ADDRESS = 1
 

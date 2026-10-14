@@ -123,7 +123,7 @@ def candidate_ports(exclude=()) -> list[dict]:
 
 def probe_tc600(port: str, address: int = 1, timeout: float = 0.5) -> dict | None:
     """Ask `port` whether a TC 600 is on it. Read-only. None if not."""
-    from tc600 import device as tc600_device
+    from drivers.tc600 import device as tc600_device
 
     try:
         with tc600_device.TC600(port, address=address, timeout=timeout,
@@ -153,7 +153,7 @@ def probe_tc600(port: str, address: int = 1, timeout: float = 0.5) -> dict | Non
 
 def probe_tpg(port: str, timeout: float = 0.5) -> dict | None:
     """Ask `port` whether a TPG is on it, at each supported rate. Read-only."""
-    import tpg
+    from drivers import tpg
 
     unit = None
     try:
@@ -258,8 +258,15 @@ class Finder:
     """
 
     def __init__(self, registry, memory: PortMemory | None = None,
-                 enabled: bool = True, ports=candidate_ports, udev_names=None):
+                 enabled: bool = True, ports=candidate_ports, udev_names=None,
+                 kinds=None):
         self.registry = registry
+        #: The kinds of instrument this chamber has (its file, lab/chamber.py)
+        #: -- the only queries the survey sends. Another chamber's controller
+        #: on a free port is not asked TC 600 questions because this panel
+        #: knows how to ask them. None: every kind there is a probe for.
+        self.kinds = tuple(PROBES) if kinds is None else tuple(
+            k for k in kinds if k in PROBES)
         self.memory = memory or PortMemory(None)
         self.enabled = enabled
         # Where to look. The selftest narrows both to its simulators' ports:
@@ -303,7 +310,8 @@ class Finder:
         """Report what every free port answers to -- for the Settings page.
 
         Ports held by this panel's instruments are listed as such and not
-        probed: they already have an owner, and it is talking to them.
+        probed: they already have an owner, and it is talking to them. Free
+        ports are asked only for the kinds this chamber has (`kinds`).
         """
         with self._lock:
             owned = {real(service.port): service for service in self.registry
@@ -321,7 +329,7 @@ class Finder:
                                     else " (not answering)")})
                     continue
                 answer = None
-                for kind in ("tc600", "tpg"):
+                for kind in self.kinds:
                     tried: list = []
                     answer = find(kind, [port["device"]], tried=tried)
                     if answer:

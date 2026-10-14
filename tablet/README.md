@@ -26,7 +26,7 @@ by itself, and can't be exited without a PIN.
 ```
  lab PC (Ubuntu)                                   tablet (stock Android 9, wiped)
  ┌───────────────────────────┐   USB cable    ┌─────────────────────────────────┐
- │ tc600-web  :8600          │◄──────────────►│ Vacuum Lab kiosk (device owner) │
+ │ vacuum-lab-web :8600      │◄──────────────►│ Vacuum Lab kiosk (device owner) │
  │ tablet-link: adb reverse  │  tablet's      │  full-screen WebView (Chrome 138)│
  │   tcp:8600 -> :8600       │  127.0.0.1:8600│  1st: http://127.0.0.1:8600      │
  └───────────────────────────┘                │  2nd: sweep the Wi-Fi /24 :8600  │

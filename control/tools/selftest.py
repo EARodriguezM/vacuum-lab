@@ -25,7 +25,7 @@ that left it. A section that raises is a FAIL, and the sections after it
 still run.
 
     --only NAME     run one section (repeatable); see SECTIONS
-    --coverage      also report which lines of lab/, tc600/, tpg/ never ran
+    --coverage      also report which lines of lab/ and drivers/ never ran
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ sys.path.insert(0, ROOT)
 SECTIONS = ("pump", "gauge", "cold_cathode", "analysis", "process", "equipment",
             "deposition", "database", "accounts", "history", "engine", "faults",
             "timing", "lifecycle", "authority", "security", "discovery",
-            "observability", "backup", "release")
+            "chambers", "observability", "backup", "release")
 
 #: Where a section's code lives, and how it is called: (module, function,
 #: which simulator ports it takes).
@@ -70,13 +70,14 @@ WHERE = {
     "authority": ("authority", "test_authority", ("pump",)),
     "security": ("security", "test_security", ("pump",)),
     "discovery": ("discovery", "test_discovery", ("pump", "gauge")),
+    "chambers": ("chambers", "test_chambers", ("pump", "gauge")),
     "observability": ("observability", "test_observability", ()),
     "backup": ("backup", "test_backup", ()),
     "release": ("release", "test_release", ()),
 }
 
 #: Module names whose constants a section may change and must not keep.
-WATCHED = ("lab.", "tc600", "tpg", "tools.fake_")
+WATCHED = ("lab.", "drivers.", "tools.fake_")
 CONSTANT = re.compile(r"^_?[A-Z][A-Z0-9_]*$")
 #: The simulators' own state, put back by their reset() before each section.
 RESET_BY_SIMULATOR = {"STATE", "FAULTS", "CHAMBER"}
@@ -275,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", action="append", choices=SECTIONS,
                         help="run only this section (repeatable)")
     parser.add_argument("--coverage", nargs="?", const="", metavar="FILE",
-                        help="report the lines of lab/, tc600/ and tpg/ "
+                        help="report the lines of lab/ and drivers/ "
                              "that never ran; the full list goes to FILE")
     args = parser.parse_args(argv)
     # In step with the warnings on stderr, and readable while it runs.

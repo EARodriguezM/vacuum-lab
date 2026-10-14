@@ -33,6 +33,11 @@ from . import db as dbmod
 from . import judgement
 from . import process
 from . import pump as pumpmod
+from .chamber import ROLES
+
+#: Every role -- for an engine whose chamber has them all, whether or not
+#: an instrument is attached (the selftest's engines with no rig behind them).
+ALL_ROLES = tuple(ROLES)
 from .history import SHAPE_KEYS, decimate
 # Kept importable from here: the curve maths moved to lab/judgement.py.
 from .judgement import linear_fit, relative_rate  # noqa: F401
@@ -110,7 +115,14 @@ class Procedure:
     #: Pressure above which the run aborts, or None for no ceiling.
     pressure_ceiling: float | None = None
 
-    #: Equipment beyond the pump and the gauge that this procedure cannot do
+    #: The instruments it cannot do without, by role (lab/chamber.py). A
+    #: chamber whose file has none for one of them lists the procedure but
+    #: refuses it: a recipe that starts the turbopump must not start where
+    #: there is no turbopump to start, nor one that reads pressure where
+    #: nothing measures it.
+    instruments: tuple[str, ...] = ("pump", "gauge")
+
+    #: Equipment beyond the instruments that this procedure cannot do
     #: without -- keys of `process.EQUIPMENT`. While any of it is not
     #: installed the procedure is listed but refused, guided or automatic.
     requires: tuple[str, ...] = ()
@@ -544,6 +556,9 @@ class Hold(Procedure):
     description = ("Pumps for a set time and reports the lowest pressure "
                    "reached, the final pressure, and the drift between them.")
     phases = ("holding", "done")
+    #: It drives nothing -- it records the pressure while the chamber is
+    #: pumped -- so a chamber whose pump the panel cannot drive still has it.
+    instruments = ("gauge",)
     fields = (
         {"key": "duration_min", "label": "Hold for", "type": "number",
          "default": 60, "unit": "min", "min": 0.1, "max": 10080},
@@ -1771,6 +1786,15 @@ def settle_config(procedure: type[Procedure], given) -> tuple[dict, list[str]]:
     return config, problems
 
 
+def not_configured(label: str, absent: list[str], chamber: str | None) -> str:
+    """Why a procedure cannot start: an instrument the chamber has none of."""
+    names = " and ".join(absent)
+    return (f"{label} needs a {names}, and the panel for "
+            f"{chamber or 'this chamber'} was started without one -- its file "
+            f"in chambers/ lists none, or --no-pump/--no-gauge left it out. A "
+            f"procedure that drives or reads it cannot run here.")
+
+
 def not_installed(label: str, missing: list[str]) -> str:
     """Why a procedure cannot start: what it needs that is not on the rig."""
     plural = len(missing) > 1
@@ -1836,9 +1860,13 @@ class RunEngine:
                  hardware: "process.ProcessHardware | None" = None,
                  pump_key: str = "pump", gauge_key: str = "gauge",
                  equipment: "process.Equipment | None" = None,
-                 chamber: str | None = None):
+                 chamber: str | None = None, roles=None):
         self.db = database
         self.registry = registry
+        #: The roles the chamber has instruments for, as its file says
+        #: (lab/chamber.py) -- what `unconfigured()` judges procedures by.
+        #: None: the roles whose instrument is registered.
+        self.roles = None if roles is None else frozenset(roles)
         #: Recorded on every run, so two rigs' records stay apart.
         self.chamber = chamber
         self.hardware = hardware or process.ProcessHardware()
@@ -2251,22 +2279,43 @@ class RunEngine:
 
     # --- what this rig can run ---------------------------------------------
 
+    def unconfigured(self, procedure) -> list[str]:
+        """The instruments `procedure` needs that this chamber has none of,
+        by what they are called (`chamber.ROLES`)."""
+        if self.roles is not None:
+            have = self.roles
+        else:
+            keys = {"pump": self.pump_key, "gauge": self.gauge_key}
+            have = {role for role, key in keys.items() if key in self.registry}
+        return [ROLES[role] for role in procedure.instruments
+                if role not in have]
+
+    def unconfigured_all(self) -> dict:
+        """Procedure name -> instruments it needs and the chamber lacks."""
+        return {name: absent for name, procedure in CATALOGUE.items()
+                if (absent := self.unconfigured(procedure))}
+
     def catalogue(self) -> list[dict]:
         """The procedures, each saying whether this rig can run it now."""
         entries = catalogue()
         for entry in entries:
-            requires = CATALOGUE[entry["name"]].requires
-            missing = self.equipment.missing(requires)
+            procedure = CATALOGUE[entry["name"]]
+            absent = self.unconfigured(procedure)
+            missing = absent + self.equipment.missing(procedure.requires)
             entry["available"] = not missing
             entry["missing"] = missing
-            entry["automatic_ready"] = (not missing
-                                        and not self.hardware.missing(requires))
+            entry["unconfigured"] = absent
+            entry["automatic_ready"] = (
+                not missing and not self.hardware.missing(procedure.requires))
         return entries
 
     def unavailable(self) -> dict:
-        """Procedure name -> what it is missing, for those that cannot run."""
+        """Procedure name -> what it is missing, for those that cannot run:
+        the instruments the chamber has none of, then the equipment not
+        installed."""
         return {name: missing for name, procedure in CATALOGUE.items()
-                if (missing := self.equipment.missing(procedure.requires))}
+                if (missing := self.unconfigured(procedure)
+                    + self.equipment.missing(procedure.requires))}
 
     def actuators(self) -> list[dict]:
         return [{**described, "installed": self.equipment.installed(described["key"])}
@@ -2367,6 +2416,10 @@ class RunEngine:
             if procedure_name not in CATALOGUE:
                 return {"ok": False,
                         "error": f"unknown procedure {procedure_name!r}"}
+            absent = self.unconfigured(CATALOGUE[procedure_name])
+            if absent:
+                return {"ok": False, "error": not_configured(
+                    CATALOGUE[procedure_name].label, absent, self.chamber)}
             absent = self.equipment.missing(CATALOGUE[procedure_name].requires)
             if absent:
                 return {"ok": False, "error": not_installed(

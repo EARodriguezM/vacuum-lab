@@ -51,7 +51,7 @@ def test_timing(pump_port: str, gauge_port: str) -> None:
         fake_tc600.reset()
         fake_tpg.reset()
         with Rig(pump_port, gauge_port, interval=None) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             started = engine.start("base_calibration", {"interval_s": 60})
             if not started.get("ok"):
                 return False, started.get("error")
@@ -77,7 +77,7 @@ def test_timing(pump_port: str, gauge_port: str) -> None:
         runs.RunEngine.MAX_SILENT_S = 3.0
         try:
             with Rig(pump_port, gauge_port, interval=None) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 engine.start("hold", {"interval_s": 60, "duration_min": 10})
                 time.sleep(2.0)
                 fake_tc600.FAULTS["silent"] = True
@@ -126,7 +126,8 @@ def test_timing(pump_port: str, gauge_port: str) -> None:
 
         runs.CATALOGUE[Stuck.name] = Stuck
         try:
-            engine = runs.RunEngine(database, registry.Registry())
+            engine = runs.RunEngine(database, registry.Registry(),
+                                    roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(registry.Registry(), engine, database,
                                            auto_recover=False)
             engine.start(Stuck.name, {})
@@ -153,7 +154,8 @@ def test_timing(pump_port: str, gauge_port: str) -> None:
         runs.CATALOGUE[Recording.name] = Recording
         clock = ClockStep()
         try:
-            engine = runs.RunEngine(database, registry.Registry())
+            engine = runs.RunEngine(database, registry.Registry(),
+                                    roles=runs.ALL_ROLES)
             engine.start(Recording.name, {})
             time.sleep(1.0)
             clock.set(3600.0)                    # an hour forward

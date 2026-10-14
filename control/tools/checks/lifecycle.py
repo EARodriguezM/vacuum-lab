@@ -58,7 +58,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
     def no_power_down_under_a_run():
         fake_tc600.reset()
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             engine.start("hold", {"duration_min": 5, "interval_s": 1})
             time.sleep(1.0)
             refused = engine.shutdown_pump("selftest")
@@ -79,7 +79,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         fake_tc600.STATE.update({10: True, 23: True})
         fake_tc600._speed = 1500.0                 # already at full speed
         with Rig(pump_port, gauge_port, interval=None) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             engine.start("full_vacuum", {"interval_s": 1})
             reached = wait_until(lambda: engine.status().get("phase")
                                  in ("basepressure", "holding"), 15, 0.1)
@@ -120,7 +120,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         fake_tc600.STATE.update({10: True, 303: "Err006"})
         with Rig(pump_port) as rig:
             rig.fresh(lambda s: s.get("status", {}).get("ErrorCode") == "Err006")
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             faulted = engine.start("hold", {"duration_min": 1})
             if faulted.get("ok"):
                 engine.stop("selftest")
@@ -149,7 +149,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
             every_field_bounded)
 
     def refused(procedure, config):
-        engine = runs.RunEngine(database, registry.Registry())
+        engine = runs.RunEngine(database, registry.Registry(), roles=runs.ALL_ROLES)
         result = engine.start(procedure, config)
         if result.get("ok"):
             engine.stop("selftest")
@@ -172,7 +172,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
                 refused("hold", {"duration_min": "", "interval_s": 0})))
 
     def stored_config():
-        engine = runs.RunEngine(database, registry.Registry())
+        engine = runs.RunEngine(database, registry.Registry(), roles=runs.ALL_ROLES)
         result = engine.start("hold", {"interval_s": 2, "extra": "ignored"})
         engine.stop("selftest")
         wait_ended(engine, 10)
@@ -201,7 +201,8 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         def write_fails_once():
             failing = FailingDatabase(database, lambda name, n:
                                       name == "add_sample" and n == 1)
-            engine = runs.RunEngine(failing, registry.Registry())
+            engine = runs.RunEngine(failing, registry.Registry(),
+                                    roles=runs.ALL_ROLES)
             engine.start(Trouble.name, {})
             wait_ended(engine, 10)
             last = engine.status().get("last") or {}
@@ -214,7 +215,8 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         def writes_all_fail():
             Trouble.finished = False
             failing = FailingDatabase(database, lambda name, n: True)
-            engine = runs.RunEngine(failing, registry.Registry())
+            engine = runs.RunEngine(failing, registry.Registry(),
+                                    roles=runs.ALL_ROLES)
             engine.start(Trouble.name, {})
             wait_ended(engine, 10)
             supervisor = alarms.Supervisor(registry.Registry(), engine, database,
@@ -294,7 +296,8 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
             reported = any(o.get("kind") == "restart" and row
                            and o["id"] == row[0]
                            for o in runs.RunEngine(later,
-                                                   registry.Registry()).orphans)
+                                                   registry.Registry(),
+                                                   roles=runs.ALL_ROLES).orphans)
         finally:
             later.close()
         return (bool(up and started and started.get("ok") and heating)
@@ -322,7 +325,8 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
 
         runs.CATALOGUE[Lingering.name] = Lingering
         try:
-            engine = runs.RunEngine(database, registry.Registry())
+            engine = runs.RunEngine(database, registry.Registry(),
+                                    roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(registry.Registry(), engine, database,
                                            auto_recover=False)
             started = engine.start(Lingering.name, {})
@@ -345,7 +349,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         fake_tc600.reset()
         fake_tpg.reset()
         with Rig(pump_port, gauge_port, interval=None) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             engine.start("hold", {"duration_min": 1, "interval_s": 1})
             time.sleep(2.0)
 
@@ -372,7 +376,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         runs.RunEngine.MAX_SILENT_S = 3.0
         try:
             with Rig(pump_port, gauge_port, interval=None) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 engine.start("hold", {"duration_min": 5, "interval_s": 1})
                 time.sleep(2.0)
                 rig.pump._stop.set()             # held up: still "connected"
@@ -408,12 +412,12 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         try:
             fake_tc600.FAULTS["silent"] = True    # the pump not answering yet
             with Rig(pump_port) as rig:
-                first = runs.RunEngine(database, rig.devices)
+                first = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 time.sleep(4.0)
                 first.close(timeout=5)            # ... and the panel stops again
             fake_tc600.FAULTS.clear()             # restarted again, pump back
             with Rig(pump_port) as rig:
-                second = runs.RunEngine(database, rig.devices)
+                second = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 off = wait_until(lambda: fake_tc600.STATE[1] is False, 15, 0.1)
                 again = any(o["id"] == cut_off["id"] for o in second.orphans)
                 second.close(timeout=5)
@@ -458,7 +462,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         saved = orphans_retried()
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 wait_until(lambda: not (engine._orphan_thread
                                         and engine._orphan_thread.is_alive()), 15)
                 engine._flush()
@@ -483,7 +487,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         saved = orphans_retried()
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 wait_until(lambda: not (engine._orphan_thread
                                         and engine._orphan_thread.is_alive()), 15)
                 engine._flush()
@@ -505,7 +509,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         runs.RunEngine.ORPHAN_RETRY_S = 2.0
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 supervisor = alarms.Supervisor(rig.devices, engine, database,
                                                auto_recover=False)
                 supervisor.check()
@@ -541,7 +545,8 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         alarms.Supervisor.CLEANUP_STALL_S = 2.0
         runs.CATALOGUE[Hanging.name] = Hanging
         try:
-            engine = runs.RunEngine(database, registry.Registry())
+            engine = runs.RunEngine(database, registry.Registry(),
+                                    roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(registry.Registry(), engine, database,
                                            auto_recover=False)
             engine.start(Hanging.name, {})
@@ -581,7 +586,8 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         alarms.Supervisor.CLEANUP_STALL_S = 2.0
         runs.CATALOGUE[Slow.name] = Slow
         try:
-            engine = runs.RunEngine(database, registry.Registry())
+            engine = runs.RunEngine(database, registry.Registry(),
+                                    roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(registry.Registry(), engine, database,
                                            auto_recover=False)
             engine.start(Slow.name, {})
@@ -614,7 +620,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         run_id = None
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 supervisor = alarms.Supervisor(rig.devices, engine, database,
                                                auto_recover=False)
                 engine.start("bakeout", {"setpoint_c": 70})
@@ -646,7 +652,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         run_id, found, said, off = None, [], [], False
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 engine.start("bakeout", {"setpoint_c": 70})
                 run_id = engine.run_id()
                 heating = wait_until(lambda: fake_tc600.STATE[1] is True, 10,
@@ -657,7 +663,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
             left_on = fake_tc600.STATE[1] is True
             fake_tc600.FAULTS.clear()            # the next start, pump fine
             with Rig(pump_port) as rig:
-                later = runs.RunEngine(database, rig.devices)
+                later = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 supervisor = alarms.Supervisor(rig.devices, later, database,
                                                auto_recover=False)
                 found = [o for o in later.orphans if o["id"] == run_id]
@@ -695,7 +701,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         heating = quiet = raised = still_on = off = settled = cleared = False
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 supervisor = alarms.Supervisor(rig.devices, engine, database,
                                                auto_recover=False)
                 engine.start("bakeout", {"setpoint_c": 70})
@@ -748,7 +754,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         run_id, held, after, off = None, {}, {}, False
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 engine.start("bakeout", {"setpoint_c": 70})
                 run_id = engine.run_id()
                 heating = wait_until(lambda: fake_tc600.STATE[1] is True, 10,
@@ -817,7 +823,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         started = {}
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 supervisor = alarms.Supervisor(rig.devices, engine, database,
                                                auto_recover=False)
                 gave_up = wait_until(lambda: (supervisor.check() or True) and not (
@@ -876,6 +882,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         kind, settled, said = None, False, []
         try:
             engine = runs.RunEngine(database, registry.Registry(),
+                                    roles=runs.ALL_ROLES,
                                     hardware=hardware)
             wait_until(lambda: not (engine._orphan_thread
                                     and engine._orphan_thread.is_alive()), 15)
@@ -903,6 +910,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         ended = None
         try:
             engine = runs.RunEngine(database, registry.Registry(),
+                                    roles=runs.ALL_ROLES,
                                     hardware=hardware)
             # As a run's ending does when its clean-up fails, the panel running.
             ended = database.create_run("deposition", "Gas would not close, "
@@ -935,7 +943,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         heating = gave_up = alarmed = kept = False
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 supervisor = alarms.Supervisor(rig.devices, engine, database,
                                                auto_recover=False)
                 engine.start("bakeout", {"setpoint_c": 70})
@@ -981,7 +989,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         run_id, quick, cleared = None, {}, False
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 supervisor = alarms.Supervisor(rig.devices, engine, database,
                                                auto_recover=False)
                 engine.start("bakeout", {"setpoint_c": 70})
@@ -1077,7 +1085,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         first = second = None
         fresh = []
         try:
-            engine = runs.RunEngine(store, registry.Registry())
+            engine = runs.RunEngine(store, registry.Registry(), roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(registry.Registry(), engine, store,
                                            auto_recover=False)
 
@@ -1119,7 +1127,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
 
         runs.CATALOGUE[Plain.name] = Plain
         store = dbmod.Database(os.path.join(directory, "forget.db"))
-        engine = runs.RunEngine(store, registry.Registry())
+        engine = runs.RunEngine(store, registry.Registry(), roles=runs.ALL_ROLES)
         named, second = False, {}
         try:
             first = engine.start(Plain.name, {})["run"]
@@ -1173,7 +1181,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         before = after = None
         kept = []
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             engine.start("hold", {"duration_min": 5, "interval_s": 1})
             run_id = engine.run_id()
             wait_until(lambda: engine.status()["running"], 5, 0.05)
@@ -1280,7 +1288,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         run_id = None
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 supervisor = alarms.Supervisor(rig.devices, engine, database,
                                                auto_recover=False)
                 engine.start("bakeout", {"setpoint_c": 70})
@@ -1308,7 +1316,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         fake_tc600.reset()
         fake_tc600.STATE.update({10: True, 23: True, 303: "Err006"})
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             first = engine.secure_pump("selftest, first press")
             thread = getattr(engine, "_secure_thread", None)
             second = engine.secure_pump("selftest, second press")
@@ -1328,7 +1336,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         fake_tc600.reset()
         fake_tc600.STATE.update({10: True, 23: True, 303: "Err006"})
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             real = engine.run_id
 
             def slow_run_id():              # a thread switch at the worst moment
@@ -1357,7 +1365,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         ended = asked = done = False
         engine_ok = supervisor_ok = None
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(rig.devices, engine, database,
                                            auto_recover=True)
             engine.start("hold", {"duration_min": 5, "interval_s": 1})
@@ -1397,7 +1405,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         fake_tc600.STATE.update({10: True, 303: "Err006"})
         since = time.time()
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(rig.devices, engine, database,
                                            auto_recover=True)
             fake_tc600.FAULTS["delay_s"] = 0.05     # each sequence takes a while
@@ -1433,7 +1441,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         supervisor = None
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(store, rig.devices)
+                engine = runs.RunEngine(store, rig.devices, roles=runs.ALL_ROLES)
                 supervisor = alarms.Supervisor(rig.devices, engine, store,
                                                auto_recover=True)
                 application = apimod.Application(rig.devices, store, engine,
@@ -1494,7 +1502,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         store = dbmod.Database(path)
         engine, took, run_id, owed_later = None, None, None, False
         try:
-            engine = runs.RunEngine(store, registry.Registry())
+            engine = runs.RunEngine(store, registry.Registry(), roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(registry.Registry(), engine, store,
                                            auto_recover=False)
             application = apimod.Application(registry.Registry(), store, engine,
@@ -1514,7 +1522,8 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
             # The next start finds the run it could not finish, and owes it.
             later = dbmod.Database(path)
             try:
-                after = runs.RunEngine(later, registry.Registry())
+                after = runs.RunEngine(later, registry.Registry(),
+                                       roles=runs.ALL_ROLES)
                 owed_later = any(o["id"] == run_id for o in after.orphans)
                 wait_until(lambda: not (after._orphan_thread
                                         and after._orphan_thread.is_alive()), 10)
@@ -1546,7 +1555,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         took = None
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(store, rig.devices)
+                engine = runs.RunEngine(store, rig.devices, roles=runs.ALL_ROLES)
                 application = apimod.Application(rig.devices, store, engine)
                 fake_tc600.FAULTS["delay_s"] = 0.2   # a sequence that takes long
                 engine.secure_pump("selftest")
@@ -1592,7 +1601,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         waited = False
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 engine.start(SlowTrouble.name, {})
                 wait_until(lambda: engine.status()["running"], 5, 0.05)
                 trouble.set()
@@ -1612,7 +1621,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
             "is up", late_make_safe_waited)
 
     def no_start_while_closing():
-        engine = runs.RunEngine(database, registry.Registry())
+        engine = runs.RunEngine(database, registry.Registry(), roles=runs.ALL_ROLES)
         engine.close()
         refused = engine.start("hold", {"duration_min": 1, "interval_s": 1})
         if refused.get("ok"):
@@ -1634,7 +1643,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
 
         runs.CATALOGUE[Plain.name] = Plain
         store = dbmod.Database(os.path.join(directory, "second-look.db"))
-        engine = runs.RunEngine(store, registry.Registry())
+        engine = runs.RunEngine(store, registry.Registry(), roles=runs.ALL_ROLES)
         holding = threading.Event()
 
         def download():                          # longer than close() waits
@@ -1681,7 +1690,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
 
         runs.CATALOGUE[Plain.name] = Plain
         store = dbmod.Database(os.path.join(directory, "held-start.db"))
-        engine = runs.RunEngine(store, registry.Registry())
+        engine = runs.RunEngine(store, registry.Registry(), roles=runs.ALL_ROLES)
         holding = threading.Event()
 
         def download():                          # past close()'s first 5 s try
@@ -1734,7 +1743,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         store = dbmod.Database(os.path.join(directory, "kept.db"))
         left, made = {}, {}
         try:
-            engine = runs.RunEngine(store, registry.Registry())
+            engine = runs.RunEngine(store, registry.Registry(), roles=runs.ALL_ROLES)
             made = engine.start(Talks.name, {})["run"]
             said.wait(5)
             # During the run, the rig's records filed under it: an admin's
@@ -1818,7 +1827,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         store = dbmod.Database(os.path.join(directory, "between-runs.db"))
         left = {}
         try:
-            engine = runs.RunEngine(store, registry.Registry())
+            engine = runs.RunEngine(store, registry.Registry(), roles=runs.ALL_ROLES)
             run_id = engine.start(Talks.name, {})["run"]["id"]
             wait_until(lambda: not engine.status()["running"], 10, 0.05)
             # Between runs the engine files under the run that just ended --
@@ -1863,7 +1872,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         kept, outcome, went_ahead, beside = [], {}, False, False
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 run_id = engine.start(SlowEnd.name, {})["run"]["id"]
                 wait_until(lambda: engine.status()["running"], 5, 0.05)
                 thread = engine._thread
@@ -1921,7 +1930,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         store = dbmod.Database(os.path.join(directory, "retry-lines.db"))
         left = set()
         try:
-            engine = runs.RunEngine(store, registry.Registry())
+            engine = runs.RunEngine(store, registry.Registry(), roles=runs.ALL_ROLES)
             real_start = engine._start_cleanups
 
             def lingering():
@@ -1955,7 +1964,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         store = dbmod.Database(os.path.join(directory, "read-once.db"))
         raised = []
         try:
-            engine = runs.RunEngine(store, registry.Registry())
+            engine = runs.RunEngine(store, registry.Registry(), roles=runs.ALL_ROLES)
             made = store.create_run("hold", "read once", {})
             store.finish_run(made["id"], dbmod.COMPLETED, {})
 
@@ -1995,7 +2004,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
         store = dbmod.Database(os.path.join(directory, "confirmed.db"))
         left = {}
         try:
-            engine = runs.RunEngine(store, registry.Registry(),
+            engine = runs.RunEngine(store, registry.Registry(), roles=runs.ALL_ROLES,
                                     hardware=process.ProcessHardware())
             engine.mode = runs.GUIDED
             run_id = engine.start(Asks.name, {})["run"]["id"]
@@ -2023,7 +2032,7 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
     def stale_running_row():
         store = dbmod.Database(os.path.join(directory, "stale-running.db"))
         try:
-            engine = runs.RunEngine(store, registry.Registry())
+            engine = runs.RunEngine(store, registry.Registry(), roles=runs.ALL_ROLES)
             # A run whose ending was never written -- a failing card.
             stale = store.create_run("hold", "never ended", {})
             outcome = engine.delete_run(stale["id"])
@@ -2176,7 +2185,7 @@ dbmod.Database({path!r})
 
         runs.CATALOGUE[Watched.name] = Watched
         store = dbmod.Database(os.path.join(directory, "stop-delete.db"))
-        engine = runs.RunEngine(store, registry.Registry())
+        engine = runs.RunEngine(store, registry.Registry(), roles=runs.ALL_ROLES)
         old = store.create_run("hold", "tidied away", {})
         store.finish_run(old["id"], dbmod.COMPLETED, {})
         holding = threading.Event()
@@ -2241,7 +2250,7 @@ dbmod.Database({path!r})
 
         runs.CATALOGUE[Plain.name] = Plain
         store = dbmod.Database(os.path.join(directory, "close-start.db"))
-        engine = runs.RunEngine(store, registry.Registry())
+        engine = runs.RunEngine(store, registry.Registry(), roles=runs.ALL_ROLES)
         holding = threading.Event()
 
         def download():                          # holds the database a while
@@ -2277,7 +2286,7 @@ dbmod.Database({path!r})
     def budget_below_unit():
         from lab import api as apimod
         import re
-        with open(os.path.join(ROOT, "deploy", "tc600-web.service")) as unit:
+        with open(os.path.join(ROOT, "deploy", "vacuum-lab-web.service")) as unit:
             found = re.search(r"^TimeoutStopSec=(\d+)", unit.read(), re.M)
         stop = int(found.group(1)) if found else None
         budget = getattr(apimod.Application, "CLOSE_BUDGET_S", None)
@@ -2377,7 +2386,7 @@ dbmod.Database({path!r})
         saved = orphans_retried()
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 time.sleep(14.0)                  # past any deadline and retry
                 fake_tc600.FAULTS.clear()
                 off = wait_until(lambda: fake_tc600.STATE[1] is False, 15, 0.1)
@@ -2401,7 +2410,7 @@ dbmod.Database({path!r})
             pump_back_later)
 
     def event_order():
-        engine = runs.RunEngine(database, registry.Registry())
+        engine = runs.RunEngine(database, registry.Registry(), roles=runs.ALL_ROLES)
 
         def holding():                            # a download's copy
             with database._lock:
@@ -2433,7 +2442,7 @@ dbmod.Database({path!r})
         fake_tc600.STATE[1] = True                # the heater, left on
         cut_off = database.create_run("bakeout", "Cut off", {"setpoint_c": 70})
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             off = wait_until(lambda: fake_tc600.STATE[1] is False, 15, 0.1)
             supervisor = alarms.Supervisor(rig.devices, engine, database,
                                            auto_recover=False)
@@ -2640,7 +2649,7 @@ dbmod.Database({path!r})
         fake_tpg.reset()
         fake_tc600.STATE[2] = True                  # the pump in standby
         with Rig(pump_port, gauge_port, interval=None) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             engine.start("base_calibration", {"interval_s": 1})
             left = wait_until(lambda: fake_tc600.STATE[2] is False, 6, 0.1)
             engine.stop("selftest")
@@ -2650,7 +2659,7 @@ dbmod.Database({path!r})
             standby_left)
 
     def rate_of_rise_isolates():
-        engine = runs.RunEngine(database, registry.Registry(),
+        engine = runs.RunEngine(database, registry.Registry(), roles=runs.ALL_ROLES,
                                 hardware=process.ProcessHardware())
         engine._run = database.create_run("rate_of_rise", "gate test", {})
         engine.mode = runs.GUIDED

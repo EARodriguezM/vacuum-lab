@@ -16,7 +16,7 @@ Two gauges are fitted, as on a typical rig: a Pirani on channel 1 covering
 atmosphere down to its 1e-4 mbar floor, and a cold cathode on channel 2 that
 only reads below 1e-2 mbar. Each reports the underrange and sensor-off
 statuses at the right pressures, which is what makes the status handling in
-`tpg/device.py` and `lab/gauge.py` worth testing at all.
+`drivers/tpg/device.py` and `lab/gauge.py` worth testing at all.
 
 `set_pumping()` links it to the pump simulator: tools/selftest.py feeds the
 fake TC 600's rotor speed in, so the two simulators model one rig.
@@ -38,7 +38,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tpg import commands, protocol  # noqa: E402
+from drivers.tpg import commands, protocol  # noqa: E402
 
 
 class Chamber:

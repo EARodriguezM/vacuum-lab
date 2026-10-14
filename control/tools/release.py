@@ -22,8 +22,8 @@ the top of the tree, a folder git knows nothing of -- never does.
     the panel's own status file (`/run/vacuum-lab/status.json`);
  3. the release is copied over and its selftest run on the target's own
     Python (there is no hardware in it, so it costs nothing but time);
- 4. a backup is made (`tools/backup.py`, through the tc600-backup unit when
-    it is installed);
+ 4. a backup is made (`tools/backup.py`, through the vacuum-lab-backup unit
+    -- or its old name, tc600-backup -- when it is installed);
  5. the installed systemd units and udev rules are compared with the
     release's `deploy/`: a difference stops the deploy, unless
     `--install-units` copies them in;
@@ -38,6 +38,15 @@ Nothing here needs a password on the target but `sudo` for systemctl,
 which is passwordless on the lab PC. The first release onto a machine that
 still runs from a plain copy (`~/tc600-control`) needs the new units, which
 point at `<base>/current`: run it with `--install-units`.
+
+Until 2026-10 the units were called tc600-web and tc600-backup. A machine
+that still has them is moved over by `--install-units`: the new units are
+installed and enabled, the old ones disabled, and one `systemctl restart`
+of the new panel stops the old one first -- the new unit `Conflicts=` the
+old and is ordered after it, so systemd never runs both, and no moment
+passes with neither. The old unit files are removed once the new panel is
+healthy (and the old one is not running), or put back and started again if
+it is not. Drop-ins beside the old units stop the move: they would be lost.
 """
 
 from __future__ import annotations
@@ -66,14 +75,24 @@ HEALTH_WAIT_S = 60.0
 DEFAULT_BASE = "~/vacuum-lab"
 DEFAULT_STATUS = "/run/vacuum-lab/status.json"
 DEFAULT_BACKUP_DEST = "/mnt/vacuum-backup/vacuum-lab"
-SERVICE = "tc600-web"
+SERVICE = "vacuum-lab-web"
+BACKUP_TIMER = "vacuum-lab-backup.timer"
 #: Installed file -> its source in a release, compared before switching.
 UNITS = {
-    "/etc/systemd/system/tc600-web.service": "deploy/tc600-web.service",
-    "/etc/systemd/system/tc600-backup.service": "deploy/tc600-backup.service",
-    "/etc/systemd/system/tc600-backup.timer": "deploy/tc600-backup.timer",
+    "/etc/systemd/system/vacuum-lab-web.service": "deploy/vacuum-lab-web.service",
+    "/etc/systemd/system/vacuum-lab-backup.service": "deploy/vacuum-lab-backup.service",
+    "/etc/systemd/system/vacuum-lab-backup.timer": "deploy/vacuum-lab-backup.timer",
     "/etc/udev/rules.d/99-vacuum-lab.rules": "deploy/99-vacuum-lab.rules",
 }
+#: The units' names until 2026-10, which `--install-units` moves a machine
+#: off (see the top of this file).
+OLD_SERVICE = "tc600-web"
+OLD_BACKUP_TIMER = "tc600-backup.timer"
+OLD_UNITS = (
+    "/etc/systemd/system/tc600-web.service",
+    "/etc/systemd/system/tc600-backup.service",
+    "/etc/systemd/system/tc600-backup.timer",
+)
 
 
 class ReleaseError(Exception):
@@ -266,20 +285,30 @@ class Target:
     def __init__(self, host: str, base: str):
         self.host, self.base = host, base.rstrip("/")
         self.units = dict(UNITS)
+        self.old_units = list(OLD_UNITS)
         self.sudo = "sudo -n "
 
     def run(self, command: str, timeout: float = 120.0) -> tuple[int, str]:
-        result = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-             self.host, command], capture_output=True, text=True,
-            timeout=timeout)
+        # A link that hangs is a step that failed -- answered like any other,
+        # so the deploy still puts back what it changed -- not a traceback
+        # that leaves the machine half way.
+        try:
+            result = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                 self.host, command], capture_output=True, text=True,
+                timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return 124, f"no answer from {self.host} within {timeout:.0f} s"
         return result.returncode, (result.stdout + result.stderr).strip()
 
     def copy(self, folder: Path, release: str) -> None:
         destination = f"{self.host}:{self.base}/releases/{release}/"
-        result = subprocess.run(
-            ["rsync", "-a", "--mkpath", f"{folder}/", destination],
-            capture_output=True, text=True, timeout=600)
+        try:
+            result = subprocess.run(
+                ["rsync", "-a", "--mkpath", f"{folder}/", destination],
+                capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            raise ReleaseError("copying the release: no progress in 600 s")
         if result.returncode != 0:
             raise ReleaseError(f"copying the release: {result.stderr.strip()}")
 
@@ -360,6 +389,27 @@ def switch(target: Target, release: str) -> None:
         raise ReleaseError(f"switching current: {out}")
 
 
+def old_units_installed(target: Target) -> list[str]:
+    """The units still installed under their names before 2026-10."""
+    return [installed for installed in target.old_units
+            if target.run(f"test -e {shlex.quote(installed)}")[0] == 0]
+
+
+def old_dropins(target: Target, old: list[str]) -> list[str]:
+    """Drop-in folders (`<unit>.d/`) beside the units under their old names:
+    local changes a move to the new names would leave behind."""
+    return [f"{installed}.d" for installed in old
+            if target.run(f"test -d {shlex.quote(installed + '.d')}")[0] == 0]
+
+
+def panel_service(target: Target) -> str:
+    """The unit the panel runs under there: the new name, or the old one on
+    a machine not moved over yet."""
+    web = next(i for i in target.units if Path(i).name == f"{SERVICE}.service")
+    code, _ = target.run(f"test -e {shlex.quote(web)}")
+    return SERVICE if code == 0 else OLD_SERVICE
+
+
 def unit_differences(target: Target, release: str) -> list[str]:
     folder = f"{target.base}/releases/{release}"
     differ = []
@@ -373,6 +423,8 @@ def unit_differences(target: Target, release: str) -> list[str]:
                                f"{_q(folder + '/' + source)}")
         if code != 0:
             differ.append(f"{installed} differs from the release's {source}")
+    for installed in old_units_installed(target):
+        differ.append(f"{installed} is the unit's old name, to be replaced")
     return differ
 
 
@@ -388,28 +440,33 @@ def units_saved(target: Target, release: str) -> str:
     return f"{target.base}/units-before/{release}"
 
 
-def install_units(target: Target, release: str) -> str:
+def install_units(target: Target, release: str, old: list[str] = ()) -> str:
     """Install the release's units and rules, keeping the ones they replace
     in `units_saved()` first; returns that folder. If any step fails, what
     was already installed is put back before the error is raised: a unit
     pointing at a release that never went live would fail the panel's next
-    start, and leave nothing watching the rig."""
+    start, and leave nothing watching the rig.
+
+    `old` are the units still installed under their names before 2026-10:
+    kept with the others, and disabled -- the old panel goes on running
+    until the restart stops it, but would no longer start at boot."""
     saved = units_saved(target, release)
     try:
-        return _install_units(target, release, saved)
+        return _install_units(target, release, saved, old)
     except ReleaseError as exc:
-        unrestored = restore_units(target, saved)
+        unrestored = restore_units(target, saved, old)
         raise ReleaseError(f"{exc}; the units were "
                            + ("put back as they were" if not unrestored else
                               "NOT all put back: " + "; ".join(unrestored)))
 
 
-def _install_units(target: Target, release: str, saved: str) -> str:
+def _install_units(target: Target, release: str, saved: str,
+                   old: list[str]) -> str:
     folder = f"{target.base}/releases/{release}"
     code, out = target.run(f"mkdir -p -m 700 {_q(saved)}")
     if code != 0:
         raise ReleaseError(f"keeping the installed units: {out}")
-    for installed in target.units:
+    for installed in [*target.units, *old]:
         code, out = target.run(f"if test -e {shlex.quote(installed)}; then "
                                f"cp -p {shlex.quote(installed)} {_q(saved)}/; fi")
         if code != 0:
@@ -421,16 +478,30 @@ def _install_units(target: Target, release: str, saved: str) -> str:
         if code != 0:
             raise ReleaseError(f"installing {installed}: {out}")
     _reload(target)
-    code, out = target.run(f"{target.sudo}systemctl enable --now "
-                           f"tc600-backup.timer")
-    if code != 0:
-        raise ReleaseError(f"enabling the backup timer: {out}")
+    names = {Path(installed).name for installed in old}
+    steps = []
+    if f"{OLD_SERVICE}.service" in names:
+        steps.append((f"systemctl disable {OLD_SERVICE}",
+                      f"disabling the old {OLD_SERVICE}"))
+    if OLD_BACKUP_TIMER in names:
+        steps.append((f"systemctl disable --now {OLD_BACKUP_TIMER}",
+                      f"stopping the old {OLD_BACKUP_TIMER}"))
+    # Enabled, so the panel comes back after a power cut: a unit installed
+    # under a new name starts nowhere until it is.
+    steps += [(f"systemctl enable {SERVICE}", "enabling the panel's unit"),
+              (f"systemctl enable --now {BACKUP_TIMER}",
+               "enabling the backup timer")]
+    for command, what in steps:
+        code, out = target.run(target.sudo + command)
+        if code != 0:
+            raise ReleaseError(f"{what}: {out}")
     return saved
 
 
-def restore_units(target: Target, saved: str) -> list[str]:
+def restore_units(target: Target, saved: str, old: list[str] = ()) -> list[str]:
     """Undo `install_units`: put back each unit it replaced, and remove each
-    it added (the backup timer stopped first). What could not be done."""
+    it added (stopped first); the units under their old names, `old`, back
+    in place and enabled again. What could not be done."""
     failed = []
     for installed in target.units:
         name = Path(installed).name
@@ -439,10 +510,45 @@ def restore_units(target: Target, saved: str) -> list[str]:
             command = (f"{target.sudo}install -m 644 {_q(saved + '/' + name)} "
                        f"{shlex.quote(installed)}")
         else:
-            if name == "tc600-backup.timer":
-                target.run(f"{target.sudo}systemctl disable --now {name}")
+            if name in (BACKUP_TIMER, f"{SERVICE}.service"):
+                code, out = target.run(f"{target.sudo}systemctl disable --now {name}")
+                if code != 0:
+                    # Kept: while the new panel may still run, its unit's
+                    # Conflicts= is what stops the old one starting beside it.
+                    failed.append(f"stopping {name}: {out}")
+                    continue
             command = f"{target.sudo}rm -f {shlex.quote(installed)}"
         code, out = target.run(command)
+        if code != 0:
+            failed.append(f"{installed}: {out}")
+    for installed in old:
+        name = Path(installed).name
+        code, out = target.run(f"{target.sudo}install -m 644 "
+                               f"{_q(saved + '/' + name)} "
+                               f"{shlex.quote(installed)}")
+        if code != 0:
+            failed.append(f"{installed}: {out}")
+    try:
+        _reload(target)
+    except ReleaseError as exc:
+        failed.append(str(exc))
+    names = {Path(installed).name for installed in old}
+    for name, command in ((f"{OLD_SERVICE}.service", f"enable {OLD_SERVICE}"),
+                          (OLD_BACKUP_TIMER, f"enable --now {OLD_BACKUP_TIMER}")):
+        if name in names:
+            code, out = target.run(f"{target.sudo}systemctl {command}")
+            if code != 0:
+                failed.append(f"systemctl {command}: {out}")
+    return failed
+
+
+def retire_old_units(target: Target, old: list[str]) -> list[str]:
+    """Once the panel runs healthy under its new name: the unit files under
+    the old names go. Their copies stay in `units_saved()`. What could not
+    be done."""
+    failed = []
+    for installed in old:
+        code, out = target.run(f"{target.sudo}rm -f {shlex.quote(installed)}")
         if code != 0:
             failed.append(f"{installed}: {out}")
     try:
@@ -454,7 +560,8 @@ def restore_units(target: Target, saved: str) -> list[str]:
 
 def healthy(target: Target, release: str | None, before: dict | None,
             status_path: str, wait: float = HEALTH_WAIT_S,
-            sleep=time.sleep) -> str | None:
+            sleep=time.sleep, service: str = SERVICE,
+            gone: str | None = None) -> str | None:
     """None once the service is up running `release` and well, else what is
     wrong. With `release` None (a panel from before releases), only that
     the service is active."""
@@ -462,10 +569,15 @@ def healthy(target: Target, release: str | None, before: dict | None,
     problem = "no status yet"
     while time.monotonic() < deadline:
         sleep(3)
-        code, out = target.run(f"systemctl is-active {SERVICE}")
+        code, out = target.run(f"systemctl is-active {service}")
         if out.strip() != "active":
             problem = f"the service is {out.strip() or 'not running'}"
             continue
+        if gone:
+            code, out = target.run(f"systemctl is-active {gone}")
+            if out.strip() == "active":
+                problem = f"{gone} is still running beside {service}"
+                continue
         if release is None:
             return None
         state, _ = rig_state(target, status_path)
@@ -549,10 +661,13 @@ def deploy(args, log=print, target: Target | None = None,
         log("No backup (--no-backup)")
     else:
         log("Backing up first")
-        code, _ = target.run("systemctl cat tc600-backup.service >/dev/null 2>&1")
-        if code == 0:
-            code, out = target.run(f"{target.sudo}systemctl start "
-                                   f"tc600-backup.service", timeout=1800)
+        unit = next((name for name in ("vacuum-lab-backup.service",
+                                       "tc600-backup.service")
+                     if target.run(f"systemctl cat {name} >/dev/null 2>&1")[0] == 0),
+                    None)
+        if unit:
+            code, out = target.run(f"{target.sudo}systemctl start {unit}",
+                                   timeout=1800)
         else:
             code, out = target.run(
                 f"cd {_q(folder)} && python3 tools/backup.py make "
@@ -578,25 +693,49 @@ def deploy(args, log=print, target: Target | None = None,
     # restarted into a folder that does not exist, and nothing would watch
     # the rig. The running panel is not touched by either until the restart.
     previous = current_release(target)
+    old = old_units_installed(target)
+    # The panel under its old name, as opposed to old backup units left over.
+    old_panel = any(Path(o).name == f"{OLD_SERVICE}.service" for o in old)
+    dropins = old_dropins(target, old)
+    if dropins:
+        raise ReleaseError("local changes to the old units would be left "
+                           "behind by the move to the new names: "
+                           + ", ".join(dropins) + ". Carry them over to the "
+                           "new unit names by hand first")
     log(f"Switching {previous or '(a plain copy)'} -> {release}")
     switch(target, release)
     saved = None
     if differ:
-        log("Installing the release's units and udev rules")
+        log("Installing the release's units and udev rules"
+            + (f", in place of {', '.join(Path(o).name for o in old)}"
+               if old else ""))
         try:
-            saved = install_units(target, release)
+            saved = install_units(target, release, old)
         except ReleaseError:
             if previous:
                 switch(target, previous)
             else:
                 target.run(f"rm -f {_q(target.base + '/current')}")
             raise
-    log("Restarting")
-    code, out = target.run(f"{target.sudo}systemctl restart {SERVICE}", timeout=150)
+    log("Restarting" + (f" under the new name; {OLD_SERVICE} stops first"
+                        if old_panel else ""))
+    # One systemd transaction even when moving off the old name: the new unit
+    # Conflicts= the old and is ordered After= it, so starting it stops the
+    # old panel first. Two commands would leave a moment -- a dropped link --
+    # with neither running and nothing watching the rig.
+    code, out = target.run(f"{target.sudo}systemctl restart {SERVICE}",
+                           timeout=150)
     problem = (f"restart failed: {out}" if code != 0 else
-               healthy(target, release, before, args.status, wait, sleep))
+               healthy(target, release, before, args.status, wait, sleep,
+                       gone=OLD_SERVICE if old_panel else None))
     if not problem:
         log(f"  {release} is running")
+        if old:
+            left = retire_old_units(target, old)
+            log(f"  now {SERVICE}; the old units were removed (copies in "
+                f"{saved})" if not left else
+                f"  now {SERVICE}, but the old units are NOT all removed: "
+                + "; ".join(left))
         for removed in prune(target):
             log(f"  removed old release {removed}")
         return release
@@ -608,19 +747,20 @@ def deploy(args, log=print, target: Target | None = None,
     if previous:
         log(f"  switching back to {previous}")
         switch(target, previous)
-    unrestored = restore_units(target, saved) if saved else []
-    code, out = target.run(f"{target.sudo}systemctl restart {SERVICE}",
+    unrestored = restore_units(target, saved, old) if saved else []
+    service = OLD_SERVICE if old_panel else SERVICE
+    code, out = target.run(f"{target.sudo}systemctl restart {service}",
                            timeout=150)
     back = (f"restart failed: {out}" if code != 0 else
             healthy(target, previous, before if previous else None,
-                    args.status, wait, sleep))
+                    args.status, wait, sleep, service=service))
     what = previous or "the copy the previous units run"
     if back or unrestored:
         raise ReleaseError(
             f"release {release} was not healthy ({problem}); going back to "
             f"{what} did NOT work either: "
             + "; ".join(filter(None, [back] + unrestored))
-            + ". Look at the machine now: journalctl -u tc600-web")
+            + f". Look at the machine now: journalctl -u {service}")
     raise ReleaseError(f"release {release} was rolled back to {what}: {problem}")
 
 
@@ -679,11 +819,12 @@ def main(argv: list[str] | None = None) -> int:
             raise ReleaseError("there is no release before the current one")
         previous = releases[releases.index(current) - 1]
         check_idle(target, args)
+        service = panel_service(target)
         switch(target, previous)
-        code, out = target.run(f"{target.sudo}systemctl restart {SERVICE}")
+        code, out = target.run(f"{target.sudo}systemctl restart {service}")
         if code != 0:
             raise ReleaseError(f"restart failed: {out}")
-        problem = healthy(target, previous, None, args.status)
+        problem = healthy(target, previous, None, args.status, service=service)
         if problem:
             raise ReleaseError(f"switched back to {previous}, but: {problem}")
         print(f"Rolled back to {previous}")

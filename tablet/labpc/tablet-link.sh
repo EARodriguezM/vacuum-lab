@@ -3,7 +3,7 @@
 #
 #   tablet-link.sh            run forever (the tablet-link systemd service)
 #   tablet-link.sh reload     make the kiosk reload the panel now, e.g. after
-#                             a deploy restarted tc600-web in under 15 s
+#                             a deploy restarted vacuum-lab-web in under 15 s
 #   tablet-link.sh status     what is connected and forwarded
 #
 # `adb reverse` lasts only as long as the USB connection, so this re-adds it

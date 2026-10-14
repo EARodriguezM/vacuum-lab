@@ -4,8 +4,8 @@
 # copies each release there, switches the link, restarts this unit and
 # checks it came back, and installs this file when it changes
 # (`release.py deploy --to HOST --install-units`). By hand:
-#   sudo cp deploy/tc600-web.service /etc/systemd/system/
-#   sudo systemctl daemon-reload && sudo systemctl enable --now tc600-web
+#   sudo cp deploy/vacuum-lab-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now vacuum-lab-web
 #
 # Everybody signs in: the first account, the chamber's owner, is made on this
 # machine BEFORE the first start with accounts --
@@ -20,7 +20,12 @@
 #   --admin-from 192.168.50.0/24     (accounts and overrides only from there)
 # Loopback -- the kiosk tablet on its USB cable -- always passes both.
 #
-# Both ports are "auto": the panel finds each instrument by asking every
+# Which instruments this chamber has, and their ports and settings, are in its
+# file, named by --chamber below -- not on this command line, so that file is
+# the one place to change them. A second chamber on the same machine is a copy
+# of this unit with its own --chamber, --port, --db and RuntimeDirectory.
+#
+# Chamber 1's ports are "auto": the panel finds each instrument by asking every
 # serial port what is on it (read-only queries -- the TC 600's type, the TPG's
 # firmware), so a replugged or replaced USB adapter, or a renumbered
 # /dev/ttyUSBn, does not matter. It tries the udev names /dev/tc600 and
@@ -35,8 +40,14 @@
 # rather than a stale config file. Finding the ports removes that trap.
 
 [Unit]
-Description=Vacuum lab control panel (TC 600 turbopump + TPG 252 A gauge)
-After=network.target
+Description=Vacuum lab control panel
+After=network.target tc600-web.service
+# tc600-web was this unit's name until 2026-10. Two panels on one rig would
+# both open the pump's serial port and talk over each other, so systemd never
+# lets them run together: starting either stops the other -- and, ordered
+# after it (above), stops it first. tools/release.py --install-units moves a
+# machine from the old name to this one.
+Conflicts=tc600-web.service
 
 [Service]
 Type=simple
@@ -46,14 +57,13 @@ WorkingDirectory=/home/esarodriguezm/vacuum-lab/current
 # Without this, Python block-buffers stdout when it is a journal socket rather
 # than a terminal, and the startup banner -- which ports were opened, what the
 # interlocks are set to, and whether an owner exists -- never reaches
-# `journalctl -u tc600-web`.
+# `journalctl -u vacuum-lab-web`.
 Environment=PYTHONUNBUFFERED=1
 # The code directory is read-only to the service (below); this stops Python
 # trying to write __pycache__ there on every start.
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/bin/python3 /home/esarodriguezm/vacuum-lab/current/webserver.py \
-    --serial auto --address 1 \
-    --gauge auto \
+    --chamber /home/esarodriguezm/vacuum-lab/current/chambers/chamber-1.toml \
     --port 8600
 Restart=on-failure
 RestartSec=5

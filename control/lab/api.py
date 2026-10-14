@@ -317,7 +317,7 @@ class Application:
                  chamber: dict | None = None, allow: list | None = None,
                  hosts: set[str] | None = None, origins: list | None = None,
                  admin_from: list | None = None, status_file: str | None = None,
-                 version: dict | None = None):
+                 version: dict | None = None, setup: dict | None = None):
         self.registry = registry
         self.db = database
         self.engine = engine
@@ -327,6 +327,10 @@ class Application:
         #: Which chamber this server drives: {"id", "name"}.
         self.chamber = chamber or {"id": self.auth.chamber,
                                    "name": self.auth.chamber}
+        #: Which kind of instrument fills each role, and which roles this
+        #: chamber has none for (lab/chamber.py) -- for those signed in only;
+        #: /api/ping says no more than the chamber's name.
+        self.setup = setup or {}
         #: Networks allowed to reach the panel at all; empty allows any.
         self.allow = allow or []
         #: Names the panel answers to besides IP addresses (host_allowed).
@@ -419,8 +423,11 @@ class Application:
             "run": self.engine.status(),
             "actuators": self.engine.actuators(),
             "automatic_ready": self.engine.hardware.automatic_ready,
-            # Procedures this rig cannot run, and what each is missing.
+            # Procedures this rig cannot run, and what each is missing --
+            # of that, the instruments the chamber does not have at all.
             "unavailable": self.engine.unavailable(),
+            "unconfigured": self.engine.unconfigured_all(),
+            "setup": self.setup,
             "alarms": self.supervisor.describe() if self.supervisor else None,
             # The thresholds the engine judges by, so the panel draws with
             # the same ones (lab/judgement.py).

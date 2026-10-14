@@ -3,7 +3,7 @@
 Built on `sys.monitoring` (Python 3.12+): each line reports itself once and
 is then switched off, so the cost is paid on first execution only and the
 timing sections still see real timing -- which `python -m trace` does not
-allow. Lines are counted per file under lab/, tc600/ and tpg/; a line is
+allow. Lines are counted per file under lab/ and drivers/; a line is
 executable when its compiled code says so, so docstrings and comments are
 never "missed".
 """
@@ -14,7 +14,7 @@ import os
 import sys
 import time
 
-PACKAGES = ("lab", "tc600", "tpg")
+PACKAGES = ("lab", "drivers")
 
 
 class Coverage:
@@ -93,7 +93,7 @@ class Coverage:
             rows.append((relative, len(lines), len(hit), share))
             if missed:
                 detail.append(f"{relative}: {_ranges(missed)}")
-        print("\nCoverage of lab/, tc600/, tpg/ (lines run at least once)")
+        print("\nCoverage of lab/ and drivers/ (lines run at least once)")
         for relative, count, hit, share in rows:
             print(f"  {share:5.1f} %  {hit:5d} / {count:<5d} {relative}")
         overall = 100.0 * total_hit / total_lines if total_lines else 100.0

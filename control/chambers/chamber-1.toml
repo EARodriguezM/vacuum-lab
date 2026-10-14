@@ -1,0 +1,27 @@
+# Chamber 1: the magnetron sputtering rig.
+#
+# Which instruments this chamber has, on which ports, with which settings.
+# Read when the panel starts (./webserver.py --chamber chambers/chamber-1.toml,
+# the default) and checked strictly: a misspelt field stops the panel with
+# this file and the field named. See README.md in this folder.
+
+# Accounts' roles are granted per chamber id: keep it once people have accounts.
+id = "chamber-1"
+name = "Chamber 1"
+about = "Magnetron sputtering in argon"
+
+# The turbopump's drive: a Pfeiffer TC 600 driving a TMH/TMU 071 P, over
+# RS-485 through the HXSP-485 converter (udev name /dev/tc600).
+[instruments.pump]
+kind = "tc600"
+port = "auto"      # "auto": ask every serial port; or a device such as "/dev/tc600"
+address = 1        # the drive's RS-485 address
+settle_ms = 30     # pause before listening, for the converter to turn round
+
+# The gauge controller: a Pfeiffer TPG 252 A, RS-232 direct (/dev/tpg252),
+# a PKR 251 FullRange on channel 1.
+[instruments.gauge]
+kind = "tpg"
+port = "auto"
+channels = 2
+# baudrate = 9600  # left out: detected

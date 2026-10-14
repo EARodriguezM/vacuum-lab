@@ -32,7 +32,7 @@ TC 600    → HXSP-485 → FTDI FT232R (/dev/tc600)   ┐
 TPG 252 A → RS-232   → FTDI US232R (/dev/tpg252)  ┘
 ```
 
-**Contents** — [Quick start](#quick-start) · [The web panel](#the-web-panel) · [The deposition process](#the-deposition-process) · [Runs and the database](#runs-and-the-database) · [Bringing the gauge link up](#bringing-the-gauge-link-up) · [Command line tools](#command-line-tools) · [Accessory connectors](#accessory-connectors) · [Verified working configuration](#verified-working-configuration) · [Deploying to the lab PC](#deploying-to-the-lab-pc) · [Releasing a new version](#releasing-a-new-version) · [Backups](#backups) · [The morning report](#the-morning-report) · [One-time setup: serial port permissions](#one-time-setup-serial-port-permissions) · [Wiring](#wiring) · [If nothing answers](#if-nothing-answers) · [Choosing an adapter](#choosing-an-adapter) · [Verifying the parameter table](#verifying-the-parameter-table) · [Testing without hardware](#testing-without-hardware) · [Layout](#layout) · [Protocol notes](#protocol-notes) · [Why not LabVIEW or PV TurboViewer](#why-not-labview-or-pv-turboviewer)
+**Contents** — [Quick start](#quick-start) · [Chambers](#chambers) · [The web panel](#the-web-panel) · [The deposition process](#the-deposition-process) · [Runs and the database](#runs-and-the-database) · [Bringing the gauge link up](#bringing-the-gauge-link-up) · [Command line tools](#command-line-tools) · [Accessory connectors](#accessory-connectors) · [Verified working configuration](#verified-working-configuration) · [Deploying to the lab PC](#deploying-to-the-lab-pc) · [Releasing a new version](#releasing-a-new-version) · [Backups](#backups) · [The morning report](#the-morning-report) · [One-time setup: serial port permissions](#one-time-setup-serial-port-permissions) · [Wiring](#wiring) · [If nothing answers](#if-nothing-answers) · [Choosing an adapter](#choosing-an-adapter) · [Verifying the parameter table](#verifying-the-parameter-table) · [Testing without hardware](#testing-without-hardware) · [Layout](#layout) · [Protocol notes](#protocol-notes) · [Why not LabVIEW or PV TurboViewer](#why-not-labview-or-pv-turboviewer)
 
 ![The Dashboard during a simulated deposition](../docs/images/panel-dashboard.png)
 
@@ -77,6 +77,52 @@ is roughed out, and that is the one question the crossover interlock exists
 to answer.
 
 ---
+
+## Chambers
+
+The panel drives one chamber, and which instruments that chamber has is
+written in its file in [`chambers/`](chambers/) — not assumed. The files are
+TOML, so they can say in comments why a setting is what it is:
+
+```toml
+id = "chamber-1"
+name = "Chamber 1"
+about = "Magnetron sputtering in argon"
+
+[instruments.pump]
+kind = "tc600"
+port = "auto"      # or a device such as "/dev/tc600"
+address = 1
+
+[instruments.gauge]
+kind = "tpg"
+port = "auto"
+channels = 2
+```
+
+```bash
+./webserver.py                                              # chambers/chamber-1.toml
+./webserver.py --chamber chambers/chamber-2.toml --port 8601
+```
+
+Everything else in the panel — the run engine, the interlocks, the alarms,
+the charts — asks for an instrument by its role (`pump`, `gauge`), never by
+its model. A role the file leaves out is simply not there: the panel starts
+without it, and every procedure that needs it is listed but switched off,
+saying so. A chamber with a gauge and no turbopump the panel can drive can
+still record an *Ultimate pressure / hold* run.
+
+The file is checked strictly when the panel starts: an unknown kind, a kind
+in the wrong role or a misspelt option stops it with the file and the field
+named. The flags `--serial`, `--address`, `--gauge`, `--gauge-baud`,
+`--gauge-channels`, `--no-pump` and `--no-gauge` override the file for one
+start. The kinds there are drivers for, and their options, are in
+[`chambers/README.md`](chambers/README.md).
+
+The port search, and the survey on the Settings page, ask free ports only for
+the kinds of instrument the chamber has. Where a chamber has a controller the
+panel has no driver for, give the ports of the ones it does have, or pass
+`--no-port-search`: a search sends its read-only queries to every free port.
 
 ## The web panel
 
@@ -184,7 +230,7 @@ Besides drive faults and the rest, the panel raises an alarm when:
 - a red banner **"Nothing is raising alarms"**: the part of the panel that
   watches for faults has stopped, so no new alarm will appear. Watch the rig
   yourself and ask whoever looks after the panel to restart it; the journal
-  (`journalctl -u tc600-web -p err`) says what went wrong.
+  (`journalctl -u vacuum-lab-web -p err`) says what went wrong.
 
 One lost reply on the bus raises none of these: the panel believes a change in
 the drive only when two readings in a row show it.
@@ -234,10 +280,9 @@ headers. The lab PC's IP has moved before.
 A hosted static page cannot do this job — the UI has to reach a serial port,
 so something with access to `/dev/tc600` must be in the loop.
 
-`deploy/tc600-web.service` is a systemd unit for starting it at boot, and
-`deploy/99-vacuum-lab.rules` is what makes `/dev/tc600` and `/dev/tpg252`
-exist. Neither is installed by default, deliberately — see **Deploying to
-the lab PC**.
+`deploy/vacuum-lab-web.service` is the systemd unit that starts it at boot,
+and `deploy/99-vacuum-lab.rules` is what makes `/dev/tc600` and `/dev/tpg252`
+exist — see **Deploying to the lab PC**.
 
 ### Safety
 
@@ -563,7 +608,7 @@ pressure unit (with automatic conversion to millibar for storage), the four
 switching functions, the error register, the keylock, and baud-rate
 autodetection.
 
-No TPG 252 A manual is in this repository, so `tpg/commands.py` started as the
+No TPG 252 A manual is in this repository, so `drivers/tpg/commands.py` started as the
 published *family* command set. The firmware settled it:
 
 ```bash
@@ -701,7 +746,7 @@ meant a live but misconfigured link instead.
 
 ## Deploying to the lab PC
 
-The panel runs there as a systemd service, `tc600-web`, on
+The panel runs there as a systemd service, `vacuum-lab-web`, on
 `http://labpc:8600/` (`labpc` standing for its address). Two files in `deploy/` set it up, and the udev
 rules come first — the unit names devices that do not exist without them:
 
@@ -711,10 +756,21 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=tty --action=add
 ls -l /dev/tc600 /dev/tpg252          # both should appear
 
-sudo cp deploy/tc600-web.service /etc/systemd/system/
+sudo cp deploy/vacuum-lab-web.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now tc600-web
+sudo systemctl enable --now vacuum-lab-web
 ```
+
+That is the first installation by hand; afterwards `tools/release.py` (below)
+installs new versions and their units.
+
+**The units' old names.** Until October 2026 they were `tc600-web` and
+`tc600-backup`. A machine still running them moves over on the next
+`./tools/release.py deploy --install-units`: the new units are installed and
+enabled, the old panel is stopped before the new one starts, and the old
+unit files are removed once the new panel is healthy — or put back and
+started again if it is not. The new unit `Conflicts=` the old one, so systemd
+never runs the two together: both would talk to the pump on one port.
 
 **Names, not numbers.** The rules match each FTDI adapter's burned-in serial
 number, so the name follows the cable rather than the USB socket:
@@ -765,7 +821,7 @@ installing the new one check that `ls -ld ~/.local/share/vacuum-lab` shows
 the directory — if it does not exist the service fails to start (status
 226/NAMESPACE) and nothing watches the rig; `./tools/users.py owner NAME`
 or `install -d -m 700 ~/.local/share/vacuum-lab` creates it — and that
-`systemctl cat tc600-web` does not point `--db` somewhere else. Run
+`systemctl cat vacuum-lab-web` does not point `--db` somewhere else. Run
 `timedatectl` too: when it does not say the clock is synchronised, every
 update signs everybody out.
 
@@ -775,11 +831,11 @@ does not stop the pump, but it does stop the interlocks and the run engine
 watching it. **Is the unit file still true?** Ports can be rebound live from
 the settings page and that only lives in memory, so a panel talking happily
 to `/dev/tc600` can be a service whose unit still says `/dev/ttyS1` — the
-restart is where that comes apart. Compare `systemctl cat tc600-web` with the
+restart is where that comes apart. Compare `systemctl cat vacuum-lab-web` with the
 `port` field in `/api/state`.
 
 The startup banner — ports opened, interlock limits, and whether an owner
-exists yet — goes to `journalctl -u tc600-web`. It only gets
+exists yet — goes to `journalctl -u vacuum-lab-web`. It only gets
 there because the unit sets `PYTHONUNBUFFERED=1`; without it Python block-
 buffers stdout into a journal socket and the banner never appears.
 
@@ -836,8 +892,8 @@ timer, which makes a backup every six hours (and at boot, if one was missed):
 
 ```bash
 ./tools/backup.py init /mnt/vacuum-backup/vacuum-lab
-sudo cp deploy/tc600-backup.service deploy/tc600-backup.timer /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now tc600-backup.timer
+sudo cp deploy/vacuum-lab-backup.service deploy/vacuum-lab-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now vacuum-lab-backup.timer
 ```
 
 The marking matters: a folder that was not marked by `init` is refused. If
@@ -849,8 +905,8 @@ of quietly filling the machine's own disk under the empty mount point.
 ```bash
 ./tools/backup.py status                              # how the last backup went
 ./tools/backup.py verify /mnt/vacuum-backup/vacuum-lab  # check every backup on the stick
-systemctl list-timers tc600-backup                    # when the next one runs
-journalctl -u tc600-backup                            # how the last ones went
+systemctl list-timers vacuum-lab-backup                    # when the next one runs
+journalctl -u vacuum-lab-backup                            # how the last ones went
 ```
 
 The panel warns when there is no backup, when the last one failed, or when the
@@ -1016,7 +1072,7 @@ B → TC pin 7 (D−), GND → TC pin 6. Vendors label A/B inconsistently, so if
 
 The manuals in `../docs/manuals/` cover wiring and the electrical spec, but defer
 the parameter list to **PM 0488 BN** and **PM 0547 BN**, neither of which is in
-this repository. The table in `tc600/params.py` is the standard Pfeiffer
+this repository. The table in `drivers/tc600/params.py` is the standard Pfeiffer
 parameter set, which the TC 600 implements — but it has not been checked
 against your specific firmware.
 
@@ -1033,7 +1089,7 @@ as "not implemented". Trust that output over the table.
 ## Testing without hardware
 
 ```bash
-./tools/selftest.py          # about 590 checks (about 11 min): drivers, analysis, database, accounts, history, alarms, run engine, bus faults, timing, restarts, who may do what, sign-in limits, port finding, logging, backups and releases
+./tools/selftest.py          # about 610 checks (about 11 min): drivers, analysis, database, accounts, history, alarms, run engine, bus faults, timing, restarts, who may do what, sign-in limits, port finding, chambers' files, logging, backups and releases
 ./tools/uitest.py            # the panel in a real browser (about 75 s, needs Chrome)
 ./tools/fake_rig.py          # both simulators, wired together
 ./tools/fake_tc600.py        # just the pump
@@ -1088,12 +1144,14 @@ with 120 sccm and the gate open reproduces the failures of 2026-10-08.
 
 | Path | Purpose |
 |---|---|
-| `tc600/protocol.py` | TC 600 telegram framing, checksums, the eight data types |
-| `tc600/params.py` | Parameter table and name/number lookup |
-| `tc600/device.py` | RS-485 transport, retries, echo handling |
-| `tpg/protocol.py` | TPG mnemonic protocol, ACK/ENQ handshake, status codes |
-| `tpg/commands.py` | Command table, enumerations, gauge types |
-| `tpg/device.py` | RS-232 transport, capability probe, baud autodetection |
+| `chambers/` | One TOML file per chamber: which instruments it has, on which ports (see [Chambers](#chambers)) |
+| `drivers/tc600/protocol.py` | TC 600 telegram framing, checksums, the eight data types |
+| `drivers/tc600/params.py` | Parameter table and name/number lookup |
+| `drivers/tc600/device.py` | RS-485 transport, retries, echo handling |
+| `drivers/tpg/protocol.py` | TPG mnemonic protocol, ACK/ENQ handshake, status codes |
+| `drivers/tpg/commands.py` | Command table, enumerations, gauge types |
+| `drivers/tpg/device.py` | RS-232 transport, capability probe, baud autodetection |
+| `lab/chamber.py` | Reading and checking a chamber's file; the kinds of instrument there are drivers for |
 | `lab/registry.py` | Device framework — one class per instrument |
 | `lab/pump.py` | TC 600 service and process interlocks |
 | `lab/gauge.py` | TPG service and the cold-cathode interlock |
@@ -1114,7 +1172,7 @@ with 120 sccm and the gate open reproduces the failures of 2026-10-08.
 | `tc600ctl.py` / `tpgctl.py` | Command line tools |
 | `tools/` | Simulators, the self test (`tools/checks/`) and the browser test |
 | `tools/backup.py`, `tools/release.py`, `tools/report.py` | Backups, releasing a new version, the morning report |
-| `deploy/` | The service files (`tc600-web`, `tc600-backup`) and the device rules |
+| `deploy/` | The service files (`vacuum-lab-web`, `vacuum-lab-backup`) and the device rules |
 
 ## Protocol notes
 
@@ -1140,7 +1198,7 @@ One subtlety worth knowing if you extend this: a **write request and its reply
 are byte-identical**, since both carry action code 10 and the pump echoes the
 accepted value. Reads are distinguishable (request 00, reply 10). So on a
 half-duplex converter that loops transmissions back, an echoed write cannot be
-told from a reply by content alone. `tc600/device.py` learns whether the
+told from a reply by content alone. `drivers/tc600/device.py` learns whether the
 converter echoes from the first read exchange and applies that to writes.
 
 ### TPG
@@ -1157,7 +1215,7 @@ unit -> "0,1.2340E-05<CR><LF>"
 The unit answers the mnemonic with nothing but an acknowledgement; the data
 only comes after a separate enquiry byte. Skipping the ENQ leaves the reply
 sitting in the unit and every later exchange one frame out of step. Every
-exchange in `tpg/device.py` therefore opens with `<ETX>`, which flushes the
+exchange in `drivers/tpg/device.py` therefore opens with `<ETX>`, which flushes the
 unit's input buffer, so resynchronising costs one byte instead of a power
 cycle.
 
