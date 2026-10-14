@@ -7,6 +7,7 @@
 
 <a href="https://github.com/EARodriguezM/vacuum-lab/commits/main"><img src="https://img.shields.io/github/last-commit/EARodriguezM/vacuum-lab" alt="Last commit"/></a>
 <a href="https://github.com/EARodriguezM/vacuum-lab/issues"><img src="https://img.shields.io/github/issues/EARodriguezM/vacuum-lab" alt="Issues"/></a>
+<a href="LICENSE"><img src="https://img.shields.io/github/license/EARodriguezM/vacuum-lab?color=2b9348" alt="License: GPL-3.0"/></a>
 <img src="https://img.shields.io/badge/python-3.11%E2%80%933.14-3776AB?logo=python&logoColor=white" alt="Python 3.11 to 3.14"/>
 <img src="https://img.shields.io/badge/dependencies-pyserial%20only-2b9348" alt="Only pyserial"/>
 <img src="https://img.shields.io/badge/web%20UI-Preact%20%2B%20htm%2C%20no%20build%20step-673AB8" alt="Preact and htm, no build step"/>
@@ -226,6 +227,13 @@ cd control
 <img src="docs/images/panel-process.png" width="49%" alt="The Process tab during a deposition"/>
 <img src="docs/images/panel-equipment.png" width="49%" alt="The turbopump's page"/>
 </p>
+
+---
+
+### License
+
+[GNU General Public License v3.0](LICENSE). The manuals in `docs/manuals/`
+are their makers' and are included for reference only.
 
 ---
 
