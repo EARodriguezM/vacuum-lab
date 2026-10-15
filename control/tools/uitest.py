@@ -646,6 +646,10 @@ def part_form(chrome, server, sessions, report, shots):
     page.wait("document.querySelector(\"[data-test='run-start'], [data-test='run-new']\")")
     if click(page, "run-new"):
         page.wait("document.querySelector(\"[data-test='run-start']\")")
+    # The form fills in its defaults just after it appears: a field cleared
+    # before that is filled in again, and Start rightly stays enabled.
+    page.wait("[...document.querySelectorAll(\"input[data-test^='recipe-field-']\")]"
+              ".every(e => e.value !== '')", timeout=10)
     field = page.js("(() => { const e = document.querySelector("
                     "\"[data-test^='recipe-field-'] input[type='number'],"
                     " input[data-test^='recipe-field-'][type='number']\");"
