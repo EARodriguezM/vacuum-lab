@@ -91,7 +91,7 @@ def test_database() -> None:
         check("orphan detected", len(database.orphaned_runs()) == 1)
         # Constructing the engine is the whole test: closing out runs left
         # open by a dead process is a startup side effect.
-        runs.RunEngine(database, registry.Registry())
+        runs.RunEngine(database, registry.Registry(), roles=runs.ALL_ROLES)
         check("orphan closed out on startup",
               len(database.orphaned_runs()) == 0)
         check("orphan marked failed",
@@ -277,7 +277,8 @@ def test_history_and_charts() -> None:
         database = dbmod.Database(os.path.join(directory, "order.db"))
         runs.CATALOGUE[Marking.name] = Marking
         try:
-            engine = runs.RunEngine(database, registry.Registry())
+            engine = runs.RunEngine(database, registry.Registry(),
+                                    roles=runs.ALL_ROLES)
             started = engine.start(Marking.name, {})
             deadline = time.monotonic() + 10
             while engine.status()["running"] and time.monotonic() < deadline:

@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import time
 
-import tpg
-from tc600 import TC600, protocol, scan
+from drivers import tpg
+from drivers.tc600 import TC600, protocol, scan
 from lab import gauge as gaugemod
 from tools.checks.common import (
     check)

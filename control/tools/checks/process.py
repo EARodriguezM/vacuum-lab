@@ -128,7 +128,8 @@ def test_equipment() -> None:
               [process.EQUIPMENT["gas"], process.EQUIPMENT["heater"]])
 
         database = dbmod.Database(os.path.join(directory, "eq.db"))
-        engine = runs.RunEngine(database, reg.Registry(), hardware=hardware,
+        engine = runs.RunEngine(database, reg.Registry(),
+                                roles=runs.ALL_ROLES, hardware=hardware,
                                 equipment=equipment)
         refused = engine.start("deposition", {})
         check("a deposition is refused while its hardware is not installed",
@@ -176,7 +177,8 @@ def test_deposition_engine() -> None:
     with tempfile.TemporaryDirectory() as directory:
         database = dbmod.Database(os.path.join(directory, "dep.db"))
         hardware = process.ProcessHardware()
-        engine = runs.RunEngine(database, reg.Registry(), hardware=hardware)
+        engine = runs.RunEngine(database, reg.Registry(),
+                                roles=runs.ALL_ROLES, hardware=hardware)
         engine._run = database.create_run("deposition", "prompt test", {})
 
         # --- guided mode: a manual step raises a prompt, not an abort ------

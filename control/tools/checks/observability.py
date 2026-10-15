@@ -21,7 +21,7 @@ from tools.checks.common import attempt, check, wait_until
 def _rig(directory: str, **options):
     from lab import alarms
     database = dbmod.Database(os.path.join(directory, "lab.db"))
-    engine = runs.RunEngine(database, registry.Registry())
+    engine = runs.RunEngine(database, registry.Registry(), roles=runs.ALL_ROLES)
     supervisor = alarms.Supervisor(registry.Registry(), engine, database,
                                    **options)
     return database, engine, supervisor

@@ -1,7 +1,7 @@
 // The run database: browse, inspect, annotate, export, delete.
 
 import { html } from "../html.js";
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { Banner, Card, Confirm, Empty, Pairs, Pill } from "../ui.js";
 import { CompareRuns, RunCharts, RunTrends } from "../runcharts.js";
 import { ResultSummary, EventLog } from "./tests.js";
@@ -13,6 +13,12 @@ function save(path, notify) {
   download(path).catch((error) => notify(error.message, "error"));
 }
 
+/** The account beside the name: two accounts may share a display name. */
+function Account({ run }) {
+  return run.started_by
+    ? html`<span class="muted small">${" "}(${run.started_by})</span>` : null;
+}
+
 const STATUS_TONE = {
   completed: "good", running: "accent", aborted: "warn", failed: "crit",
 };
@@ -21,9 +27,8 @@ function RunDetail({ run, onClose, onChanged, notify, devices, runs,
                     canEdit = true, canDelete = true }) {
   const [samples, setSamples] = useState([]);
   const [events, setEvents] = useState([]);
-  const [meta, setMeta] = useState({
-    name: run.name, operator: run.operator || "", notes: run.notes || "",
-  });
+  // Who ran it is not here: it is the account that started the run.
+  const [meta, setMeta] = useState({ name: run.name, notes: run.notes || "" });
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -31,7 +36,7 @@ function RunDetail({ run, onClose, onChanged, notify, devices, runs,
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    setMeta({ name: run.name, operator: run.operator || "", notes: run.notes || "" });
+    setMeta({ name: run.name, notes: run.notes || "" });
     Promise.all([api.runSamples(run.id, 2000), api.runEvents(run.id)])
       .then(([s, e]) => {
         if (cancelled) return;
@@ -77,7 +82,7 @@ function RunDetail({ run, onClose, onChanged, notify, devices, runs,
           <${Pill} tone=${STATUS_TONE[run.status] || "idle"}>${run.status}<//>
           <button onClick=${() => save(`/api/runs/${run.id}/export.csv`, notify)}>CSV</button>
           <button onClick=${() => save(`/api/runs/${run.id}/export.json`, notify)}>JSON</button>
-          <button onClick=${onClose}>Close</button>`}>
+          <button data-test="history-close" onClick=${onClose}>Close</button>`}>
         <${Pairs} items=${[
           ["Started", fmt.dateTime(run.started_at)],
           ["Ended", run.ended_at ? fmt.dateTime(run.ended_at) : "—"],
@@ -111,21 +116,22 @@ function RunDetail({ run, onClose, onChanged, notify, devices, runs,
         <//>
 
         <${Card} title="Notes"
-                 hint="Editable after the fact — the curve is immutable, the story around it is not.">
+                 hint="Name and notes are editable after the fact — the curve and who ran it are not.">
           <label class="field"><span>Name</span>
             <input value=${meta.name}
                    onInput=${(e) => setMeta({ ...meta, name: e.target.value })} />
           </label>
-          <label class="field"><span>Operator</span>
-            <input value=${meta.operator}
-                   onInput=${(e) => setMeta({ ...meta, operator: e.target.value })} />
-          </label>
+          <div class="field"><span>Operator</span>
+            <div class="fixed-value" data-test="history-operator">
+              <span>${run.operator || "—"}<${Account} run=${run} /></span></div>
+          </div>
           <label class="field"><span>Notes</span>
-            <textarea value=${meta.notes}
+            <textarea value=${meta.notes} data-test="history-notes"
                       onInput=${(e) => setMeta({ ...meta, notes: e.target.value })} />
           </label>
           <div class="row">
             <button class="primary" disabled=${saving || !canEdit} onClick=${saveMeta}
+                    data-test="history-save"
                     title=${canEdit ? "" : "Editing a run needs the operator role"}>Save</button>
             <button class="danger right" disabled=${!canDelete}
                     title=${canDelete ? "" : "Deleting a run is an admin's"}
@@ -148,10 +154,13 @@ export function HistoryView({ notify, state }) {
   const [total, setTotal] = useState(0);
   const [stats, setStats] = useState(null);
   const [selected, setSelectedState] = useState(null);
+  // Where the list was scrolled to when a run was opened.
+  const listScroll = useRef(0);
 
   // A selected run lives in the address too, as #history/<id>, so it can be
   // bookmarked or sent to someone and opens straight on that run.
   const setSelected = (run) => {
+    if (run && !selected) listScroll.current = window.scrollY;
     setSelectedState(run);
     const want = run ? `#history/${run.id}` : "#history";
     if (location.hash !== want) history.replaceState(null, "", want);
@@ -168,9 +177,17 @@ export function HistoryView({ notify, state }) {
     window.addEventListener("hashchange", open);
     return () => window.removeEventListener("hashchange", open);
   }, []);
+  // A run opens at its top, not at whatever height the list was scrolled
+  // to; closing it goes back to the same place in the list.
+  useEffect(() => {
+    window.scrollTo(0, selected ? 0 : listScroll.current);
+  }, [selected?.id]);
   const [filters, setFilters] = useState({ procedure: "", status: "", search: "" });
   const [loading, setLoading] = useState(true);
 
+  // A refresh keeps the rows on screen until the new ones arrive: back from
+  // a saved or deleted run, the list must have its height for the scroll to
+  // return to where it was.
   const load = () => {
     setLoading(true);
     api.runs({ ...filters, limit: 200 })
@@ -246,7 +263,7 @@ export function HistoryView({ notify, state }) {
 
       <${Card} title=${`Runs${total ? ` (${runs.length} of ${total})` : ""}`}
                actions=${html`<button class="small" onClick=${load}>Refresh</button>`}>
-        ${loading
+        ${loading && !runs.length
           ? html`<${Empty}>Loading…<//>`
           : !runs.length
           ? html`<${Empty}>No runs recorded yet. Start one from the Process tab.<//>`
@@ -261,6 +278,7 @@ export function HistoryView({ notify, state }) {
                 <tbody>
                   ${runs.map((run) => html`
                     <tr key=${run.id} style="cursor:pointer"
+                        data-test=${`history-run-${run.id}`}
                         onClick=${() => setSelected(run)}>
                       <td class="num">${run.id}</td>
                       <td>${fmt.dateTime(run.started_at)}</td>
@@ -270,7 +288,7 @@ export function HistoryView({ notify, state }) {
                           ${run.status}<//></td>
                       <td class="num">${fmt.duration(run.duration)}</td>
                       <td class="num">${headline(run)}</td>
-                      <td>${run.operator || "—"}</td>
+                      <td>${run.operator || "—"}<${Account} run=${run} /></td>
                       <td><button class="small ghost">Open</button></td>
                     </tr>`)}
                 </tbody>

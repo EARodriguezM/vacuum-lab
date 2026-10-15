@@ -293,6 +293,10 @@ function App() {
     setWhere(parseHash());
   }, []);
 
+  // A new page starts at its top, not at whatever height the last one was
+  // scrolled to -- a link from low on the Dashboard opened History halfway.
+  useEffect(() => { window.scrollTo(0, 0); }, [where.tab, where.sub]);
+
   // --- accounts -------------------------------------------------------------
 
   useEffect(() => { api.ping().then(setPing).catch(() => {}); }, [held]);
@@ -581,6 +585,15 @@ function App() {
   // after which nothing pumps the chamber and it leaks back up.
   // Powering down stays one click away for the end of the day.
   const stopOptions = () => {
+    // A chamber whose file has no turbopump: the run's recording ends and
+    // nothing else changes -- there is no pump here to power down.
+    if (!state?.devices?.pump) {
+      return [{
+        key: "keep", label: "Stop the run",
+        description: "Ends the recording. This chamber has no turbopump the "
+          + "panel drives, so nothing else changes.",
+      }];
+    }
     const keep = {
       key: "keep", label: "Stop the run, keep the vacuum",
       description: "The turbopump and the backing pump carry on exactly as "
@@ -804,7 +817,7 @@ function App() {
             : `not looked at the rig for ${fmt.integer(state.health.supervisor_s)} s`}:
           faults, a lost link or a dragged rotor will not be announced, and
           a drive fault will not be made safe. Restart the panel, and see
-          <span class="mono">journalctl -u tc600-web -p err</span> for why.
+          <span class="mono">journalctl -u vacuum-lab-web -p err</span> for why.
         <//>`}
 
       ${showShutdown && html`

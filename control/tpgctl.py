@@ -9,7 +9,7 @@ Run `./tpgctl.py --help` for the command list, or start with:
     ./tpgctl.py probe            # which mnemonics this firmware implements
     ./tpgctl.py monitor          # live pressure display
 
-`probe` is the one to trust: the command table in `tpg/commands.py` is the
+`probe` is the one to trust: the command table in `drivers/tpg/commands.py` is the
 published family set, and every model implements a subset of it.
 """
 
@@ -24,8 +24,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import tpg  # noqa: E402
-from tpg import commands, protocol  # noqa: E402
+from drivers import tpg  # noqa: E402
+from drivers.tpg import commands, protocol  # noqa: E402
 
 #: Onboard COM1 on the lab PC. Two different USB-serial adapters were tried
 #: on this instrument and neither worked; see the README.

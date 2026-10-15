@@ -37,7 +37,8 @@ def test_security(pump_port: str) -> None:
     directory = tempfile.mkdtemp(prefix="selftest-security-")
     database = dbmod.Database(os.path.join(directory, "security.db"))
     accounts = authmod.Auth(database, "chamber-1")
-    engine = runs.RunEngine(database, registry.Registry(), chamber="chamber-1")
+    engine = runs.RunEngine(database, registry.Registry(),
+                            roles=runs.ALL_ROLES, chamber="chamber-1")
     application = apimod.Application(registry.Registry(), database, engine,
                                      auth=accounts,
                                      chamber={"id": "chamber-1", "name": "C1"})
@@ -603,7 +604,7 @@ def test_security(pump_port: str) -> None:
                 "owner only", files_private)
 
         def unit_hardened():
-            with open(os.path.join(ROOT, "deploy", "tc600-web.service")) as unit:
+            with open(os.path.join(ROOT, "deploy", "vacuum-lab-web.service")) as unit:
                 text = unit.read()
             wanted = ("UMask=0077", "ProtectSystem=strict", "ReadWritePaths=",
                       "NoNewPrivileges=yes", "PrivateTmp=yes", "TasksMax=")
@@ -1077,7 +1078,8 @@ def test_security(pump_port: str) -> None:
                 return start(self, *args, **kwargs)
             try:
                 with Rig(pump_port) as rig:
-                    engine_here = runs.RunEngine(database, rig.devices)
+                    engine_here = runs.RunEngine(database, rig.devices,
+                                                 roles=runs.ALL_ROLES)
                     supervisor = alarms.Supervisor(rig.devices, engine_here,
                                                    database, auto_recover=True)
                     watching(supervisor, 1.5)

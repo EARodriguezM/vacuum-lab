@@ -62,7 +62,8 @@ def test_accounts() -> None:
 
         database = dbmod.Database(os.path.join(directory, "accounts.db"))
         accounts = authmod.Auth(database, "chamber-1")
-        engine = runs.RunEngine(database, registry.Registry(), chamber="chamber-1")
+        engine = runs.RunEngine(database, registry.Registry(),
+                                roles=runs.ALL_ROLES, chamber="chamber-1")
         application = apimod.Application(registry.Registry(), database, engine,
                                          auth=accounts,
                                          chamber={"id": "chamber-1", "name": "Chamber 1"})
@@ -94,7 +95,9 @@ def test_accounts() -> None:
             code, ping = call("/api/ping")
             check("the ping stays open and says what it is (the kiosk needs it)",
                   code == 200 and ping.get("service") == "vacuum-lab"
-                  and ping.get("auth") == {"enabled": True, "owner": False})
+                  and ping.get("auth") == {"enabled": True, "owner": False,
+                                           "email_domain": "unal.edu.co",
+                                           "verify_email": False})
             check("the ping does not list the serial ports",
                   "devices" not in ping and bool(ping.get("build")))
             check("no session, no state", call("/api/state")[0] == 401)

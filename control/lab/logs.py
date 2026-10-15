@@ -9,7 +9,7 @@ said again at the 10th, 100th and 1000th time, so a failure that repeats
 every second does not flood the journal and one that repeats is not lost.
 
 Each line starts with a syslog priority (`<3>` error, `<4>` warning), which
-journald reads as the entry's priority: `journalctl -u tc600-web -p err`
+journald reads as the entry's priority: `journalctl -u vacuum-lab-web -p err`
 shows them and nothing else.
 """
 

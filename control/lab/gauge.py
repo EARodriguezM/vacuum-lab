@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import serial
 
-import tpg
-from tpg import commands as tpg_commands
-from tpg import protocol as tpg_protocol
+from drivers import tpg
+from drivers.tpg import commands as tpg_commands
+from drivers.tpg import protocol as tpg_protocol
 
 from .registry import DeviceService, waived_rules
 

@@ -1,6 +1,8 @@
 # Every six hours; a run missed while the machine was off happens at boot.
 [Unit]
 Description=Back up the vacuum lab database every six hours
+# Its name until 2026-10; never both.
+Conflicts=tc600-backup.timer
 
 [Timer]
 OnCalendar=*-*-* 00/6:17:00

@@ -10,9 +10,11 @@ the page scroll sideways? does it say "NaN" or "undefined"? is every button
 at least 40 px tall to a finger? Then the flows that matter on the rig: who
 may press what, the override dialog, a guided prompt and its Done, a drive
 fault through to its acknowledged alarm, the idle prompt, the reload after
-a deploy, a cleared recipe field, the poll rate and the alarm sound left
+a deploy, a cleared recipe field, a run opened from History (at its top,
+its operator shown and never typed), the poll rate and the alarm sound left
 running -- and the curve maths run in the browser against the vectors the
-selftest runs in Python.
+selftest runs in Python. The database starts with a few recorded runs, so
+History lays out a table and trends as it does on the lab PC.
 
     ./tools/uitest.py                 everything, in about a minute
     ./tools/uitest.py --only pages    one part (repeatable); see PARTS
@@ -48,7 +50,7 @@ sys.path.insert(0, ROOT)
 from tools.cdp import Chrome, Page, attach  # noqa: E402
 
 PARTS = ("pages", "maths", "gating", "override", "prompt", "fault", "idle",
-         "deploy", "form")
+         "deploy", "form", "history", "signup")
 SIZES = {"tablet": (1024, 600, False), "phone": (390, 844, True)}
 ROLES = ("viewer", "operator", "admin", "tablet")
 PASSWORD = "uitest-pass-1"
@@ -97,8 +99,12 @@ AUDIT = r"""
 (() => {
   const text = document.body ? document.body.innerText : "";
   const bad = [...text.matchAll(/.{0,30}\b(?:NaN|undefined)\b.{0,30}/g)].map((m) => m[0]);
-  const sideways = document.documentElement.scrollWidth > innerWidth + 1
-    || document.body.scrollWidth > innerWidth + 1;
+  // Against the screen's width (clientWidth), not innerWidth: a mobile
+  // browser -- the kiosk's WebView, the phone here -- widens its layout
+  // viewport to fit what overflows, and innerWidth grows with it.
+  const screenW = document.documentElement.clientWidth;
+  const sideways = document.documentElement.scrollWidth > screenW + 1
+    || document.body.scrollWidth > screenW + 1;
   const coarse = matchMedia("(pointer: coarse)").matches;
   const small = coarse ? [...document.querySelectorAll("button, a.btn, select")]
     .filter((e) => e.offsetParent && !e.closest("[data-test-skip-size]"))
@@ -160,6 +166,7 @@ class Server:
         self.app = webserver.build(args)
         auth.bootstrap_owner(self.app.db, self.app.chamber["id"], "owner",
                              PASSWORD, "Owner")
+        self.seed_runs()
         api.Handler.app = self.app
 
         class Quiet(api.Handler):
@@ -170,11 +177,57 @@ class Server:
         # Eight panels and this test share one address. The cap on
         # connections from one client is the selftest's to check.
         api.MAX_CONNECTIONS_PER_ADDRESS = 128
+        auth.SIGNUPS_PER_HOUR = 50
         self.httpd = api.Server(("127.0.0.1", 0), Quiet)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         threading.Thread(target=self.httpd.serve_forever, daemon=True,
                          name="uitest-http").start()
         self.owner = self.login("owner")
+
+    def seed_runs(self) -> None:
+        """Finished runs, a day apart, each with a pump-down curve: the History
+        table, its trends and a run's own page get something to lay out. With
+        none, a table too wide for the tablet went unseen (2026-10-14)."""
+        import math
+        db = self.app.db
+        recipes = [
+            ("base_calibration", "completed",
+             {"base_mbar": 4.0e-5, "ultimate_mbar": 3.9e-5, "time_to_base_s": 3000}),
+            ("full_vacuum", "aborted", {"ultimate_mbar": 2.1e-5}),
+            ("pumpdown", "completed", {"ultimate_mbar": 6.8e-6, "time_to_target_s": 900}),
+            ("rate_of_rise", "completed",
+             {"leak_rate_mbar_l_s": 3.2e-6, "r_squared": 0.99, "verdict": "linear"}),
+            ("hold", "failed", {"ultimate_mbar": 8.1e-6}),
+            ("base_calibration", "completed",
+             {"base_mbar": 2.6e-5, "ultimate_mbar": 2.5e-5, "time_to_base_s": 3300}),
+        ]
+        first = time.time() - (len(recipes) + 1) * 86400
+        for n, (procedure, status, result) in enumerate(recipes):
+            run = db.create_run(
+                procedure, f"{procedure.replace('_', ' ').capitalize()} after "
+                "opening the chamber to change the target holder",
+                {"interval_s": 30}, operator="Seeded Operator",
+                notes="seeded by uitest", started_by="owner",
+                chamber=self.app.chamber["id"])
+            began = first + n * 86400
+            for t in range(0, 3601, 30):
+                spinning = t >= 300
+                speed = min(1500.0, (t - 300) * 7.5) if spinning else 0.0
+                p = 1000 * math.exp(-t / 40) + 2e-5 * (1 + 1500 / (t + 1))
+                db.add_sample(run["id"], {
+                    "t": float(t), "at": began + t, "p1": p, "p1_status": 0,
+                    "p_best": p, "speed": speed, "set_speed": 1500.0,
+                    "power": 80.0 if 0 < speed < 1500 else 12.0 if spinning else 0.0,
+                    "current": 3.8 if 0 < speed < 1500 else 0.6,
+                    "voltage": 21.75 if 0 < speed < 1500 else 23.25,
+                    "station": 1, "motor": 1 if spinning else 0, "error_code": "000000",
+                    "phase": "rough" if t < 300 else "spinup" if speed < 1500
+                             else "basepressure"})
+            db.finish_run(run["id"], status, result)
+            with db._lock:
+                db._db.execute("UPDATE runs SET started_at=?, created_at=?, ended_at=? "
+                               "WHERE id=?", (began, began, began + 3600, run["id"]))
+                db._db.commit()
 
     def call(self, path: str, body: dict | None = None,
              token: str | None = None) -> tuple[int, dict]:
@@ -614,6 +667,149 @@ def part_form(chrome, server, sessions, report, shots):
     audit(page, report, "recipe form with a cleared field", shots)
 
 
+def part_history(chrome, server, sessions, report, shots):
+    """Who ran a run is the account that started it; a run opens at its top."""
+    page = chrome.page(*SIZES["tablet"])
+    open_as(page, server.base, sessions["operator"], "tests")
+    page.wait("document.querySelector(\"[data-test='run-start'], [data-test='run-new']\")")
+    if click(page, "run-new"):
+        page.wait("document.querySelector(\"[data-test='run-start']\")")
+    shown = page.js("""(() => { const e = document.querySelector("[data-test='run-operator']");
+      return e ? {text: e.innerText.trim(), typed: e.tagName === 'INPUT'
+        || e.closest('.field').querySelectorAll('input, textarea').length} : null; })()""")
+    report.check("the run form names the signed-in operator, and nothing can be "
+                 "typed there", shown and shown["text"] == "Olga" and not shown["typed"],
+                 str(shown))
+
+    open_as(page, server.base, sessions["operator"], "history")
+    listed = page.wait("document.querySelector(\"[data-test^='history-run-']\")",
+                       timeout=15)
+    if not report.check("History lists the recorded runs", listed):
+        return
+    page.wait("document.querySelectorAll('section.card svg').length > 3", timeout=10)
+    page.js("window.scrollTo(0, document.documentElement.scrollHeight)")
+    settle(page)
+    before = page.js("window.scrollY")
+    row = page.js("[...document.querySelectorAll(\"[data-test^='history-run-']\")]"
+                  ".pop().dataset.test")
+    click(page, row)
+    opened = page.wait("document.querySelector(\"[data-test='history-close']\")",
+                       timeout=10)
+    page.wait("!document.body.innerText.includes('Loading the curves')", timeout=10)
+    settle(page)
+    top = page.js("window.scrollY")
+    report.check("a run opens at its top, not where the list was scrolled",
+                 opened and before > 200 and top == 0, f"list at {before}, run at {top}")
+    field = page.js("""(() => { const e = document.querySelector("[data-test='history-operator']");
+      return e ? {text: e.innerText.trim(), typed: e.tagName === 'INPUT'
+        || e.closest('.field').querySelectorAll('input').length} : null; })()""")
+    report.check("a run's operator is shown and cannot be edited",
+                 field and field["text"] == "Seeded Operator (owner)"
+                 and not field["typed"],
+                 str(field))
+    audit(page, report, "a run opened from History", shots)
+    click(page, "history-close")
+    page.wait("document.querySelector(\"[data-test^='history-run-']\")", timeout=10)
+    settle(page)
+    back = page.js("window.scrollY")
+    report.check("closing it goes back to the same place in the list",
+                 abs(back - before) <= 2, f"{before} -> {back}")
+
+    # Saving a note closes the run and reloads the list: same place again.
+    page.js("window.scrollTo(0, document.documentElement.scrollHeight)")
+    settle(page)
+    before = page.js("window.scrollY")
+    click(page, row)
+    page.wait("document.querySelector(\"[data-test='history-save']\")", timeout=10)
+    type_into(page, "history-notes", "uitest: a note, saved")
+    click(page, "history-save")
+    page.wait("document.querySelector(\"[data-test^='history-run-']\")", timeout=10)
+    run_id = int(row.rsplit("-", 1)[1])
+    _wait(lambda: (server.app.db.run(run_id) or {}).get("notes")
+          == "uitest: a note, saved", 5)
+    wait_polls(page)
+    settle(page)
+    back = page.js("window.scrollY")
+    report.check("saving a run's notes goes back to the same place in the list",
+                 abs(back - before) <= 2, f"{before} -> {back}")
+
+    # The case reported: a link to a run from low on another page.
+    open_as(page, server.base, sessions["operator"], "dashboard")
+    wait_polls(page)
+    page.js("window.scrollTo(0, document.documentElement.scrollHeight)")
+    settle(page)
+    low = page.js("window.scrollY")
+    page.js(f"location.hash = 'history/{run_id}'")
+    page.wait("document.querySelector(\"[data-test='history-close']\")", timeout=10)
+    settle(page)
+    top = page.js("window.scrollY")
+    report.check("a link to a run opens it at its top, wherever the page was",
+                 low > 100 and top == 0, f"dashboard at {low}, run at {top}")
+
+    # A paired tablet watches: it is nobody who could run anything.
+    tablet = chrome.page(*SIZES["tablet"])
+    open_as(tablet, server.base, sessions["tablet"], "tests")
+    tablet.wait("document.querySelector(\"[data-test='run-start'], [data-test='run-new']\")")
+    if click(tablet, "run-new"):
+        tablet.wait("document.querySelector(\"[data-test='run-start']\")")
+    named = tablet.js("(document.querySelector(\"[data-test='run-operator']\") || {})"
+                      ".innerText || ''").strip()
+    report.check("a paired tablet's run form names no operator", named == "—",
+                 repr(named))
+
+
+def part_signup(chrome, server, sessions, report, shots):
+    """Asking for an account from a phone: the institutional username, the
+    code mailed there, and the admin seeing it confirmed."""
+    from lab import mailer
+    from tools.fake_smtp import FakeSMTP
+    smtp = FakeSMTP()
+    path = os.path.join(server.folder, mailer.SETTINGS_FILE)
+    mailer.save_settings(path, smtp.settings())
+    try:
+        page = chrome.page(*SIZES["phone"])
+        open_as(page, server.base, None, "dashboard")
+        page.wait("document.querySelector(\"[data-test='signin-mode-signup']\")")
+        click(page, "signin-mode-signup")
+        page.wait("document.querySelector(\"[data-test='signup-username']\")")
+        note = page.js("document.querySelector(\"[data-test='signup-username']\")"
+                       ".closest('.field').innerText") or ""
+        report.check("the sign-up form asks for the institutional username",
+                     "@unal.edu.co" in note, " ".join(note.split())[:120])
+        audit(page, report, "sign-up form", shots)
+        type_into(page, "signup-username", "Nina.Ruiz@unal.edu.co")
+        type_into(page, "signup-password", "nina-pass-1")
+        type_into(page, "signup-repeat", "nina-pass-1")
+        settle(page)
+        click(page, "signup-submit")
+        asked = page.wait("document.querySelector(\"[data-test='signup-code']\")",
+                          timeout=15)
+        codes = smtp.codes("nina.ruiz@unal.edu.co")
+        report.check("a code is mailed to the address, and the page asks for it",
+                     asked and len(codes) == 1, f"{len(codes)} mailed")
+        audit(page, report, "sign-up: the code", shots)
+        type_into(page, "signup-code", codes[0] if codes else "")
+        settle(page)
+        click(page, "signup-confirm")
+        done = page.wait("document.body.innerText.includes('Address confirmed')",
+                         timeout=10)
+        user = server.app.db.user_by_name("nina.ruiz") or {}
+        report.check("typed back, the address is confirmed",
+                     done and user.get("email_verified_at"),
+                     f"page {bool(done)}, stored {user.get('email_verified_at')}")
+        admin = chrome.page(*SIZES["tablet"])
+        open_as(admin, server.base, sessions["admin"], "settings")
+        shown = admin.wait("(document.querySelector(\"[data-test='address-nina.ruiz']\")"
+                           " || {}).innerText", timeout=15) or ""
+        report.check("the People page shows the request's address confirmed",
+                     "confirmed" in shown and "not" not in shown, shown)
+        audit(admin, report, "People with a confirmed request", shots)
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+        smtp.close()
+
+
 def _wait(predicate, timeout: float) -> bool:
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -626,7 +822,8 @@ def _wait(predicate, timeout: float) -> bool:
 PART_FUNCTIONS = {"pages": part_pages, "maths": part_maths,
                   "gating": part_gating, "override": part_override,
                   "prompt": part_prompt, "fault": part_fault,
-                  "idle": part_idle, "deploy": part_deploy, "form": part_form}
+                  "idle": part_idle, "deploy": part_deploy, "form": part_form,
+                  "history": part_history, "signup": part_signup}
 
 
 # --- the kiosk -------------------------------------------------------------------

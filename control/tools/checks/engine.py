@@ -452,7 +452,7 @@ def test_run_engine(pump_port: str, gauge_port: str) -> None:
         devices = registry.Registry()
         devices.add(pumpmod.PumpService("pump", pump_port, address=1))
         devices.add(gaugemod.GaugeService("gauge", gauge_port, baudrate=9600))
-        engine = runs.RunEngine(database, devices)
+        engine = runs.RunEngine(database, devices, roles=runs.ALL_ROLES)
         try:
             # Give both samplers a cycle to make contact.
             deadline = time.monotonic() + 10

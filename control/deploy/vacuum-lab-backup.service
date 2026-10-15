@@ -1,9 +1,9 @@
-# Back up the rig's database every six hours (with tc600-backup.timer).
+# Back up the rig's database every six hours (with vacuum-lab-backup.timer).
 #
-#   sudo cp deploy/tc600-backup.service deploy/tc600-backup.timer /etc/systemd/system/
-#   sudo systemctl daemon-reload && sudo systemctl enable --now tc600-backup.timer
-#   systemctl list-timers tc600-backup      # when it runs next
-#   journalctl -u tc600-backup              # how the last one went
+#   sudo cp deploy/vacuum-lab-backup.service deploy/vacuum-lab-backup.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now vacuum-lab-backup.timer
+#   systemctl list-timers vacuum-lab-backup      # when it runs next
+#   journalctl -u vacuum-lab-backup              # how the last one went
 #
 # The destinations are the lab's decision (2026-10-11): a USB stick on each
 # Pi, the other Pi once chamber 2 exists, the laptop when it is connected --
@@ -28,6 +28,8 @@
 
 [Unit]
 Description=Vacuum lab database backup
+# Its name until 2026-10; never both.
+Conflicts=tc600-backup.service
 After=local-fs.target
 
 [Service]

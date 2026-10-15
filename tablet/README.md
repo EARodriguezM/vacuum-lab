@@ -26,7 +26,7 @@ by itself, and can't be exited without a PIN.
 ```
  lab PC (Ubuntu)                                   tablet (stock Android 9, wiped)
  ┌───────────────────────────┐   USB cable    ┌─────────────────────────────────┐
- │ tc600-web  :8600          │◄──────────────►│ Vacuum Lab kiosk (device owner) │
+ │ vacuum-lab-web :8600      │◄──────────────►│ Vacuum Lab kiosk (device owner) │
  │ tablet-link: adb reverse  │  tablet's      │  full-screen WebView (Chrome 138)│
  │   tcp:8600 -> :8600       │  127.0.0.1:8600│  1st: http://127.0.0.1:8600      │
  └───────────────────────────┘                │  2nd: sweep the Wi-Fi /24 :8600  │
@@ -111,7 +111,8 @@ off and confirm **Deactivate**. Android doesn't let adb do this, and Google
 Play services can't be removed while it's active.
 
 It installs Chrome 138 and the kiosk, makes the kiosk device owner, removes
-72 apps (Google Play services included; `--keep-google` leaves them), turns
+the apps it doesn't need (Google Play services, the setup wizard and Carrier
+Services included; `--keep-google` leaves Google's), turns
 animations off, keeps the screen on while powered, sets density 160 and media
 volume to max, and starts the kiosk. Then reboot once (`adb reboot`) to check
 that the tablet comes straight back to the panel.
@@ -170,15 +171,28 @@ certificate the same way, and swap the folder.
 | Check | Result |
 | --- | --- |
 | Boot to panel | 40 s to Android, kiosk in front at 43 s, LOCKED; panel 6 s after the USB link |
-| Debloat | 202 → 144 enabled packages (59 removed); kiosk uses ~100 MB |
-| `uitest --attach` (simulator over USB) | 44/50 in 14 s. The 6 failures are regular buttons measuring 39.3 px (limit 39.5); see the note on borders below |
+| Debloat | 202 → 144 enabled packages (59 removed, then 2 more: see the next section); kiosk uses ~100 MB |
+| `uitest --attach` (simulator over USB) | 44/50 in 14 s, then 50/50 once the buttons were made 40 px (see below) |
 
-The 6 touch-size failures: at DPR 1.25 Chrome draws each 1 px border as one
-device pixel, which is 0.8 CSS px, so a `button`/`.btn` (8 + 21.7 + 8 px plus
-borders) comes to 39.3 instead of 39.7. Physically they are 6.6 mm tall,
-larger than the 5.9 mm that passes on the TB-7305X. Giving `button, .btn`
-`min-height: 40px` in the panel's `@media (pointer: coarse)` block would make
-the check pass at any density.
+That first pass's 6 failures were regular buttons measuring 39.3 px (limit
+39.5): at DPR 1.25 each 1 px border is drawn as one device pixel, 0.8 CSS px.
+Fixed since: the panel gives every `button` and `.btn` a `min-height` of 40 px
+on a touch screen, so the check passes at any density (`uitest --attach` went
+from 44/50 to 50/50).
+
+### "Android Setup keeps stopping"
+
+Removing Google Play services leaves a few Google apps that crash whenever
+Android wakes them, and a dialog with that name appeared over the panel every
+few minutes. `provision.sh` now also removes the setup wizard (only when the
+tablet has finished its setup; otherwise it keeps it and says so) and Carrier
+Services, and `--undo` restores them. A third, Device Setup, is protected by
+Android and can't be removed or disabled; it still crashes twice at each boot,
+but the kiosk (the device owner) turns off Android's error dialogs, so nothing
+shows over the panel. If the kiosk itself stops responding, Android restarts
+it. A tablet provisioned before this needs `./provision.sh` run again (or
+just the two packages removed and the new kiosk installed, see *Updating the
+kiosk*).
 
 ## Day to day
 

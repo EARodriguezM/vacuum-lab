@@ -106,6 +106,13 @@ GOOGLE=(
     com.google.android.gms.policy_sidecar_aps com.google.android.partnersetup
     com.google.android.syncadapters.contacts com.google.android.backuptransport
     com.google.android.configupdater com.google.android.onetimeinitializer
+    # They need the two above and crash without them, each time something
+    # wakes them: "Android Setup keeps stopping" over the panel, on the
+    # TB-8505X. The setup wizard goes only once setup is complete (below).
+    # Device Setup (com.google.android.apps.work.oobconfig) crashes at boot
+    # too, but Android protects it from removal, disabling and hiding; the
+    # kiosk forbids crash dialogs instead (Kiosk.applyPolicies).
+    com.google.android.setupwizard com.google.android.ims
 )
 
 # --- helpers -------------------------------------------------------------------
@@ -263,6 +270,13 @@ remove=("${BLOAT[@]}")
 [[ "$KEEP_GOOGLE" == 1 ]] || remove+=("${GOOGLE[@]}")
 for pkg in "${remove[@]}"; do
     installed "$pkg" || continue
+    # Removing the wizard before it has finished leaves Android waiting for
+    # it; the walkthrough skips it, so this is only a tablet set up wrongly.
+    if [[ "$pkg" == com.google.android.setupwizard \
+          && "$(run settings get secure user_setup_complete)" != 1 ]]; then
+        echo "  KEPT $pkg (setup not finished: finish the wizard, then run this again)"
+        continue
+    fi
     result="$(run pm uninstall -k --user 0 "$pkg" 2>&1 || true)"
     if [[ "$result" == Success ]]; then
         echo "  removed $pkg"

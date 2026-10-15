@@ -33,7 +33,7 @@ import time
 
 import serial
 
-from tc600 import device, params, protocol
+from drivers.tc600 import device, params, protocol
 
 from .registry import DeviceService, waived_rules
 

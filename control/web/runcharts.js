@@ -386,6 +386,10 @@ export function CompareRuns({ run, samples, runs }) {
 
 // --- the rig across months ----------------------------------------------------------
 
+/** The trends last fetched. Back from a run, the list draws them at once,
+ *  so the page has its old height and the list's place can be kept. */
+let lastTrends = null;
+
 /**
  * Health indicators run by run: is the chamber, or the pump, getting worse?
  *
@@ -394,10 +398,10 @@ export function CompareRuns({ run, samples, runs }) {
  * only against last week.
  */
 export function RunTrends({ pump }) {
-  const [rows, setRows] = useState(null);
+  const [rows, setRows] = useState(lastTrends);
   const [error, setError] = useState(null);
   useEffect(() => {
-    api.trends().then((data) => setRows(data.runs || []))
+    api.trends().then((data) => { lastTrends = data.runs || []; setRows(lastTrends); })
       .catch((problem) => setError(problem.message));
   }, []);
 

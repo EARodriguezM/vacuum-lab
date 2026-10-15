@@ -17,7 +17,7 @@ import os
 import sys
 import time
 
-from tc600 import device, params, protocol
+from drivers.tc600 import device, params, protocol
 
 DEFAULT_PORT = "/dev/ttyUSB0"
 

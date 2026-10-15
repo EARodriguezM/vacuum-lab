@@ -8,7 +8,7 @@
 
 [Unit]
 Description=USB link to the vacuum lab kiosk tablet (adb reverse tcp:8600)
-After=tc600-web.service
+After=vacuum-lab-web.service
 
 [Service]
 Type=simple

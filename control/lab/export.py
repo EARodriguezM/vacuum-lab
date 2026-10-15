@@ -34,7 +34,7 @@ SAMPLE_HEADER = (
 
 #: Columns of the all-runs index CSV.
 INDEX_HEADER = (
-    "id", "uuid", "procedure", "name", "operator", "status",
+    "id", "uuid", "procedure", "name", "operator", "started_by", "status",
     "started_iso", "ended_iso", "duration_s", "samples", "result", "notes",
 )
 
@@ -77,7 +77,11 @@ def run_csv(database: "dbmod.Database", run_id: int) -> tuple[str, str] | None:
         f"  status {run['status']}",
     ]
     if run.get("operator"):
-        comments.append(f"# operator {run['operator']}")
+        # The display name, which two accounts may share; the account says who.
+        account = f" (account {run['started_by']})" if run.get("started_by") else ""
+        # A newline would end the comment, as in the notes below.
+        operator = run["operator"].replace(chr(10), " ")
+        comments.append(f"# operator {operator}{account}")
     comments.append(f"# config {json.dumps(run['config'], sort_keys=True)}")
     if run.get("result"):
         comments.append(f"# result {json.dumps(run['result'], sort_keys=True)}")
@@ -134,7 +138,7 @@ def index_csv(database: "dbmod.Database") -> tuple[str, str]:
     for run in database.runs(limit=100000):
         writer.writerow([
             run["id"], run["uuid"], run["procedure"], run["name"],
-            run.get("operator", ""), run["status"],
+            run.get("operator", ""), run.get("started_by") or "", run["status"],
             _iso(run["started_at"]), _iso(run.get("ended_at")),
             round(run["duration"], 1) if run.get("duration") else "",
             run.get("sample_count", ""),

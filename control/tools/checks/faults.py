@@ -13,7 +13,7 @@ import os
 import tempfile
 import time
 
-from tc600 import TC600, protocol
+from drivers.tc600 import TC600, protocol
 from lab import db as dbmod
 from lab import pump as pumpmod
 from lab import registry, runs
@@ -307,7 +307,7 @@ def test_faults(pump_port: str, gauge_port: str) -> None:
         alarms.Supervisor.FOUND_DRIVEN_WAIT_S = 2.0
         try:
             with Rig(pump_port) as rig:          # no gauge: pressure unknown
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 supervisor = alarms.Supervisor(rig.devices, engine, database,
                                                auto_recover=False)
                 watching(supervisor, 6.0)
@@ -330,7 +330,7 @@ def test_faults(pump_port: str, gauge_port: str) -> None:
         fake_tc600._speed = 1500.0
         with Rig(pump_port, gauge_port) as rig:
             wait_until(lambda: rig.gauge.best_pressure() is not None, 10, 0.1)
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(rig.devices, engine, database,
                                            auto_recover=False)
             watching(supervisor, 6.0)
@@ -352,7 +352,7 @@ def test_faults(pump_port: str, gauge_port: str) -> None:
         alarms.Supervisor.OFFLINE_AFTER_S = 2.0
         try:
             with Rig(pump_port, gauge_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 supervisor = alarms.Supervisor(rig.devices, engine, database,
                                                auto_recover=False)
                 watching(supervisor, 5.0)
@@ -412,7 +412,7 @@ def test_faults(pump_port: str, gauge_port: str) -> None:
         fake_tc600._speed = 400.0                # coasting, motor off
         fake_tc600.FAULTS["drop"] = {309: -1}    # the speed never answers
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             snap = rig.fresh(lambda s: s.get("connected")
                              and "ActualSpd" not in s.get("status", {}))
             rule = rig.pump.interlocks(snap)["off"] if snap else {}
@@ -443,7 +443,7 @@ def test_faults(pump_port: str, gauge_port: str) -> None:
         fake_tc600.reset()
         fake_tc600.STATE[10] = True
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(rig.devices, engine, database,
                                            auto_recover=False)
             watching(supervisor, 4.0)            # station on, motor off
@@ -470,7 +470,7 @@ def test_faults(pump_port: str, gauge_port: str) -> None:
         fake_tc600.reset()
         fake_tc600.STATE[10] = True
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(rig.devices, engine, database,
                                            auto_recover=False)
             watching(supervisor, 4.0)
@@ -519,7 +519,7 @@ def test_faults(pump_port: str, gauge_port: str) -> None:
         fake = Snapshots()
         devices = registry.Registry()
         devices._devices["pump"] = fake
-        engine = runs.RunEngine(database, registry.Registry())
+        engine = runs.RunEngine(database, registry.Registry(), roles=runs.ALL_ROLES)
         supervisor = alarms.Supervisor(devices, engine, database,
                                        auto_recover=False)
         for _ in range(3):
@@ -543,7 +543,7 @@ def test_faults(pump_port: str, gauge_port: str) -> None:
         alarms.Supervisor.OFFLINE_AFTER_S = 3.0
         try:
             with Rig(pump_port) as rig:
-                engine = runs.RunEngine(database, rig.devices)
+                engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
                 supervisor = alarms.Supervisor(rig.devices, engine, database,
                                                auto_recover=False)
                 watching(supervisor, 4.0)        # running, before the cut
@@ -565,7 +565,7 @@ def test_faults(pump_port: str, gauge_port: str) -> None:
         fake_tc600.reset()
         fake_tc600.STATE[10] = True
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(rig.devices, engine, database,
                                            auto_recover=True)
             watching(supervisor, 4.0)
@@ -591,7 +591,7 @@ def test_faults(pump_port: str, gauge_port: str) -> None:
         fake_tc600.STATE[10] = True
         fake_tc600.FAULTS["value"] = {303: "Err006"}   # a fault that stays
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(rig.devices, engine, database,
                                            auto_recover=True)
             wait_until(lambda: (supervisor.check() or True)
@@ -611,7 +611,7 @@ def test_faults(pump_port: str, gauge_port: str) -> None:
         fake_tc600.STATE[10] = True
         fake_tc600.FAULTS["value"] = {303: "Err006"}
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             supervisor = alarms.Supervisor(rig.devices, engine, database,
                                            auto_recover=True)
             wait_until(lambda: (supervisor.check() or True)
@@ -634,7 +634,7 @@ def test_faults(pump_port: str, gauge_port: str) -> None:
         fake_tc600.reset()
         fake_tc600.FAULTS["drop"] = {315: -1}
         with Rig(pump_port) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             missing = "NominalSpd" not in rig.pump.snapshot().get("identity", {})
             during = engine.nominal_speed()
             fake_tc600.FAULTS["drop"] = {}
@@ -690,7 +690,7 @@ def test_faults(pump_port: str, gauge_port: str) -> None:
         fake_tpg.set_pumping(1.0, True)
         fake_tc600.FAULTS["drop"] = {315: -1}       # NominalSpd never answers
         with Rig(pump_port, gauge_port, interval=None) as rig:
-            engine = runs.RunEngine(database, rig.devices)
+            engine = runs.RunEngine(database, rig.devices, roles=runs.ALL_ROLES)
             started = engine.start("base_calibration", {"interval_s": 1})
             if not started.get("ok"):
                 return False, started.get("error")

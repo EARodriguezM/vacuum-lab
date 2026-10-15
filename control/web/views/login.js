@@ -66,13 +66,28 @@ function SignIn({ onSignedIn }) {
     </form>`;
 }
 
-function SignUp() {
+/** The username in what was typed: the name, or the whole address. */
+function bareUsername(typed, domain) {
+  const name = typed.trim().toLowerCase();
+  return domain && name.endsWith(`@${domain}`) ? name.slice(0, -domain.length - 1) : name;
+}
+
+/**
+ * Asking for an account. The username is the person's institutional address
+ * before the @; when the server can send mail, a code goes to that address
+ * and the request waits for it to be typed back (lab/auth.py), which proves
+ * the address exists and is theirs.
+ */
+function SignUp({ domain, verify }) {
   const [form, setForm] = useState({ username: "", name: "", password: "",
                                      repeat: "", note: "" });
   const [error, setError] = useState(null);
-  const [sent, setSent] = useState(false);
+  // form -> code (when the server mails one) -> confirmed; or form -> done
+  const [step, setStep] = useState("form");
+  const [mailed, setMailed] = useState({ email: "", problem: null });
   const [working, setWorking] = useState(false);
   const set = (key) => (e) => setForm({ ...form, [key]: e.target.value });
+  const username = bareUsername(form.username, domain);
 
   const submit = async (event) => {
     event.preventDefault();
@@ -83,10 +98,11 @@ function SignUp() {
     setWorking(true);
     setError(null);
     try {
-      await api.signup({ username: form.username.trim().toLowerCase(),
-                         name: form.name.trim(), password: form.password,
-                         note: form.note.trim() });
-      setSent(true);
+      const result = await api.signup({ username, name: form.name.trim(),
+                                        password: form.password,
+                                        note: form.note.trim() });
+      setMailed({ email: result.email || "", problem: result.problem || null });
+      setStep(result.verify ? "code" : "done");
     } catch (problem) {
       setError(problem.message);
     } finally {
@@ -94,38 +110,46 @@ function SignUp() {
     }
   };
 
-  if (sent) {
+  if (step === "code" || step === "confirm") {
+    return html`<${ConfirmAddress} domain=${domain}
+      username=${step === "code" ? username : ""} email=${mailed.email}
+      password=${step === "code" ? form.password : ""}
+      problem=${mailed.problem} onConfirmed=${() => setStep("confirmed")} />`;
+  }
+  if (step === "done" || step === "confirmed") {
     return html`
       <${Banner} tone="good">
-        <strong>Request sent.</strong> An admin approves it and chooses what you
-        may do — watch, or operate the rig. Then sign in with${" "}
-        <span class="mono">${form.username.trim().toLowerCase()}</span>${" "}and the
-        password you chose.
+        <strong>${step === "confirmed" ? "Address confirmed." : "Request sent."}</strong> An admin
+        approves it and chooses what you may do — watch, or operate the rig. Then
+        sign in with${" "}<span class="mono">${username || "your username"}</span>${" "}and
+        the password you chose.
       <//>`;
   }
   return html`
     <form class="grid" style="gap:12px" onSubmit=${submit}>
-      <div class="row form-row">
-        <label class="field"><span>Username</span>
+      <label class="field"><span>Institutional username</span>
+        <span class="suffix">
           <input value=${form.username} autocomplete="username" autocapitalize="none"
-                 spellcheck="false" placeholder="e.g. arodriguez"
+                 spellcheck="false" placeholder="e.g. anperez" data-test="signup-username"
                  onInput=${set("username")} />
-          <span class="help">3–32 lower-case letters, digits, dots or dashes.</span>
-        </label>
-        <label class="field"><span>Your name</span>
-          <input value=${form.name} autocomplete="name" onInput=${set("name")} />
-          <span class="help">Shown next to everything you do on the rig.</span>
-        </label>
-      </div>
+          <span class="unit">@${domain}</span></span>
+        <span class="help">Your institutional email before the @: for
+          anperez@${domain}, type anperez.${verify
+            ? " A code is mailed there to confirm it is yours." : ""}</span>
+      </label>
+      <label class="field"><span>Your name</span>
+        <input value=${form.name} autocomplete="name" onInput=${set("name")} />
+        <span class="help">Shown next to everything you do on the rig.</span>
+      </label>
       <div class="row form-row">
         <label class="field"><span>Password</span>
           <input type="password" value=${form.password} autocomplete="new-password"
-                 onInput=${set("password")} />
-          <span class="help">At least 8 characters.</span>
+                 data-test="signup-password" onInput=${set("password")} />
+          <span class="help">At least 8 characters. Not your email's password.</span>
         </label>
         <label class="field"><span>Password again</span>
           <input type="password" value=${form.repeat} autocomplete="new-password"
-                 onInput=${set("repeat")} />
+                 data-test="signup-repeat" onInput=${set("repeat")} />
         </label>
       </div>
       <label class="field"><span>Note for the admin (optional)</span>
@@ -133,9 +157,94 @@ function SignUp() {
                onInput=${set("note")} />
       </label>
       ${error && html`<${Banner} tone="crit">${error}<//>`}
-      <button class="primary" type="submit"
-              disabled=${working || !form.username || !form.password}>
-        ${working ? "Sending…" : "Request the account"}</button>
+      <div class="row">
+        <button class="primary" type="submit" data-test="signup-submit"
+                disabled=${working || !form.username || !form.password}>
+          ${working ? "Sending…" : "Request the account"}</button>
+        ${verify && html`
+          <button type="button" class="ghost" data-test="signup-have-code"
+                  onClick=${() => setStep("confirm")}>I already have a code</button>`}
+      </div>
+    </form>`;
+}
+
+/**
+ * The code mailed to the institutional address, typed back with the password
+ * chosen for the request: the code proves somebody reads the inbox, the
+ * password that it is the person who asked.
+ */
+function ConfirmAddress({ domain, username: known = "", email = "", password: chosen = "",
+                          problem = null, onConfirmed }) {
+  const [typed, setTyped] = useState(known);
+  const [password, setPassword] = useState(chosen);
+  const [code, setCode] = useState("");
+  const [error, setError] = useState(problem);
+  const [note, setNote] = useState(null);
+  const [working, setWorking] = useState(false);
+  const username = bareUsername(typed, domain);
+  const address = email || (username ? `${username}@${domain}` : `your @${domain} address`);
+
+  const confirm = async (event) => {
+    event.preventDefault();
+    setWorking(true);
+    setError(null);
+    setNote(null);
+    try {
+      await api.verifyEmail(username, password, code);
+      onConfirmed();
+    } catch (failure) {
+      setError(failure.message);
+    } finally {
+      setWorking(false);
+    }
+  };
+  const again = async () => {
+    setWorking(true);
+    setError(null);
+    setNote(null);
+    try {
+      await api.requestCode(username, password);
+      setNote(`A new code went to ${address}.`);
+    } catch (failure) {
+      setError(failure.message);
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  return html`
+    <form class="grid" style="gap:12px" onSubmit=${confirm}>
+      <p class="small">${known
+        ? html`A 6-digit code was mailed to <strong>${address}</strong>. Type it
+            here to confirm the address is yours; the request waits for it.`
+        : html`Type your username, the password you chose when you asked for the
+            account, and the code mailed to your @${domain} address.`}
+        ${" "}It works for 30 minutes.</p>
+      ${!known && html`
+        <label class="field"><span>Institutional username</span>
+          <span class="suffix">
+            <input value=${typed} autocapitalize="none" spellcheck="false"
+                   data-test="confirm-username" onInput=${(e) => setTyped(e.target.value)} />
+            <span class="unit">@${domain}</span></span>
+        </label>
+        <label class="field"><span>Password you chose</span>
+          <input type="password" value=${password} autocomplete="current-password"
+                 data-test="confirm-password" onInput=${(e) => setPassword(e.target.value)} />
+        </label>`}
+      <label class="field"><span>Code</span>
+        <input value=${code} inputmode="numeric" autocomplete="one-time-code"
+               maxlength="12" data-test="signup-code"
+               onInput=${(e) => setCode(e.target.value)} />
+      </label>
+      ${error && html`<${Banner} tone="crit">${error}<//>`}
+      ${note && html`<${Banner} tone="good">${note}<//>`}
+      <div class="row">
+        <button class="primary" type="submit" data-test="signup-confirm"
+                disabled=${working || !username || !password || !code.trim()}>Confirm</button>
+        <button type="button" data-test="signup-resend"
+                disabled=${working || !username || !password}
+                onClick=${again}>Send a new code</button>
+      </div>
     </form>`;
 }
 
@@ -205,12 +314,13 @@ export function LoginView({ ping, onSignedIn, onCancel }) {
         ${modes.length > 1 && html`
           <nav class="tabs subtabs" aria-label="Sign-in options">
             ${modes.map((entry) => html`
-              <button key=${entry.key} type="button"
+              <button key=${entry.key} type="button" data-test=${`signin-mode-${entry.key}`}
                       aria-current=${mode === entry.key ? "page" : null}
                       onClick=${() => setMode(entry.key)}>${entry.label}</button>`)}
           </nav>`}
         ${mode === "signin" && html`<${SignIn} onSignedIn=${onSignedIn} />`}
-        ${mode === "signup" && html`<${SignUp} />`}
+        ${mode === "signup" && html`<${SignUp} domain=${ping?.auth?.email_domain || "unal.edu.co"}
+                                                verify=${!!ping?.auth?.verify_email} />`}
         ${mode === "pair" && html`<${Pair} onSignedIn=${onSignedIn} />`}
         ${onCancel && html`
           <button class="ghost" type="button" onClick=${onCancel}>

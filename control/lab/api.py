@@ -69,7 +69,8 @@ POST_RULES = {
 }
 
 #: Reachable without a session: how a sign-in page finds out where it is.
-PUBLIC_POSTS = ("/api/login", "/api/signup", "/api/pair")
+PUBLIC_POSTS = ("/api/login", "/api/signup", "/api/signup/verify",
+                "/api/signup/code", "/api/pair")
 
 #: GETs that need more than watching.
 ADMIN_GETS = ("/api/ports/survey",)
@@ -77,8 +78,9 @@ ADMIN_GETS = ("/api/ports/survey",)
 #: The most rows one listing returns, whatever the request asks for.
 MAX_LIST = 1000
 
-#: How long a run's name, operator and notes may be, in characters.
-RUN_NAME_MAX, RUN_OPERATOR_MAX, RUN_NOTES_MAX = 120, 80, 4000
+#: How long a run's name and notes may be, in characters. Its operator is
+#: not typed: it is the account that started it.
+RUN_NAME_MAX, RUN_NOTES_MAX = 120, 4000
 
 #: Connections served at once, in all and from one address. Each holds a
 #: thread; beyond these a new connection is turned away, so a flood from the
@@ -317,7 +319,7 @@ class Application:
                  chamber: dict | None = None, allow: list | None = None,
                  hosts: set[str] | None = None, origins: list | None = None,
                  admin_from: list | None = None, status_file: str | None = None,
-                 version: dict | None = None):
+                 version: dict | None = None, setup: dict | None = None):
         self.registry = registry
         self.db = database
         self.engine = engine
@@ -327,6 +329,10 @@ class Application:
         #: Which chamber this server drives: {"id", "name"}.
         self.chamber = chamber or {"id": self.auth.chamber,
                                    "name": self.auth.chamber}
+        #: Which kind of instrument fills each role, and which roles this
+        #: chamber has none for (lab/chamber.py) -- for those signed in only;
+        #: /api/ping says no more than the chamber's name.
+        self.setup = setup or {}
         #: Networks allowed to reach the panel at all; empty allows any.
         self.allow = allow or []
         #: Names the panel answers to besides IP addresses (host_allowed).
@@ -419,8 +425,11 @@ class Application:
             "run": self.engine.status(),
             "actuators": self.engine.actuators(),
             "automatic_ready": self.engine.hardware.automatic_ready,
-            # Procedures this rig cannot run, and what each is missing.
+            # Procedures this rig cannot run, and what each is missing --
+            # of that, the instruments the chamber does not have at all.
             "unavailable": self.engine.unavailable(),
+            "unconfigured": self.engine.unconfigured_all(),
+            "setup": self.setup,
             "alarms": self.supervisor.describe() if self.supervisor else None,
             # The thresholds the engine judges by, so the panel draws with
             # the same ones (lab/judgement.py).
@@ -961,7 +970,10 @@ class Handler(BaseHTTPRequestHandler):
                 str(payload.get("procedure", "")),
                 payload.get("config") or {},
                 name=str(payload.get("name", "")),
-                operator=str(payload.get("operator", "")) or principal.name,
+                # Who ran it is whoever is signed in and pressed Start --
+                # never a name typed on the form, which the record could not
+                # tell from the truth. An "operator" in the request is ignored.
+                operator=principal.name,
                 notes=str(payload.get("notes", "")),
                 started_by=principal.username,
             )
@@ -1170,6 +1182,15 @@ class Handler(BaseHTTPRequestHandler):
                                      str(payload.get("password", "")),
                                      str(payload.get("note", "")),
                                      self._address())
+            elif route == "/api/signup/verify":
+                result = auth.verify_email(str(payload.get("username", "")),
+                                           str(payload.get("password", "")),
+                                           str(payload.get("code", "")),
+                                           self._address())
+            elif route == "/api/signup/code":
+                result = auth.request_code(str(payload.get("username", "")),
+                                           str(payload.get("password", "")),
+                                           self._address())
             else:
                 result = auth.pair(str(payload.get("code", "")),
                                    self._address(), agent)
@@ -1376,25 +1397,41 @@ class Handler(BaseHTTPRequestHandler):
             def bounded(key: str, limit: int):
                 value = payload.get(key)
                 return None if value is None else str(value)[:limit]
+            def short(text):
+                text = "" if text is None else str(text)
+                return text if len(text) <= 200 else text[:200] + "..."
             before = self.app.db.run(run_id)
+            if before is None:
+                self._json({"ok": False, "error": f"no run {run_id}"}, 404)
+                return
+            # Who ran it is the account that started it. The same name sent
+            # back (an older panel sends every field) is no change; any other
+            # is refused, and the attempt kept in the rig's log.
+            asked = payload.get("operator")
+            if asked is not None and str(asked) != (before.get("operator") or ""):
+                who = self._who()
+                self._record(None, "warning",
+                             f"{who.name}: tried to change who ran run {run_id}",
+                             {"run": run_id, "operator": short(before.get("operator")),
+                              "asked": short(asked)}, user=who.username)
+                self._json({"ok": False, "error":
+                            "a run's operator is the account that started it, "
+                            "and cannot be changed"}, 400)
+                return
             updated = self.app.db.update_run(
                 run_id,
                 name=bounded("name", RUN_NAME_MAX),
-                operator=bounded("operator", RUN_OPERATOR_MAX),
                 notes=bounded("notes", RUN_NOTES_MAX),
             )
             if updated is None:
                 self._json({"ok": False, "error": f"no run {run_id}"}, 404)
                 return
-            # A run's record is evidence: who changed its name, operator or
-            # notes, and from what, is kept in the rig's log.
-            def short(text):
-                text = "" if text is None else str(text)
-                return text if len(text) <= 200 else text[:200] + "..."
-            changed = {key: {"from": short((before or {}).get(key)),
+            # A run's record is evidence: who changed its name or notes, and
+            # from what, is kept in the rig's log.
+            changed = {key: {"from": short(before.get(key)),
                              "to": short(updated.get(key))}
-                       for key in ("name", "operator", "notes")
-                       if (before or {}).get(key) != updated.get(key)}
+                       for key in ("name", "notes")
+                       if before.get(key) != updated.get(key)}
             if changed:
                 who = self._who()
                 self._record(None, "info",

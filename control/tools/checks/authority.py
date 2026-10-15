@@ -74,7 +74,8 @@ def test_authority(pump_port: str) -> None:
     devices = registry.Registry()
     pump_service = devices.add(pumpmod.PumpService("pump", pump_port, address=1))
     pump_service.interval = 0.3
-    engine = runs.RunEngine(database, devices, chamber="chamber-1")
+    engine = runs.RunEngine(database, devices,
+                            roles=runs.ALL_ROLES, chamber="chamber-1")
     application = apimod.Application(devices, database, engine, auth=accounts,
                                      chamber={"id": "chamber-1", "name": "C1"})
     handler = type("AuthorityHandler", (apimod.Handler,),
@@ -322,6 +323,86 @@ def test_authority(pump_port: str) -> None:
                          and "had not succeeded" in noted[0],
                          f"{held} then {gone}: "
                          + (noted[0][:90] if noted else "nothing noted")))
+
+        # --- who ran it ---------------------------------------------------------
+        # The account that pressed Start, whatever name the request carries:
+        # a typed operator could not be told from the truth afterwards.
+        code, body = call("/api/run/start", {
+            "procedure": "hold", "confirm": True, "name": "Typed for somebody",
+            "operator": "Mallory", "config": {"duration_min": 5, "interval_s": 1}},
+            owner)
+        ran = (body.get("run") or {}).get("id")
+        if ran:
+            wait_until(lambda: engine.status()["running"], 5, 0.05)
+            engine.stop("selftest")
+            wait_until(lambda: not engine.status()["running"], 15, 0.1)
+        stored = (database.run(ran) if ran else None) or {}
+        attempt("a run's operator is whoever started it, not a name sent with it",
+                lambda: (code == 200 and stored.get("operator") == "Olga"
+                         and stored.get("started_by") == "olga",
+                         f"{code}: operator {stored.get('operator')!r}, started by "
+                         f"{stored.get('started_by')!r}"
+                         + ("" if ran else f"; {body.get('error')}")))
+        changed, said = call(f"/api/runs/{ran}", {"operator": "Mallory"}, ana)
+        both, _ = call(f"/api/runs/{ran}", {"name": "Sneaky",
+                                            "operator": "Mallory"}, ana)
+        # Refused as a whole: the name sent with it is not written either.
+        untouched = ((database.run(ran) if ran else None) or {}).get("name")
+        # An older panel sends every field back, the operator unchanged.
+        renamed, _ = call(f"/api/runs/{ran}", {"name": "Renamed",
+                                               "operator": "Olga"}, ana)
+        noted, _ = call(f"/api/runs/{ran}", {"notes": "fine", "operator": None}, ana)
+        after = (database.run(ran) if ran else None) or {}
+        refusal = said.get("error", "")
+        attempt("nobody can change who ran a run; its name and notes stay editable",
+                lambda: (changed == 400 and "cannot be changed" in refusal
+                         and both == 400 and untouched == "Typed for somebody"
+                         and renamed == 200 and noted == 200
+                         and after.get("operator") == "Olga"
+                         and after.get("name") == "Renamed"
+                         and after.get("notes") == "fine",
+                         f"changing it: {changed} {refusal[:40]!r}; with a new "
+                         f"name: {both}, name then {untouched!r}; renaming: "
+                         f"{renamed}; operator null: "
+                         f"{noted}; operator {after.get('operator')!r}, name "
+                         f"{after.get('name')!r}"))
+        records = [e for e in database.events(limit=40)
+                   if (e.get("detail") or {}).get("run") == ran]
+        tried = [e for e in records if "tried to change who ran" in e["message"]]
+        edits = [sorted((e.get("detail") or {}).get("changes", {}))
+                 for e in records if "edited the" in e["message"]]
+        attempt("an attempt to change who ran a run is logged; an edit's record "
+                "names only what changed",
+                lambda: (len(tried) == 2 and all(e.get("user") == "ana" for e in tried)
+                         and edits and all(c in (["name"], ["notes"]) for c in edits),
+                         f"{len(tried)} attempt(s) logged; edits {edits}"))
+
+        # A person signed in on a paired tablet is that person, not the tablet.
+        pairing = call("/api/devices/add", {"label": "Wall"}, owner)[1].get("code")
+        wall = call("/api/pair", {"code": pairing})[1].get("token")
+        ana_here = call("/api/login", {"username": "ana", "password": "ana-pass-1",
+                                       "device": wall})[1].get("token")
+        call("/api/control/release", {}, owner)
+        code, body = call("/api/run/start", {
+            "procedure": "hold", "operator": "Wall",
+            "config": {"duration_min": 5, "interval_s": 1}}, ana_here)
+        there = (body.get("run") or {}).get("id")
+        if there:
+            wait_until(lambda: engine.status()["running"], 5, 0.05)
+            engine.stop("selftest")
+            wait_until(lambda: not engine.status()["running"], 15, 0.1)
+        stored = (database.run(there) if there else None) or {}
+        attempt("on a paired tablet the run is the signed-in person's",
+                lambda: (code == 200 and stored.get("operator") == "Ana"
+                         and stored.get("started_by") == "ana",
+                         f"{code}: operator {stored.get('operator')!r}, started by "
+                         f"{stored.get('started_by')!r}"
+                         + ("" if there else f"; {body.get('error')}")))
+        if ran:
+            database.update_run(ran, operator="Mallory")
+        kept = ((database.run(ran) if ran else None) or {}).get("operator")
+        attempt("the store will not change it either",
+                lambda: (kept == "Olga", f"operator {kept!r}"))
     finally:
         server.shutdown()
         server.server_close()

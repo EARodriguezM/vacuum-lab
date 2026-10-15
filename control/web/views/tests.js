@@ -176,19 +176,20 @@ function LiveRun({ run, samples, events, onStop, onAcknowledge, busy, stopBusy,
 }
 
 function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable = {},
-                 me = null }) {
+                 unconfigured = {}, me = null }) {
   const [name, setName] = useState("");
   const [chosen, setChosen] = useState("");
-  // Whoever is signed in, unless they type somebody else's name: a student
-  // running a run for a supervisor. The account is recorded either way.
-  const [operator, setOperator] = useState(() => me?.name || "");
   const [notes, setNotes] = useState("");
   const [config, setConfig] = useState({});
 
   // Opens on the first procedure this rig can run.
   const procedure = procedures.find((p) => p.name === chosen)
     || procedures.find((p) => !unavailable[p.name]) || procedures[0];
-  const absent = unavailable[procedure?.name] || [];
+  // What the chamber has no instrument for at all, and -- of the rest --
+  // the equipment not installed yet: two different things to tell someone.
+  const noInstrument = unconfigured[procedure?.name] || [];
+  const absent = (unavailable[procedure?.name] || [])
+    .filter((label) => !noInstrument.includes(label));
   // Only the actuators this procedure moves: a pump-down asks for none.
   const manual = actuators.filter((a) => (procedure?.requires || []).includes(a.key)
                                          && a.installed !== false && !a.available)
@@ -209,7 +210,6 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
     onStart({
       procedure: procedure.name,
       name: name || procedure.label,
-      operator,
       notes,
       config: coerceConfig(procedure.fields, config),
     });
@@ -219,7 +219,14 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
     <div class="grid" style="gap:16px">
       ${blocked && html`<${Banner} tone="warn">${blocked}<//>`}
 
-      ${absent.length > 0 && html`
+      ${noInstrument.length > 0 && html`
+        <${Banner} tone="warn">
+          <strong>Switched off — this chamber has no ${noInstrument.join(" or ")}.</strong>
+          ${" "}You can read what this procedure does, but it cannot run on this
+          chamber: its instruments are listed in its file in <code>chambers/</code>.
+        <//>`}
+
+      ${noInstrument.length === 0 && absent.length > 0 && html`
         <${Banner} tone="warn">
           <strong>Switched off — not installed on the rig yet:</strong>
           ${" "}${absent.join(", ")}. You can read what this procedure does, but it
@@ -227,7 +234,7 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
           ${" "}<a href="#settings">Settings → Rig equipment</a>.
         <//>`}
 
-      ${absent.length === 0 && manual.length > 0 && html`
+      ${noInstrument.length === 0 && absent.length === 0 && manual.length > 0 && html`
         <${Banner} tone="warn">
           <strong>Not wired up yet:</strong> ${manual.join(", ")}.
           A guided run will stop and ask you to do each of these by hand.
@@ -238,12 +245,13 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
         <div class="row">
           ${procedures.map((entry) => {
             const off = unavailable[entry.name];
+            const tag = unconfigured[entry.name] ? "not on this chamber" : "not installed";
             return html`
               <button key=${entry.name}
                       class=${`${entry.name === procedure.name ? "primary" : ""}${off ? " unavailable" : ""}`}
                       title=${off ? `Switched off: needs ${off.join(", ")}` : entry.description}
                       onClick=${() => setChosen(entry.name)}>
-                ${entry.label}${off ? html` <span class="off-tag">not installed</span>` : null}</button>`;
+                ${entry.label}${off ? html` <span class="off-tag">${tag}</span>` : null}</button>`;
           })}
         </div>
         <p class="hint">${procedure.description}</p>
@@ -270,10 +278,14 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
             <input value=${name} placeholder=${procedure.label}
                    onInput=${(e) => setName(e.target.value)} />
           </label>
-          <label class="field">
+          <div class="field">
             <span>Operator</span>
-            <input value=${operator} onInput=${(e) => setOperator(e.target.value)} />
-          </label>
+            <div class="fixed-value" data-test="run-operator">
+              ${me && me.kind !== "device" ? me.name : "—"}</div>
+            <span class="help">${me && me.kind !== "device"
+              ? "Whoever is signed in and starts the run. To run under your own name, sign in as yourself."
+              : "A paired tablet only watches: sign in to start a run under your name."}</span>
+          </div>
           <label class="field">
             <span>Notes</span>
             <textarea value=${notes} onInput=${(e) => setNotes(e.target.value)}
@@ -284,12 +296,16 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
 
       <${Card}>
         <div class="row">
-          <button class="primary" disabled=${busy || absent.length > 0 || problems.length > 0}
+          <button class="primary"
+                  disabled=${busy || noInstrument.length > 0 || absent.length > 0
+                             || problems.length > 0}
                   data-test="run-start" onClick=${start}>
             Start ${procedure.label.toLowerCase()}
           </button>
           <span class="small muted">
-            ${absent.length > 0
+            ${noInstrument.length > 0
+              ? `Switched off: this chamber has no ${noInstrument.join(" or ")}.`
+              : absent.length > 0
               ? "Switched off until its equipment is installed."
               : problems.length > 0
                 ? "Fix the settings marked below first."
@@ -467,6 +483,7 @@ export function TestsView({ state, live, onStart, onStop, onAcknowledge, busy,
                         busy=${busy} blocked=${blocked}
                         actuators=${state?.actuators || []}
                         unavailable=${state?.unavailable || {}}
+                        unconfigured=${state?.unconfigured || {}}
                         me=${state?.me} />`;
 }
 

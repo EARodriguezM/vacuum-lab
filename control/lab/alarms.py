@@ -386,7 +386,7 @@ class Supervisor:
                 f"Its last sign of life was at {clock}, and it did not stop "
                 f"cleanly -- a crash or a power cut. Nothing watched the rig "
                 f"{span}. Check the pump and the chamber, and the journal "
-                f"(journalctl -u tc600-web) for why.")
+                f"(journalctl -u vacuum-lab-web) for why.")
         # An event, not a condition: on screen until acknowledged, never
         # "active" -- nothing will ever clear it, and a release counts the
         # active critical alarms a restart leaves.
@@ -408,7 +408,7 @@ class Supervisor:
         except (OSError, ValueError) as exc:
             status = {"last_ok": False, "last_error": f"its status is "
                       f"unreadable: {exc}", "last_attempt": time.time()}
-        how = ("Set the backups up (deploy/tc600-backup.service) and check "
+        how = ("Set the backups up (deploy/vacuum-lab-backup.service) and check "
                "with ./tools/backup.py status.")
         if not status:
             self.raise_alarm("backup", "warning",
@@ -446,7 +446,7 @@ class Supervisor:
                 "recorder_stalled", "warning", "The chart recorder has stopped",
                 f"Nothing has been added to the charts for {age:.0f} s. Runs "
                 f"still record; the pump and gauge pages do not. The journal "
-                f"says why (journalctl -u tc600-web -p err).")
+                f"says why (journalctl -u vacuum-lab-web -p err).")
         else:
             self.clear("recorder_stalled")
 
@@ -553,8 +553,9 @@ class Supervisor:
         psnap = pump.snapshot() if pump else None
         gsnap = gauge.snapshot() if gauge else None
 
-        self._watch_link("pump", psnap, "TC 600 turbopump", pump)
-        self._watch_link("gauge", gsnap, "TPG gauge controller", gauge)
+        self._watch_link("pump", psnap, getattr(pump, "label", "turbopump"), pump)
+        self._watch_link("gauge", gsnap,
+                         getattr(gauge, "label", "gauge controller"), gauge)
         self._watch_moves()
         if pump and psnap and not psnap.get("connected"):
             self._pump_lost_at = self._pump_lost_at or time.monotonic()
@@ -604,7 +605,7 @@ class Supervisor:
             if sampler is not None and not sampler.is_alive():
                 why = ("the panel's own sampler for it has stopped -- a fault "
                        "in the panel, not the instrument: restart the panel, "
-                       "and see journalctl -u tc600-web -p err")
+                       "and see journalctl -u vacuum-lab-web -p err")
             self.raise_alarm(
                 f"{key}_offline", "critical" if key == "pump" else "warning",
                 f"No contact with the {label}",

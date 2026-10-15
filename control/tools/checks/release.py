@@ -33,14 +33,21 @@ class LocalTarget(rel.Target):
     def __init__(self, base: Path, units: Path | None = None):
         super().__init__("local", str(base))
         self.sudo = "FAKESUDO "
+        self.etc = units
+        #: Units systemd is not running; everything else answers "active".
+        self.inactive: set[str] = set()
+        #: Whether starting one panel unit stops the other (their Conflicts=).
+        self.conflicts_work = True
         if units is not None:
             units.mkdir(parents=True, exist_ok=True)
             self.units = {str(units / Path(i).name): s
                           for i, s in rel.UNITS.items()}
+            self.old_units = [str(units / Path(i).name) for i in rel.OLD_UNITS]
         self.active = True
         self.status: dict | None = None
         self.skew = 0.0                          # target clock minus ours
         self.restarts = 0
+        self.restarted: list[str] = []           # which unit, each time
         self.on_restart = None                   # what the panel does then
         self.before_command = None
         #: A command this returns True for fails, as a refused sudo would.
@@ -60,15 +67,29 @@ class LocalTarget(rel.Target):
             return 0, f"{self.clock()}\n" + (json.dumps(self.status)
                                              if self.status else "")
         if command.startswith("systemctl is-active"):
-            return 0, "active" if self.active else "failed"
+            unit = command.split()[-1].removesuffix(".service")
+            return 0, ("active" if self.active and unit not in self.inactive
+                       else "inactive")
         if command.startswith("systemctl cat"):
-            return 1, ""                         # no backup unit here
+            unit = command.split()[2]
+            known = self.etc is not None and (self.etc / unit).exists()
+            return (0, "") if known else (1, "")
         if command.startswith(self.sudo):
             command = command[len(self.sudo):]
             if command.startswith("systemctl restart"):
+                unit = command.split()[-1].removesuffix(".service")
                 self.restarts += 1
+                self.restarted.append(unit)
+                self.inactive.discard(unit)
+                other = {rel.SERVICE: rel.OLD_SERVICE,
+                         rel.OLD_SERVICE: rel.SERVICE}.get(unit)
+                if other and self.conflicts_work:
+                    self.inactive.add(other)
                 if self.on_restart:
                     self.on_restart(self)
+                return 0, ""
+            if command.startswith(("systemctl stop", "systemctl disable --now")):
+                self.inactive.add(command.split()[-1].removesuffix(".service"))
                 return 0, ""
             if command.startswith(("systemctl", "udevadm")):
                 return 0, ""
@@ -285,7 +306,7 @@ def _sections(folder: Path) -> None:
             (place / "base" / "releases" / "20250101-0000-old").mkdir()
             rel.switch(stand_in, "20250101-0000-old")
         if old_unit is not None:
-            (place / "etc" / "tc600-web.service").write_text(old_unit)
+            (place / "etc" / "vacuum-lab-web.service").write_text(old_unit)
         stand_in.status = {"written": stand_in.clock(), "run": None,
                            "release": "20250101-0000-old" if previous else None,
                            "ports": {}, "critical": 0}
@@ -325,7 +346,7 @@ def _sections(folder: Path) -> None:
             return False
         stand_in.fail_on = second_install
         made, error = deploy(stand_in, args)
-        unit = (folder / "halfway" / "etc" / "tc600-web.service").read_text()
+        unit = (folder / "halfway" / "etc" / "vacuum-lab-web.service").read_text()
         return (made is None and unit == "OLD UNIT\n"
                 and "put back as they were" in (error or "")
                 and stand_in.restarts == 0,
@@ -377,8 +398,8 @@ def _sections(folder: Path) -> None:
         stand_in, args = fresh("first", previous=False, old_unit="OLD UNIT\n")
         stand_in.on_restart = reports(lambda t: None)   # never comes up right
         made, error = deploy(stand_in, args)
-        unit = (folder / "first" / "etc" / "tc600-web.service").read_text()
-        added = (folder / "first" / "etc" / "tc600-backup.timer").exists()
+        unit = (folder / "first" / "etc" / "vacuum-lab-web.service").read_text()
+        added = (folder / "first" / "etc" / "vacuum-lab-backup.timer").exists()
         return (made is None and "rolled back to the copy" in (error or "")
                 and unit == "OLD UNIT\n" and not added,
                 f"{(error or 'deployed')[:70]}; unit restored "
@@ -409,3 +430,181 @@ def _sections(folder: Path) -> None:
                 (error or "deployed")[:80])
     attempt("a release that does not come up is switched back, and the one "
             "before checked running again", bad_release_rolled_back)
+
+    # --- from the units' old names (tc600-web, tc600-backup) ------------------------
+    def old_names(name):
+        stand_in, args = fresh(name)
+        for installed in stand_in.old_units:
+            Path(installed).write_text(f"OLD {Path(installed).name}\n")
+        return stand_in, args
+
+    def systemctl(stand_in) -> list[str]:
+        return [c[len(stand_in.sudo):] for c in stand_in.commands
+                if c.startswith(stand_in.sudo + "systemctl")]
+
+    def moved_over():
+        stand_in, args = old_names("moved")
+        stand_in.on_restart = reports(current_name)
+        made, error = deploy(stand_in, args)
+        done = systemctl(stand_in)
+        etc = folder / "moved" / "etc"
+        kept = folder / "moved" / "base" / "units-before" / str(made)
+        return (made is not None
+                and all((etc / Path(i).name).exists() for i in rel.UNITS)
+                and not any((etc / Path(i).name).exists() for i in rel.OLD_UNITS)
+                and all((kept / Path(i).name).exists() for i in rel.OLD_UNITS)
+                and "systemctl enable vacuum-lab-web" in done
+                and "systemctl disable tc600-web" in done
+                and "systemctl disable --now tc600-backup.timer" in done
+                and "systemctl enable --now vacuum-lab-backup.timer" in done
+                and "systemctl stop tc600-web" not in done
+                and stand_in.restarted == ["vacuum-lab-web"]
+                and "tc600-web" in stand_in.inactive,
+                error or f"systemctl: {done}")
+    attempt("a machine under the old unit names is moved over: new units "
+            "enabled, one restart of the new panel that stops the old one, the "
+            "old unit files removed once it is healthy and kept aside",
+            moved_over)
+
+    def both_running():
+        stand_in, args = old_names("both")
+        stand_in.conflicts_work = False      # the old panel does not stop
+        stand_in.on_restart = reports(current_name)
+        made, error = deploy(stand_in, args)
+        return (made is None and "still running beside" in (error or "")
+                and stand_in.restarted[-1] == "tc600-web",
+                (error or "deployed")[:120])
+    attempt("a move is not healthy while the old panel still runs beside the "
+            "new one, and is undone", both_running)
+
+    def restart_refused():
+        stand_in, args = old_names("refused")
+        stand_in.fail_on = lambda c: c == "FAKESUDO systemctl restart vacuum-lab-web"
+        stand_in.on_restart = reports(current_name)
+        made, error = deploy(stand_in, args)
+        etc = folder / "refused" / "etc"
+        return (made is None and "rolled back" in (error or "")
+                and all((etc / Path(i).name).exists() for i in rel.OLD_UNITS)
+                and not (etc / "vacuum-lab-web.service").exists()
+                and stand_in.restarted == ["tc600-web"],
+                f"{(error or 'deployed')[:80]}; restarts {stand_in.restarted}")
+    attempt("a move whose new panel will not start goes back to the old one",
+            restart_refused)
+
+    def new_panel_will_not_stop():
+        stand_in, args = old_names("stuck")
+        stand_in.on_restart = lambda t: reports(
+            lambda u: "something else" if t.restarted[-1] == "vacuum-lab-web"
+            else current_name(u))(t)
+        stand_in.fail_on = lambda c: c == ("FAKESUDO systemctl disable --now "
+                                           "vacuum-lab-web.service")
+        made, error = deploy(stand_in, args)
+        kept = (folder / "stuck" / "etc" / "vacuum-lab-web.service").exists()
+        return (made is None and "NOT work" in (error or "") and kept,
+                f"{(error or 'deployed')[:90]}; unit kept {kept}")
+    attempt("... and if the new panel cannot be stopped in going back, its unit "
+            "stays -- its Conflicts= keeps the two apart -- and the deploy says "
+            "so", new_panel_will_not_stop)
+
+    def only_backups_left():
+        stand_in, args = fresh("leftover")
+        etc = folder / "leftover" / "etc"
+        for installed, source in stand_in.units.items():
+            shutil.copy2(Path(ROOT) / source, installed)
+        for name in ("tc600-backup.service", "tc600-backup.timer"):
+            (etc / name).write_text(f"OLD {name}\n")
+        stand_in.on_restart = reports(current_name)
+        made, error = deploy(stand_in, args)
+        return (made is not None and stand_in.restarted == ["vacuum-lab-web"]
+                and not (etc / "tc600-backup.timer").exists(),
+                error or f"restarts {stand_in.restarted}")
+    attempt("old backup units left behind are removed, and do not make a "
+            "deploy treat the panel as still under its old name",
+            only_backups_left)
+
+    def dropins_refused():
+        stand_in, args = old_names("dropins")
+        (folder / "dropins" / "etc" / "tc600-web.service.d").mkdir()
+        made, error = deploy(stand_in, args)
+        return (made is None and "tc600-web.service.d" in (error or "")
+                and stand_in.restarts == 0
+                and current_name(stand_in) == "20250101-0000-old",
+                (error or "deployed")[:100])
+    attempt("a move that would leave local changes (drop-ins) behind is "
+            "refused before anything is switched", dropins_refused)
+
+    def backup_through_the_unit_there():
+        chosen = []
+        for name, setup in (("bk-old", old_names), ("bk-new", fresh)):
+            stand_in, args = setup(name)
+            if setup is fresh:
+                for installed, source in stand_in.units.items():
+                    shutil.copy2(Path(ROOT) / source, installed)
+            args.no_backup = False
+            stand_in.on_restart = reports(current_name)
+            deploy(stand_in, args)
+            chosen.append(next((c.split()[-1] for c in systemctl(stand_in)
+                                if c.startswith("systemctl start")), None))
+        return (chosen == ["tc600-backup.service", "vacuum-lab-backup.service"],
+                str(chosen))
+    attempt("the backup before a deploy runs through the backup unit the "
+            "machine has, old name or new", backup_through_the_unit_there)
+
+    def not_without_asking():
+        stand_in, args = old_names("asked")
+        args.install_units = False
+        made, error = deploy(stand_in, args)
+        return (made is None and "tc600-web.service is the unit's old name"
+                in (error or "") and stand_in.restarts == 0
+                and current_name(stand_in) == "20250101-0000-old",
+                (error or "deployed")[:120])
+    attempt("... but only with --install-units", not_without_asking)
+
+    def move_undone():
+        stand_in, args = old_names("unmoved")
+
+        def comes_up(target):
+            # Under the new name it never comes right; under the old name the
+            # release before is running again.
+            back = target.restarted[-1] == "tc600-web"
+            reports(lambda t: current_name(t) if back else "something else")(target)
+        stand_in.on_restart = comes_up
+        made, error = deploy(stand_in, args)
+        done = systemctl(stand_in)
+        etc = folder / "unmoved" / "etc"
+        restored = all((etc / Path(i).name).read_text()
+                       == f"OLD {Path(i).name}\n" for i in rel.OLD_UNITS)
+        added = [Path(i).name for i in rel.UNITS
+                 if Path(i).name != "99-vacuum-lab.rules"
+                 and (etc / Path(i).name).exists()]
+        return (made is None and "rolled back to 20250101-0000-old" in (error or "")
+                and restored and not added
+                and "systemctl disable --now vacuum-lab-web.service" in done
+                and "systemctl enable tc600-web" in done
+                and "systemctl enable --now tc600-backup.timer" in done
+                and stand_in.restarted == ["vacuum-lab-web", "tc600-web"]
+                and current_name(stand_in) == "20250101-0000-old",
+                f"{(error or 'deployed')[:60]}; old back {restored}; "
+                f"new left {added}; restarts {stand_in.restarted}")
+    attempt("a move that does not come up healthy is undone: the old units "
+            "back, enabled and restarted, the new ones removed", move_undone)
+
+    def unit_never_beside_old():
+        unit = (Path(ROOT) / "deploy" / "vacuum-lab-web.service").read_text()
+        lines = [line.strip() for line in unit.splitlines()]
+        conflicts = "Conflicts=tc600-web.service" in lines
+        ordered = any(line.startswith("After=") and "tc600-web.service" in line
+                      for line in lines)
+        return conflicts and ordered, f"Conflicts {conflicts}, ordered {ordered}"
+    attempt("the panel's unit never runs beside its old name, and stops it "
+            "before starting", unit_never_beside_old)
+
+    def which_unit():
+        stand_in, _ = old_names("which")
+        before = rel.panel_service(stand_in)
+        Path(next(i for i in stand_in.units
+                  if i.endswith("vacuum-lab-web.service"))).write_text("NEW\n")
+        return (before == "tc600-web" and rel.panel_service(stand_in)
+                == "vacuum-lab-web", f"{before} -> {rel.panel_service(stand_in)}")
+    attempt("rollback restarts the unit the panel runs under, old name or new",
+            which_unit)
