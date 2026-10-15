@@ -14,7 +14,8 @@ way), `lifecycle` (a run's start, end and clean-up when the database, the
 service or the process fails), `authority` (overrides and who may change
 the drive) and `security` (idle sessions, bursts of sign-ins and
 connections, wrong clocks, stray hosts and origins, downloads that must not
-hold up the rig) -- and last port discovery, what the panel says about
+hold up the rig), then `addresses` (a username is the institutional address
+before the @, confirmed by a mailed code) -- and last port discovery, what the panel says about
 itself (`observability`), backups and releases.
 
 Each section starts from the same place: both simulators reset, and
@@ -47,8 +48,8 @@ sys.path.insert(0, ROOT)
 #: Every section, by the name `--only` takes, in the order they run.
 SECTIONS = ("pump", "gauge", "cold_cathode", "analysis", "process", "equipment",
             "deposition", "database", "accounts", "history", "engine", "faults",
-            "timing", "lifecycle", "authority", "security", "discovery",
-            "chambers", "observability", "backup", "release")
+            "timing", "lifecycle", "authority", "security", "addresses",
+            "discovery", "chambers", "observability", "backup", "release")
 
 #: Where a section's code lives, and how it is called: (module, function,
 #: which simulator ports it takes).
@@ -69,6 +70,7 @@ WHERE = {
     "lifecycle": ("lifecycle", "test_lifecycle", ("pump", "gauge")),
     "authority": ("authority", "test_authority", ("pump",)),
     "security": ("security", "test_security", ("pump",)),
+    "addresses": ("addresses", "test_addresses", ()),
     "discovery": ("discovery", "test_discovery", ("pump", "gauge")),
     "chambers": ("chambers", "test_chambers", ("pump", "gauge")),
     "observability": ("observability", "test_observability", ()),

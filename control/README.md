@@ -370,9 +370,28 @@ you may do depends on your role in this chamber:
 | **admin** | also set the rig up (equipment, ports, automatic recovery), approve accounts, reset passwords, pair tablets, change the drive's settings, **override interlocks** |
 | **owner** | one per chamber: also appoints admins |
 
-- **Getting an account.** *Request an account* on the sign-in page. Nothing
-  happens until an admin approves it under Settings → People and picks your
-  role. Ask for a higher one later from Settings → My account.
+- **Getting an account.** *Request an account* on the sign-in page. Your
+  username is your institutional email before the @: for
+  anperez@unal.edu.co, type `anperez` (typing the whole address works too).
+  Choose a password, and a 6-digit code is mailed to that address. Type the
+  code back on the next step **with the same password**; it is good for 30
+  minutes (*Send a new code* if it lapses, at most one a minute and five a
+  day). An admin can approve the request under Settings → People, and pick
+  your role, only after the address is confirmed; People shows each
+  request's address and whether it is confirmed. If you close the page, use
+  *I already have a code* and give your username, password and code. Ask for
+  a higher role later from Settings → My account.
+- **Mail for the codes.** The lab's machine needs a mail account to send
+  them. Whoever runs it sets that up once, on the machine itself (the
+  settings are never shown on a page and are not part of a backup):
+  `./tools/users.py mail set --host smtp.gmail.com --user lab@example.org
+  --sender "Vacuum Lab <lab@example.org>"` (it asks for the account's
+  password), then `./tools/users.py mail test you@unal.edu.co` to send a
+  test message; `mail show` lists the settings without the password and
+  `mail off` stops sending. Without a mail account nothing is checked:
+  requests are approved as before, and People warns that addresses are not
+  verified. Another domain than `unal.edu.co` is set with
+  `webserver.py --email-domain`.
 - **The first account** — the owner — is made on the lab PC itself, so nobody
   on the network can claim the rig: `./tools/users.py owner YOURNAME`. The
   same command gives a forgotten owner password back.

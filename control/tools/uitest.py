@@ -50,7 +50,7 @@ sys.path.insert(0, ROOT)
 from tools.cdp import Chrome, Page, attach  # noqa: E402
 
 PARTS = ("pages", "maths", "gating", "override", "prompt", "fault", "idle",
-         "deploy", "form", "history")
+         "deploy", "form", "history", "signup")
 SIZES = {"tablet": (1024, 600, False), "phone": (390, 844, True)}
 ROLES = ("viewer", "operator", "admin", "tablet")
 PASSWORD = "uitest-pass-1"
@@ -177,6 +177,7 @@ class Server:
         # Eight panels and this test share one address. The cap on
         # connections from one client is the selftest's to check.
         api.MAX_CONNECTIONS_PER_ADDRESS = 128
+        auth.SIGNUPS_PER_HOUR = 50
         self.httpd = api.Server(("127.0.0.1", 0), Quiet)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         threading.Thread(target=self.httpd.serve_forever, daemon=True,
@@ -757,6 +758,58 @@ def part_history(chrome, server, sessions, report, shots):
                  repr(named))
 
 
+def part_signup(chrome, server, sessions, report, shots):
+    """Asking for an account from a phone: the institutional username, the
+    code mailed there, and the admin seeing it confirmed."""
+    from lab import mailer
+    from tools.fake_smtp import FakeSMTP
+    smtp = FakeSMTP()
+    path = os.path.join(server.folder, mailer.SETTINGS_FILE)
+    mailer.save_settings(path, smtp.settings())
+    try:
+        page = chrome.page(*SIZES["phone"])
+        open_as(page, server.base, None, "dashboard")
+        page.wait("document.querySelector(\"[data-test='signin-mode-signup']\")")
+        click(page, "signin-mode-signup")
+        page.wait("document.querySelector(\"[data-test='signup-username']\")")
+        note = page.js("document.querySelector(\"[data-test='signup-username']\")"
+                       ".closest('.field').innerText") or ""
+        report.check("the sign-up form asks for the institutional username",
+                     "@unal.edu.co" in note, " ".join(note.split())[:120])
+        audit(page, report, "sign-up form", shots)
+        type_into(page, "signup-username", "Nina.Ruiz@unal.edu.co")
+        type_into(page, "signup-password", "nina-pass-1")
+        type_into(page, "signup-repeat", "nina-pass-1")
+        settle(page)
+        click(page, "signup-submit")
+        asked = page.wait("document.querySelector(\"[data-test='signup-code']\")",
+                          timeout=15)
+        codes = smtp.codes("nina.ruiz@unal.edu.co")
+        report.check("a code is mailed to the address, and the page asks for it",
+                     asked and len(codes) == 1, f"{len(codes)} mailed")
+        audit(page, report, "sign-up: the code", shots)
+        type_into(page, "signup-code", codes[0] if codes else "")
+        settle(page)
+        click(page, "signup-confirm")
+        done = page.wait("document.body.innerText.includes('Address confirmed')",
+                         timeout=10)
+        user = server.app.db.user_by_name("nina.ruiz") or {}
+        report.check("typed back, the address is confirmed",
+                     done and user.get("email_verified_at"),
+                     f"page {bool(done)}, stored {user.get('email_verified_at')}")
+        admin = chrome.page(*SIZES["tablet"])
+        open_as(admin, server.base, sessions["admin"], "settings")
+        shown = admin.wait("(document.querySelector(\"[data-test='address-nina.ruiz']\")"
+                           " || {}).innerText", timeout=15) or ""
+        report.check("the People page shows the request's address confirmed",
+                     "confirmed" in shown and "not" not in shown, shown)
+        audit(admin, report, "People with a confirmed request", shots)
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+        smtp.close()
+
+
 def _wait(predicate, timeout: float) -> bool:
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -770,7 +823,7 @@ PART_FUNCTIONS = {"pages": part_pages, "maths": part_maths,
                   "gating": part_gating, "override": part_override,
                   "prompt": part_prompt, "fault": part_fault,
                   "idle": part_idle, "deploy": part_deploy, "form": part_form,
-                  "history": part_history}
+                  "history": part_history, "signup": part_signup}
 
 
 # --- the kiosk -------------------------------------------------------------------

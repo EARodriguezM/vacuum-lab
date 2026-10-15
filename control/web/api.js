@@ -297,6 +297,9 @@ export const api = {
   login:   (username, password) =>
     post("/api/login", { username, password, device: sessions.device || undefined }),
   signup:  (body) => post("/api/signup", body),
+  verifyEmail: (username, password, code) =>
+    post("/api/signup/verify", { username, password, code }),
+  requestCode: (username, password) => post("/api/signup/code", { username, password }),
   pair:    (code) => post("/api/pair", { code }),
   logout:  () => post("/api/logout", {}),
   me:      () => get("/api/me"),

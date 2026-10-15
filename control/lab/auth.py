@@ -118,6 +118,28 @@ CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 SIGNUPS_PER_HOUR = 5
 MAX_PENDING = 50
 
+#: Accounts are the people of one institution: a username is the part of
+#: their institutional address before the @ (webserver.py --email-domain).
+EMAIL_DOMAIN = "unal.edu.co"
+#: The code mailed there when somebody asks for an account (lab/mailer.py):
+#: digits, as a phone's mail shows them; good for 30 minutes and 5 tries.
+EMAIL_CODE_DIGITS = 6
+EMAIL_CODE_TTL_S = 30 * 60
+EMAIL_CODE_TRIES = 5
+#: At least a minute between two codes for one account, at most 5 a day.
+EMAIL_RESEND_S = 60
+EMAIL_SENDS_PER_DAY = 5
+#: Mail the panel sends in an hour and in a day, everybody together: a
+#: flood of sign-ups must not get the sending account blocked as a spammer.
+MAIL_PER_HOUR = 30
+MAIL_PER_DAY = 200
+#: Codes typed per minute, and codes asked for per hour, from one address.
+CODE_CHECKS_PER_MINUTE = 10
+CODE_REQUESTS_PER_HOUR = 10
+#: How long a request waits for another's mail to go (each send is bounded
+#: by mailer.SEND_TIMEOUT_S), before it is told the panel is busy.
+SEND_LOCK_WAIT_S = 20.0
+
 
 # --- passwords and tokens --------------------------------------------------
 
@@ -180,8 +202,13 @@ def normalise_code(code: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(code or "").upper())
 
 
+def _email_digest(salt: str, code: str) -> str:
+    return hashlib.sha256(f"{salt}:{code}".encode("utf-8")).hexdigest()
+
+
 def check_username(username: str) -> str | None:
-    if not USERNAME.match(username or ""):
+    # fullmatch, not match: `$` also matches before a final newline.
+    if not USERNAME.fullmatch(username or ""):
         return ("A username is 3 to 32 characters: lower-case letters, digits, "
                 "dots, dashes or underscores, starting with a letter or digit.")
     return None
@@ -419,10 +446,22 @@ class Auth:
 
     def __init__(self, database, chamber: str, enabled: bool = True,
                  idle_s: float = IDLE_S, run_idle_s: float = RUN_IDLE_S,
-                 runner=None):
+                 runner=None, email_domain: str = EMAIL_DOMAIN, mailer=None):
         self.db = database
         self.chamber = chamber
         self.enabled = enabled
+        #: Whose usernames these are, and what mails the code there
+        #: (lab/mailer.py; None or unconfigured: nobody's address is checked).
+        self.email_domain = str(email_domain or EMAIL_DOMAIN).strip().lower()
+        self.mailer = mailer
+        self._mail_sent = Budget(MAIL_PER_HOUR, 3600.0)
+        self._mail_daily = Budget(MAIL_PER_DAY, 86400.0)
+        self._code_checks = Budget(CODE_CHECKS_PER_MINUTE)
+        self._code_requests = Budget(CODE_REQUESTS_PER_HOUR, 3600.0)
+        #: One code mailed at a time, and one checked at a time: a burst in
+        #: parallel must not pass a limit before any of it is counted.
+        self._mail_lock = threading.Lock()
+        self._codes_lock = threading.Lock()
         #: How long a person may go untouched and still act, and how long
         #: when the run that is going is theirs (webserver.py --idle-minutes,
         #: --run-idle-minutes).
@@ -635,6 +674,10 @@ class Auth:
         if not self.enabled:
             return {"ok": True, "token": None, "me": self.me(LOCAL)}
         name = str(username or "").strip().lower()
+        # The whole institutional address signs in too: it is what sign-up
+        # accepts, and what a browser may have saved from it.
+        if name.endswith(f"@{self.email_domain}"):
+            name = name[:-len(self.email_domain) - 1].strip()
         # Per name *and* address: a wrong guess from elsewhere must not lock
         # the owner out of their own account. The address key still slows
         # one machine trying many names.
@@ -810,8 +853,8 @@ class Auth:
                                "later.", 429)
             recent.append(now)
             self._signups[address] = recent
-        name = str(username or "").strip().lower()
-        problem = check_username(name) or check_password(password, name)
+        name, problem = self.username_from(username)
+        problem = problem or check_password(password, name)
         if problem:
             return refusal(problem, 400)
         display = " ".join(str(display_name or "").split())[:60] or name
@@ -820,19 +863,256 @@ class Auth:
         if len(pending) >= MAX_PENDING:
             return refusal("Too many requests are already waiting. Ask an "
                            "admin.", 429)
+        hashed = hash_password(password)
         try:
-            self.db.create_user(name, hash_password(password),
-                                display_name=display, status="pending",
-                                note=str(note or "")[:300])
+            user = self.db.create_user(name, hashed, display_name=display,
+                                       status="pending", note=str(note or "")[:300])
         except sqlite3.IntegrityError:
-            return refusal("That username is taken.", 409)
+            user = self._replace_unconfirmed(name, hashed, display, note)
+            if user is None:
+                return refusal("That username is taken.", 409)
         # Only the username, which check_username has limited to letters,
         # digits and . _ - : the rest was typed by somebody nobody has
         # vouched for yet, and the activity feed is on every screen.
         self.db.add_event(None, "info",
                           f"An account was requested ({name}). An admin "
                           "approves it in Settings -> People.")
-        return {"ok": True, "pending": True}
+        if not self.verifying:
+            return {"ok": True, "pending": True, "verify": False}
+        sent = self._send_code(user)
+        return {"ok": True, "pending": True, "verify": True,
+                "email": self.email_of(name), "sent": bool(sent.get("ok")),
+                "problem": None if sent.get("ok") else sent.get("error")}
+
+    # --- the institutional address -----------------------------------------
+
+    @property
+    def verifying(self) -> bool:
+        """Whether a request must confirm its address before approval:
+        only while the panel can send the code."""
+        return self.mailer is not None and self.mailer.configured
+
+    def email_of(self, username: str) -> str:
+        return f"{username}@{self.email_domain}"
+
+    def username_from(self, typed: str) -> tuple[str, str | None]:
+        """The username in what was typed -- the name, or the whole
+        institutional address -- and why it is not one, or None."""
+        name = str(typed or "").strip().lower()
+        if "@" in name:
+            name, _, domain = name.rpartition("@")
+            name = name.strip()
+            if domain != self.email_domain:
+                return name, (f"Use your institutional address: the part before "
+                              f"@{self.email_domain}.")
+        return name, check_username(name)
+
+    def _replace_unconfirmed(self, name: str, hashed: str, display: str,
+                             note: str) -> dict | None:
+        """A name held by a request that never confirmed its address, and
+        whose last code has expired, goes to whoever asks for it now:
+        otherwise anybody could block a colleague's username by asking for
+        it first. Never while nothing can be confirmed (no mail set up)."""
+        if not self.verifying:
+            return None
+        # Under the codes' lock: a confirmation going on for the old request
+        # finishes first, or finds it gone.
+        with self._codes_lock:
+            old = self.db.user_by_name(name)
+            now = time.time()
+            if (not old or old["kind"] != "person" or old["status"] != "pending"
+                    or old.get("email_verified_at")
+                    or now - old["created_at"] < EMAIL_CODE_TTL_S):
+                return None
+            code = self.db.email_code(name)
+            if (code and code["code_hash"] and code["user_uuid"] == old["uuid"]
+                    and now < code["expires_at"]):
+                return None
+            if not self.db.delete_unconfirmed_request(old["id"], old["uuid"]):
+                return None
+            self.db.void_email_code(name)
+            try:
+                made = self.db.create_user(name, hashed, display_name=display,
+                                           status="pending",
+                                           note=str(note or "")[:300])
+            except sqlite3.IntegrityError:
+                return None
+        self.db.add_event(None, "info", f"An unconfirmed account request for "
+                                        f"{name} was replaced by a new one.")
+        return made
+
+    def _requester(self, name: str, password: str,
+                   address: str) -> tuple[dict | None, dict | None]:
+        """The request still waiting under `name`, if `password` is the one
+        chosen when it was made; else the refusal. The code alone is not
+        enough: it proves somebody reads the inbox, not that they made this
+        request -- with it alone, a stranger who asked first for a
+        colleague's username would have the colleague confirm it for them.
+        A password guess like a sign-in, so it is checked like one: budgeted
+        per address, throttled per name and address, the same cost for a
+        name that does not exist."""
+        # Keys of their own: wrong passwords here must not hold up sign-in
+        # from the same address -- all of loopback is one address, the kiosk
+        # tablet beside the rig among it. The hashing budget is shared: it
+        # is one machine's share of the slots, whatever the hash is for.
+        keys = (f"request:{name}@{address}", f"request-addr:{address}")
+        busy = self._hash_budget(f"addr:{address}")
+        if busy:
+            return None, busy
+        wait = self.throttle.begin(*keys)
+        if wait > 0:
+            seconds = math.ceil(wait)
+            return None, refusal(f"Too many wrong passwords. Try again in "
+                                 f"{seconds} s.", 429, retry_after=seconds)
+        wrong = False
+        try:
+            user = self.db.user_by_name(name) if name else None
+            if (user is None or user["kind"] != "person"
+                    or user["status"] != "pending" or not user["password_hash"]
+                    or user.get("email_verified_at")):
+                verify_password(str(password), self._dummy_hash())  # same cost
+                wrong = True
+            elif not verify_password(str(password), user["password_hash"]):
+                wrong = True
+        finally:
+            self.throttle.end(*keys, failed=wrong)
+        if wrong:
+            return None, refusal("No request is waiting under that username "
+                                 "with that password.", 403)
+        self.throttle.clear(keys[0])
+        return user, None
+
+    def _send_code(self, user: dict) -> dict:
+        """Mail a new code to the request's institutional address. Nothing is
+        counted against the name unless the mail went."""
+        if not self._mail_lock.acquire(timeout=SEND_LOCK_WAIT_S):
+            return refusal("The panel is busy sending mail. Try again in a "
+                           "moment.", 503)
+        try:
+            name = user["username"]
+            now = time.time()
+            record = self.db.email_code(name)
+            if record:
+                since = now - record["sent_at"]
+                if 0 <= since < EMAIL_RESEND_S:
+                    return refusal("A code was sent less than a minute ago: "
+                                   "look for it, or ask again in a minute.", 429)
+                if (record["sends"] >= EMAIL_SENDS_PER_DAY
+                        and 0 <= now - record["first_sent_at"] < 86400):
+                    return refusal(f"{EMAIL_SENDS_PER_DAY} codes went to this "
+                                   "address today. Try again tomorrow.", 429)
+            if self._mail_sent.take("all"):
+                return refusal("The panel has sent all the mail it may this "
+                               "hour. Try again later.", 429)
+            if self._mail_daily.take("all"):
+                self._mail_sent.give_back("all")
+                return refusal("The panel has sent all the mail it may today. "
+                               "Try again tomorrow.", 429)
+            code = "".join(secrets.choice("0123456789")
+                           for _ in range(EMAIL_CODE_DIGITS))
+            address = self.email_of(name)
+            asked = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
+            try:
+                # Nothing typed by the requester goes into the mail but the
+                # username, which check_username limits to letters, digits
+                # and . _ - : the lab's account must not carry a stranger's
+                # words to anybody's inbox.
+                self.mailer.send(address, "Your code for the vacuum lab panel", (
+                    f"Your code is\n\n    {code}\n\n"
+                    f"Somebody asked at {asked} for the account \"{name}\" on "
+                    "the vacuum lab's control panel. If it was you, type the "
+                    "code there with the password you chose. It works for "
+                    f"{EMAIL_CODE_TTL_S // 60} minutes.\n\n"
+                    "If it was not you, ignore this message: without the code "
+                    "nothing happens. If it keeps happening, tell the lab's "
+                    "admin -- somebody else is asking for your username.\n"))
+            except Exception as exc:              # MailError, or a bug in it
+                self._mail_sent.give_back("all")
+                self._mail_daily.give_back("all")
+                # The reason is for the machine's log only: the person asking
+                # is not told which server, nor what it said.
+                print(f"!! could not mail a code to {address}: "
+                      f"{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+                return refusal("The code could not be sent. Try again later, "
+                               "or ask an admin.", 503)
+            salt = secrets.token_hex(8)
+            self.db.set_email_code(name, user["uuid"],
+                                   f"{salt}${_email_digest(salt, code)}",
+                                   now + EMAIL_CODE_TTL_S)
+            return {"ok": True, "email": address}
+        finally:
+            self._mail_lock.release()
+
+    def request_code(self, typed: str, password: str, address: str = "") -> dict:
+        """A new code for a request still waiting to confirm its address --
+        asked for by whoever made it, so nobody can fill a colleague's inbox."""
+        if not self.enabled:
+            return refusal("Accounts are switched off on this server.", 400)
+        if not self.verifying:
+            return refusal("This server cannot send mail; an admin checks "
+                           "requests without it.", 409)
+        name, problem = self.username_from(typed)
+        if problem:
+            return refusal(problem, 400)
+        if self._code_requests.take(f"address:{address}"):
+            return refusal("Too many codes asked for from here. Try again "
+                           "later.", 429)
+        user, refused = self._requester(name, password, address)
+        if refused:
+            return refused
+        sent = self._send_code(user)
+        return sent if not sent.get("ok") else {**sent, "verify": True}
+
+    def verify_email(self, typed: str, password: str, code: str,
+                     address: str = "") -> dict:
+        """The code mailed to a request's address, typed back by whoever
+        made the request (their password): the address is confirmed."""
+        if not self.enabled:
+            return refusal("Accounts are switched off on this server.", 400)
+        name, problem = self.username_from(typed)
+        if problem:
+            return refusal(problem, 400)
+        wait = self._code_checks.take(f"address:{address}")
+        if wait:
+            return refusal(f"Too many codes tried. Wait {math.ceil(wait)} s.", 429)
+        user, refused = self._requester(name, password, address)
+        if refused:
+            return refused
+        # Per name only once the password was right: a stranger's tries
+        # must not spend the person's own.
+        wait = self._code_checks.take(f"user:{name}")
+        if wait:
+            return refusal(f"Too many codes tried. Wait {math.ceil(wait)} s.", 429)
+        wrong = refusal("That code is not right, or it has expired: ask for a "
+                        "new one.", 400)
+        typed_code = re.sub(r"\D", "", str(code or ""))
+        with self._codes_lock:
+            # Again under the lock: the request may have been replaced,
+            # declined or confirmed while the password was being checked.
+            current = self.db.user_by_name(name)
+            if (not current or current["uuid"] != user["uuid"]
+                    or current["status"] != "pending"
+                    or current.get("email_verified_at")):
+                return wrong
+            record = self.db.email_code(name)
+            now = time.time()
+            if (not record or not record["code_hash"]
+                    or record["user_uuid"] != current["uuid"]
+                    or not record["sent_at"] - 60 <= now < record["expires_at"]
+                    or record["tries"] >= EMAIL_CODE_TRIES):
+                return wrong
+            salt, _, digest = record["code_hash"].partition("$")
+            if not hmac.compare_digest(_email_digest(salt, typed_code), digest):
+                self.db.count_email_try(name)
+                if record["tries"] + 1 >= EMAIL_CODE_TRIES:
+                    self.db.void_email_code(name)
+                return wrong
+            if not self.db.confirm_email(current["id"], current["uuid"], now):
+                return wrong
+            self.db.void_email_code(name)
+        self.db.add_event(None, "info", f"{name} confirmed their institutional "
+                                        f"address ({self.email_of(name)}).")
+        return {"ok": True, "verified": True}
 
     def me(self, principal: Principal) -> dict:
         """What the panel needs to know about whoever is looking at it."""
@@ -1116,9 +1396,12 @@ class Auth:
                 tablets.append(entry)
             else:
                 entry["you"] = user["username"] == actor.username
+                entry["email"] = self.email_of(user["username"])
                 people.append(entry)
         return {"ok": True, "people": people, "tablets": tablets,
                 "requests": self.db.role_requests(self.chamber),
+                "email": {"domain": self.email_domain,
+                          "verifying": self.verifying},
                 "you": {"username": actor.username, "role": actor.role}}
 
     def _target(self, actor: Principal, user_id: int,
@@ -1158,6 +1441,11 @@ class Auth:
         problem = self._grantable(actor, role)
         if problem:
             return problem
+        if self.verifying and not user.get("email_verified_at"):
+            return refusal(f"{user['username']} has not confirmed "
+                           f"{self.email_of(user['username'])} yet: the code "
+                           "mailed there is typed on the sign-up page. Decline "
+                           "the request if the address is not theirs.", 409)
         self.db.update_user(user["id"], status="active")
         self.db.set_role(user["id"], self.chamber, role, actor.username)
         self._log(actor, "action", f"{actor.name} approved {user['display_name']} "
@@ -1324,7 +1612,9 @@ class Auth:
         if not self.enabled:
             return {"enabled": False}
         return {"enabled": True,
-                "owner": bool(self.db.holders(self.chamber, "owner"))}
+                "owner": bool(self.db.holders(self.chamber, "owner")),
+                "email_domain": self.email_domain,
+                "verify_email": self.verifying}
 
 
 def bootstrap_owner(database, chamber: str, username: str, password: str,

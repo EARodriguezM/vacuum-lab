@@ -40,7 +40,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lab import (alarms, api, auth, chamber as chambermod,  # noqa: E402
-                 db as dbmod, discovery, history, process, pump, registry, runs)
+                 db as dbmod, discovery, history, mailer, process, pump,
+                 registry, runs)
 
 
 def build(args) -> api.Application:
@@ -123,10 +124,15 @@ def build(args) -> api.Application:
     # Who may watch and who may drive, per chamber. Sessions outlive a
     # restart -- they are in the database -- so a deploy does not sign every
     # tablet out; the expired ones are swept here.
+    # A username is the person's institutional address before the @; the
+    # code that proves it is mailed through the account in mail.json beside
+    # the database (tools/users.py mail set), read at each sending.
     accounts = auth.Auth(database, chamber.id, enabled=not args.no_auth,
                          idle_s=args.idle_minutes * 60,
                          run_idle_s=args.run_idle_minutes * 60,
-                         runner=engine.runner)
+                         runner=engine.runner, email_domain=args.email_domain,
+                         mailer=mailer.Mailer(os.path.join(
+                             data_dir, mailer.SETTINGS_FILE)))
     database.purge_sessions()
     application = api.Application(devices, database, engine, auth=accounts,
                            history=recorder, supervisor=supervisor,
@@ -254,6 +260,12 @@ def parse(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-idle-minutes", type=float, default=60,
                         help="the same, for the person whose run is going: a "
                              "deposition is mostly watching")
+    parser.add_argument("--email-domain", default=auth.EMAIL_DOMAIN,
+                        help="usernames are the part of an address at this "
+                             "domain before the @; a request for an account "
+                             "confirms it with a code mailed there, once a "
+                             "mail account is set up (tools/users.py mail "
+                             f"set). Default {auth.EMAIL_DOMAIN}")
     parser.add_argument("--no-auth", action="store_true",
                         help="switch accounts off: anyone who reaches the port "
                              "is the owner. For the simulator on a laptop, "
@@ -354,6 +366,15 @@ def main() -> int:
               + (f" --db {args.db}" if args.db else "")
               + (f" --chamber {chamber.id}"
                  if chamber.id != "chamber-1" else ""))
+    if not args.no_auth:
+        if application.auth.verifying:
+            print(f"  account requests confirm their @{args.email_domain} "
+                  "address by a mailed code")
+        else:
+            print(f"  NO MAIL ACCOUNT: requests' @{args.email_domain} addresses "
+                  "are not checked;")
+            print("  set one up on this machine: ./tools/users.py mail set"
+                  + (f" --db {args.db}" if args.db else ""))
     if args.allow_from:
         print(f"  reachable only from: {args.allow_from} (and loopback)")
     if args.admin_from:

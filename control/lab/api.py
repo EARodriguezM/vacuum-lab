@@ -69,7 +69,8 @@ POST_RULES = {
 }
 
 #: Reachable without a session: how a sign-in page finds out where it is.
-PUBLIC_POSTS = ("/api/login", "/api/signup", "/api/pair")
+PUBLIC_POSTS = ("/api/login", "/api/signup", "/api/signup/verify",
+                "/api/signup/code", "/api/pair")
 
 #: GETs that need more than watching.
 ADMIN_GETS = ("/api/ports/survey",)
@@ -1181,6 +1182,15 @@ class Handler(BaseHTTPRequestHandler):
                                      str(payload.get("password", "")),
                                      str(payload.get("note", "")),
                                      self._address())
+            elif route == "/api/signup/verify":
+                result = auth.verify_email(str(payload.get("username", "")),
+                                           str(payload.get("password", "")),
+                                           str(payload.get("code", "")),
+                                           self._address())
+            elif route == "/api/signup/code":
+                result = auth.request_code(str(payload.get("username", "")),
+                                           str(payload.get("password", "")),
+                                           self._address())
             else:
                 result = auth.pair(str(payload.get("code", "")),
                                    self._address(), agent)

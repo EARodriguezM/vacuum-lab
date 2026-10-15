@@ -15,6 +15,17 @@ the rig. The owner is made here, by somebody with a shell on the machine:
 the password. Safe to run while the panel is running: both use the same
 SQLite file, and the panel reads accounts from it on every request.
 
+A username is the person's institutional address before the @ (webserver.py
+--email-domain, unal.edu.co by default). A request for an account proves it
+by typing a code mailed there, once the panel has an account to send from:
+
+    ./tools/users.py mail set --host smtp.gmail.com --sender "Vacuum Lab <lab@...>"
+    ./tools/users.py mail test someone@unal.edu.co
+    ./tools/users.py mail show | off
+
+The settings go in mail.json beside the database, readable by this account
+only, and are never sent to the panel's pages nor copied by backup.py.
+
 Passwords are asked for on the terminal, or read from standard input when
 it is not one (`echo ... | ./tools/users.py owner NAME` over ssh).
 """
@@ -30,7 +41,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lab import auth, db as dbmod  # noqa: E402
+from lab import auth, db as dbmod, mailer  # noqa: E402
 
 
 def ask_password(prompt: str = "Password") -> str:
@@ -40,6 +51,51 @@ def ask_password(prompt: str = "Password") -> str:
     if getpass.getpass("Again: ") != first:
         raise SystemExit("The two passwords differ.")
     return first
+
+
+def ask_secret(prompt: str) -> str:
+    if not sys.stdin.isatty():
+        return sys.stdin.readline().rstrip("\n")
+    return getpass.getpass(f"{prompt}: ")
+
+
+def mail_command(args) -> int:
+    path = os.path.join(os.path.dirname(os.path.abspath(
+        args.db or dbmod.default_path())), mailer.SETTINGS_FILE)
+    if args.mail_command == "set":
+        settings = {"host": args.host.strip(), "port": args.port,
+                    "security": args.security, "username": args.user.strip(),
+                    "password": ask_secret("Password of the sending account")
+                    if args.user.strip() else "",
+                    "sender": args.sender.strip()}
+        mailer.save_settings(path, settings)
+        print(f"Saved {path} (0600). Try it: {sys.argv[0]} mail test ADDRESS")
+        return 0
+    if args.mail_command == "off":
+        if os.path.exists(path):
+            os.unlink(path)
+        print("No mail account: requests' addresses are no longer checked.")
+        return 0
+    settings = mailer.Mailer(path).settings()
+    if settings is None:
+        print(f"No usable mail account in {path}.")
+        return 1 if args.mail_command == "test" else 0
+    if args.mail_command == "show":
+        shown = {k: v for k, v in settings.items() if k != "password"}
+        shown["password"] = "set" if settings.get("password") else "none"
+        for key, value in shown.items():
+            print(f"{key:<9} {value}")
+        return 0
+    try:
+        mailer.Mailer(path).send(args.address, "Test from the vacuum lab panel",
+                                 "This account can send the panel's sign-up "
+                                 "codes.\n")
+    except Exception as exc:                      # MailError, or a bug in it
+        print(f"Not sent: {exc if isinstance(exc, mailer.MailError) else type(exc).__name__}",
+              file=sys.stderr)
+        return 1
+    print(f"Sent to {args.address}.")
+    return 0
 
 
 def main() -> int:
@@ -65,17 +121,48 @@ def main() -> int:
                                                 "the account's sessions")
     passwd.add_argument("username")
 
+    unconfirmed = ("let in a request that never confirmed its institutional "
+                   "address -- only after checking it is the person it names: "
+                   "while unconfirmed, the request may be anybody's")
     role = commands.add_parser("role", help="set a role: viewer, operator, "
                                             "admin")
     role.add_argument("username")
     role.add_argument("role", choices=("viewer", "operator", "admin"))
+    role.add_argument("--unconfirmed", action="store_true", help=unconfirmed)
 
     for name, text in (("disable", "stop an account signing in"),
                        ("enable", "let a disabled or pending account in")):
         sub = commands.add_parser(name, help=text)
         sub.add_argument("username")
+        if name == "enable":
+            sub.add_argument("--unconfirmed", action="store_true", help=unconfirmed)
+
+    mail = commands.add_parser("mail", help="the account that mails sign-up "
+                                            "codes to institutional addresses")
+    mail_commands = mail.add_subparsers(dest="mail_command", required=True)
+    setting = mail_commands.add_parser("set", help="set the sending account "
+                                                   "(asks for its password)")
+    setting.add_argument("--host", required=True, help="e.g. smtp.gmail.com")
+    setting.add_argument("--port", type=int, default=587)
+    setting.add_argument("--security", choices=mailer.SECURITY,
+                         default="starttls", help="starttls (587), ssl (465), "
+                                                  "or none for a local relay")
+    setting.add_argument("--user", default="", help="the login, usually the "
+                                                    "sender's address")
+    setting.add_argument("--sender", required=True,
+                         help='"Vacuum Lab <lab@example.org>"')
+    mail_commands.add_parser("show", help="the settings, without the password")
+    trying = mail_commands.add_parser("test", help="send a test message")
+    trying.add_argument("address")
+    mail_commands.add_parser("off", help="remove the settings")
 
     args = parser.parse_args()
+    if args.command == "mail":
+        try:
+            return mail_command(args)
+        except ValueError as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 1
     database = dbmod.Database(args.db)
     try:
         return run(args, database)
@@ -102,16 +189,33 @@ def run(args, database: "dbmod.Database") -> int:
             return 0
         for user in rows:
             seen = user.get("last_login_at")
+            waiting = ""
+            if user["kind"] == "person" and user["status"] == "pending":
+                age = max(0, time.time() - user["created_at"]) / 60
+                waiting = (f"  [address {'confirmed' if user.get('email_verified_at') else 'NOT confirmed'}, "
+                           f"asked {age:.0f} min ago]")
             print(f"{user['username']:<20} {user['kind']:<7} "
                   f"{user['status']:<9} {user['role'] or '-':<9} "
                   f"{user['display_name']}"
                   + (f"  (last sign-in {time.strftime('%Y-%m-%d %H:%M', time.localtime(seen))})"
-                     if seen else ""))
+                     if seen else "") + waiting)
         return 0
 
     user = database.user_by_name(args.username.strip().lower())
     if user is None:
         raise ValueError(f"no account named {args.username!r}")
+    # While the panel mails codes, a pending request whose address was never
+    # confirmed may be anybody's -- somebody else may have asked first for
+    # this name. Letting it in from here takes saying so.
+    mail_path = os.path.join(os.path.dirname(os.path.abspath(
+        args.db or dbmod.default_path())), mailer.SETTINGS_FILE)
+    if (args.command in ("role", "enable") and user["kind"] == "person"
+            and user["status"] == "pending" and not user.get("email_verified_at")
+            and mailer.Mailer(mail_path).configured
+            and not getattr(args, "unconfirmed", False)):
+        raise ValueError(f"{user['username']} has not confirmed the address the "
+                         "code was mailed to, so this request may not be theirs. "
+                         "Check with the person, then add --unconfirmed")
 
     if args.command == "passwd":
         if user["kind"] != "person":
@@ -145,7 +249,10 @@ def run(args, database: "dbmod.Database") -> int:
         print(f"{user['username']} enabled as "
               f"{database.role(user['id'], chamber)}.")
     database.add_event(None, "action", f"Account {user['username']}: "
-                                       f"{args.command} on the machine",
+                                       f"{args.command} on the machine"
+                                       + (" without a confirmed address"
+                                          if getattr(args, "unconfirmed", False)
+                                          else ""),
                        user=user["username"])
     return 0
 

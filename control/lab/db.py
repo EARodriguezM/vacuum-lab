@@ -139,7 +139,28 @@ CREATE TABLE IF NOT EXISTS users (
     note          TEXT    DEFAULT '',
     created_at    REAL    NOT NULL,
     updated_at    REAL    NOT NULL,
-    last_login_at REAL
+    last_login_at REAL,
+    -- When the person typed back the code mailed to their institutional
+    -- address (username@domain): NULL until then, and for accounts made
+    -- before the panel could send mail.
+    email_verified_at REAL
+);
+
+-- The code mailed to a person asking for an account, as a hash: typing it
+-- back, with the password chosen for the request, proves the institutional
+-- address exists and is theirs. Kept per username, not per account, so the
+-- daily limits outlive a request replaced or declined; each code is for one
+-- request (`user_uuid`) and stops working once used or replaced.
+CREATE TABLE IF NOT EXISTS email_codes (
+    username      TEXT    PRIMARY KEY COLLATE NOCASE,
+    user_uuid     TEXT    NOT NULL DEFAULT '',
+    code_hash     TEXT    NOT NULL DEFAULT '',
+    sent_at       REAL    NOT NULL,
+    expires_at    REAL    NOT NULL,
+    tries         INTEGER NOT NULL DEFAULT 0,
+    -- Codes sent since first_sent_at, for the daily limit.
+    sends         INTEGER NOT NULL DEFAULT 1,
+    first_sent_at REAL    NOT NULL
 );
 
 -- One role per account per chamber: owner, admin, operator or viewer.
@@ -229,6 +250,7 @@ MIGRATIONS = (
     ("events", "user", "TEXT"),
     ("events", "origin", "TEXT"),
     ("sessions", "device_id", "INTEGER"),
+    ("users", "email_verified_at", "REAL"),
 )
 
 
@@ -236,7 +258,7 @@ class RunStillRunning(ValueError):
     """A run still marked running cannot be deleted."""
 
 #: Tables holding credentials. Dropped from every copy that leaves the box.
-ACCOUNT_TABLES = ("sessions", "role_requests", "roles", "users")
+ACCOUNT_TABLES = ("sessions", "role_requests", "roles", "email_codes", "users")
 
 
 def default_path() -> str:
@@ -808,7 +830,7 @@ class Database:
 
     def update_user(self, user_id: int, **fields) -> dict | None:
         allowed = {"display_name", "password_hash", "status", "must_change",
-                   "note", "last_login_at"}
+                   "note", "last_login_at", "email_verified_at"}
         changes = {k: v for k, v in fields.items() if k in allowed}
         if changes:
             changes["updated_at"] = time.time()
@@ -818,6 +840,70 @@ class Database:
                                  (*changes.values(), user_id))
                 self._db.commit()
         return self.user(user_id)
+
+    # --- the code mailed to an institutional address ---------------------
+
+    def email_code(self, username: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM email_codes WHERE username=?",
+                                   (username,)).fetchone()
+        return dict(row) if row else None
+
+    def set_email_code(self, username: str, user_uuid: str, code_hash: str,
+                       expires_at: float, day_s: float = 86400.0) -> dict:
+        """A new code replaces the last; `sends` counts the codes sent since
+        the first of the last `day_s` seconds, whichever request they were for."""
+        now = time.time()
+        with self._lock:
+            row = self._db.execute("SELECT * FROM email_codes WHERE username=?",
+                                   (username,)).fetchone()
+            fresh = (row is None or not 0 <= now - row["first_sent_at"] < day_s)
+            first = now if fresh else row["first_sent_at"]
+            sends = 1 if fresh else row["sends"] + 1
+            self._db.execute(
+                "INSERT OR REPLACE INTO email_codes (username, user_uuid, "
+                "code_hash, sent_at, expires_at, tries, sends, first_sent_at) "
+                "VALUES (?,?,?,?,?,0,?,?)",
+                (username, user_uuid, code_hash, now, expires_at, sends, first))
+            self._db.commit()
+        return self.email_code(username)  # type: ignore[return-value]
+
+    def count_email_try(self, username: str) -> None:
+        with self._lock:
+            self._db.execute("UPDATE email_codes SET tries = tries + 1 "
+                             "WHERE username=?", (username,))
+            self._db.commit()
+
+    def void_email_code(self, username: str) -> None:
+        """The code stops working; the count of codes sent today stays."""
+        with self._lock:
+            self._db.execute("UPDATE email_codes SET code_hash='', expires_at=0 "
+                             "WHERE username=?", (username,))
+            self._db.commit()
+
+    def delete_unconfirmed_request(self, user_id: int, user_uuid: str) -> bool:
+        """Delete a request only if it is still that request (`uuid`: SQLite
+        gives a deleted id to the next row), a person's, pending and
+        unconfirmed -- in the same statement, so nothing changed meanwhile
+        is taken for it."""
+        with self._lock:
+            cursor = self._db.execute(
+                "DELETE FROM users WHERE id=? AND uuid=? AND kind='person' AND "
+                "status='pending' AND email_verified_at IS NULL",
+                (user_id, user_uuid))
+            self._db.commit()
+            return cursor.rowcount > 0
+
+    def confirm_email(self, user_id: int, user_uuid: str, at: float) -> bool:
+        """Mark a request's address confirmed, only if it is still that
+        request, pending and unconfirmed."""
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE users SET email_verified_at=?, updated_at=? WHERE id=? "
+                "AND uuid=? AND kind='person' AND status='pending' AND "
+                "email_verified_at IS NULL", (at, time.time(), user_id, user_uuid))
+            self._db.commit()
+            return cursor.rowcount > 0
 
     def delete_user(self, user_id: int) -> bool:
         with self._lock:

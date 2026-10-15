@@ -95,7 +95,9 @@ def test_accounts() -> None:
             code, ping = call("/api/ping")
             check("the ping stays open and says what it is (the kiosk needs it)",
                   code == 200 and ping.get("service") == "vacuum-lab"
-                  and ping.get("auth") == {"enabled": True, "owner": False})
+                  and ping.get("auth") == {"enabled": True, "owner": False,
+                                           "email_domain": "unal.edu.co",
+                                           "verify_email": False})
             check("the ping does not list the serial ports",
                   "devices" not in ping and bool(ping.get("build")))
             check("no session, no state", call("/api/state")[0] == 401)
