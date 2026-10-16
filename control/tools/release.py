@@ -17,7 +17,9 @@ the top of the tree, a folder git knows nothing of -- never does.
 
  1. pre-flight here: every file parses as Python 3.11 to 3.14 (and no
     f-string uses what only 3.12 reads), the selftest and the browser test
-    pass, the tree is clean -- or the release is stamped "dirty";
+    pass, the tree is clean -- or the release is stamped "dirty". What is
+    copied must be byte for byte what was checked: a file edited, added or
+    removed while the tests ran stops the deploy before anything is sent;
  2. the rig is idle: no run going and no power-down under way, read from
     the panel's own status file (`/run/vacuum-lab/status.json`);
  3. the release is copied over and its selftest run on the target's own
@@ -53,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import io
 import json
 import os
@@ -235,8 +238,22 @@ def run_tests(root: Path, log=print) -> list[str]:
     return failed
 
 
+def fingerprint(root: Path, files: list[str]) -> str:
+    """One hash over the release's file names and contents."""
+    digest = hashlib.sha256()
+    for name in sorted(files):
+        digest.update(name.encode() + b"\0")
+        digest.update((Path(root) / name).read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def preflight(root: Path = ROOT, tests: bool = True, log=print) -> dict:
     files = tracked_files(root)
+    # Taken before anything is checked: the release must be these bytes.
+    # The tests take ten minutes, and a tree edited meanwhile would ship
+    # what was never tested under a stamp saying it was clean.
+    checked = fingerprint(root, files)
     state = git_state(root)
     log(f"Release from {state['branch']} at {state['short']}"
         + (" (with uncommitted changes: stamped dirty)" if state["dirty"] else ""))
@@ -249,7 +266,7 @@ def preflight(root: Path = ROOT, tests: bool = True, log=print) -> dict:
         log("  tests skipped (--skip-tests)")
     if problems:
         raise ReleaseError("pre-flight failed:\n  " + "\n  ".join(problems))
-    return {"files": files, **state}
+    return {"files": files, "fingerprint": checked, **state}
 
 
 def stage(root: Path, files: list[str], state: dict, out: Path) -> str:
@@ -259,10 +276,26 @@ def stage(root: Path, files: list[str], state: dict, out: Path) -> str:
                + ("-dirty" if state["dirty"] else ""))
     folder = out / release
     folder.mkdir(parents=True)
-    for name in files:
-        target = folder / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(root / name, target)
+    changed = ReleaseError("files changed while the pre-flight ran: nothing was "
+                           "sent. Deploy again from a tree nobody is editing "
+                           "(a separate `git worktree` of the commit).")
+    try:
+        for name in files:
+            target = folder / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(root / name, target)
+    except OSError:
+        # A file removed, or made unreadable, since it was checked.
+        shutil.rmtree(folder, ignore_errors=True)
+        if state.get("fingerprint"):
+            raise changed from None
+        raise
+    # The copy, not the tree, is compared: what goes is what was checked.
+    if state.get("fingerprint") and (
+            fingerprint(folder, files) != state["fingerprint"]
+            or sorted(tracked_files(root)) != sorted(files)):
+        shutil.rmtree(folder, ignore_errors=True)
+        raise changed
     (folder / "VERSION.json").write_text(json.dumps({
         "release": release, "commit": state["commit"], "branch": state["branch"],
         "dirty": state["dirty"], "built_utc": time.strftime(
