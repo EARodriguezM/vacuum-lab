@@ -17,14 +17,14 @@ SQLite file, and the panel reads accounts from it on every request.
 
 A username is the person's institutional address before the @ (webserver.py
 --email-domain, unal.edu.co by default). A request for an account proves it
-by typing a code mailed there, once the panel has an account to send from:
+with a Google sign-in, once the panel has a Google client (lab/google.py):
 
-    ./tools/users.py mail set --host smtp.gmail.com --sender "Vacuum Lab <lab@...>"
-    ./tools/users.py mail test someone@unal.edu.co
-    ./tools/users.py mail show | off
+    ./tools/users.py google set --client-file client_secret_....json
+    ./tools/users.py google test        # a real sign-in, end to end
+    ./tools/users.py google show | off
 
-The settings go in mail.json beside the database, readable by this account
-only, and are never sent to the panel's pages nor copied by backup.py.
+The client goes in google.json beside the database, readable by this account
+only, and is never sent to the panel's pages nor copied by backup.py.
 
 Passwords are asked for on the terminal, or read from standard input when
 it is not one (`echo ... | ./tools/users.py owner NAME` over ssh).
@@ -41,7 +41,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lab import auth, db as dbmod, mailer  # noqa: E402
+from lab import auth, db as dbmod, google as googlemod  # noqa: E402
 
 
 def ask_password(prompt: str = "Password") -> str:
@@ -59,43 +59,65 @@ def ask_secret(prompt: str) -> str:
     return getpass.getpass(f"{prompt}: ")
 
 
-def mail_command(args) -> int:
+def google_command(args) -> int:
     path = os.path.join(os.path.dirname(os.path.abspath(
-        args.db or dbmod.default_path())), mailer.SETTINGS_FILE)
-    if args.mail_command == "set":
-        settings = {"host": args.host.strip(), "port": args.port,
-                    "security": args.security, "username": args.user.strip(),
-                    "password": ask_secret("Password of the sending account")
-                    if args.user.strip() else "",
-                    "sender": args.sender.strip()}
-        mailer.save_settings(path, settings)
-        print(f"Saved {path} (0600). Try it: {sys.argv[0]} mail test ADDRESS")
+        args.db or dbmod.default_path())), googlemod.SETTINGS_FILE)
+    if args.google_command == "set":
+        if args.client_file:
+            settings = googlemod.read_client_file(args.client_file)
+        elif args.client_id:
+            settings = {"client_id": args.client_id.strip(),
+                        "client_secret": ask_secret("Client secret").strip()}
+        else:
+            raise ValueError("give --client-file (the JSON Google Cloud gives "
+                             "for download) or --client-id")
+        googlemod.save_settings(path, settings)
+        print(f"Saved {path} (0600). Try it: {sys.argv[0]} google test")
         return 0
-    if args.mail_command == "off":
+    if args.google_command == "off":
         if os.path.exists(path):
             os.unlink(path)
-        print("No mail account: requests' addresses are no longer checked.")
+        print("No Google sign-in: requests' accounts are no longer checked.")
         return 0
-    settings = mailer.Mailer(path).settings()
+    google = googlemod.Google(path)
+    settings = google.settings()
     if settings is None:
-        print(f"No usable mail account in {path}.")
-        return 1 if args.mail_command == "test" else 0
-    if args.mail_command == "show":
-        shown = {k: v for k, v in settings.items() if k != "password"}
-        shown["password"] = "set" if settings.get("password") else "none"
-        for key, value in shown.items():
-            print(f"{key:<9} {value}")
+        print(f"No usable Google client in {path}.")
+        return 1 if args.google_command == "test" else 0
+    if args.google_command == "show":
+        print(f"client_id      {settings['client_id']}")
+        print("client_secret  set")
         return 0
+    # test: a real sign-in, as a person asking for an account would do it.
     try:
-        mailer.Mailer(path).send(args.address, "Test from the vacuum lab panel",
-                                 "This account can send the panel's sign-up "
-                                 "codes.\n")
-    except Exception as exc:                      # MailError, or a bug in it
-        print(f"Not sent: {exc if isinstance(exc, mailer.MailError) else type(exc).__name__}",
-              file=sys.stderr)
+        started = google.start()
+        print(f"On a phone or a computer, open {started['url']}, sign in with an "
+              f"@{args.domain} account and type:\n\n    {started['user_code']}\n")
+        interval = max(auth.GOOGLE_POLL_MIN_S, started["interval"])
+        deadline = time.monotonic() + min(started["expires_in"], 600)
+        while time.monotonic() < deadline:
+            time.sleep(interval)
+            state, claims = google.poll(started["device_code"])
+            if state == "slow_down":
+                interval += 5
+            elif state in ("denied", "expired"):
+                print(f"The sign-in was {state}.")
+                return 1
+            elif state == "ok":
+                identity, problem = auth.google_identity(
+                    claims, settings["client_id"], args.domain)
+                if problem:
+                    print(f"Google answered, but a request would be refused: "
+                          f"{problem}")
+                    return 1
+                print(f"Works: a request from this account would be "
+                      f"{identity['username']} ({identity['name']}).")
+                return 0
+    except googlemod.GoogleError as exc:
+        print(f"Google sign-in failed: {exc}", file=sys.stderr)
         return 1
-    print(f"Sent to {args.address}.")
-    return 0
+    print("No sign-in within 10 minutes.")
+    return 1
 
 
 def main() -> int:
@@ -121,9 +143,9 @@ def main() -> int:
                                                 "the account's sessions")
     passwd.add_argument("username")
 
-    unconfirmed = ("let in a request that never confirmed its institutional "
-                   "address -- only after checking it is the person it names: "
-                   "while unconfirmed, the request may be anybody's")
+    unconfirmed = ("let in a request that was not verified with Google -- "
+                   "only after checking it is the person it names: unverified, "
+                   "the request may be anybody's")
     role = commands.add_parser("role", help="set a role: viewer, operator, "
                                             "admin")
     role.add_argument("username")
@@ -137,30 +159,26 @@ def main() -> int:
         if name == "enable":
             sub.add_argument("--unconfirmed", action="store_true", help=unconfirmed)
 
-    mail = commands.add_parser("mail", help="the account that mails sign-up "
-                                            "codes to institutional addresses")
-    mail_commands = mail.add_subparsers(dest="mail_command", required=True)
-    setting = mail_commands.add_parser("set", help="set the sending account "
-                                                   "(asks for its password)")
-    setting.add_argument("--host", required=True, help="e.g. smtp.gmail.com")
-    setting.add_argument("--port", type=int, default=587)
-    setting.add_argument("--security", choices=mailer.SECURITY,
-                         default="starttls", help="starttls (587), ssl (465), "
-                                                  "or none for a local relay")
-    setting.add_argument("--user", default="", help="the login, usually the "
-                                                    "sender's address")
-    setting.add_argument("--sender", required=True,
-                         help='"Vacuum Lab <lab@example.org>"')
-    mail_commands.add_parser("show", help="the settings, without the password")
-    trying = mail_commands.add_parser("test", help="send a test message")
-    trying.add_argument("address")
-    mail_commands.add_parser("off", help="remove the settings")
+    google = commands.add_parser("google", help="the Google client that "
+                                                "verifies requests for an account")
+    google_commands = google.add_subparsers(dest="google_command", required=True)
+    setting = google_commands.add_parser(
+        "set", help="set the client (type 'TVs and Limited Input devices')")
+    setting.add_argument("--client-file", default="",
+                         help="the JSON Google Cloud gives for download")
+    setting.add_argument("--client-id", default="",
+                         help="or the client ID (the secret is asked for)")
+    google_commands.add_parser("show", help="the client, without its secret")
+    trying = google_commands.add_parser("test", help="a real sign-in, end to end")
+    trying.add_argument("--domain", default=auth.EMAIL_DOMAIN,
+                        help="the institution's domain (webserver.py --email-domain)")
+    google_commands.add_parser("off", help="remove the client")
 
     args = parser.parse_args()
-    if args.command == "mail":
+    if args.command == "google":
         try:
-            return mail_command(args)
-        except ValueError as exc:
+            return google_command(args)
+        except (ValueError, OSError) as exc:
             print(f"refused: {exc}", file=sys.stderr)
             return 1
     database = dbmod.Database(args.db)
@@ -192,7 +210,7 @@ def run(args, database: "dbmod.Database") -> int:
             waiting = ""
             if user["kind"] == "person" and user["status"] == "pending":
                 age = max(0, time.time() - user["created_at"]) / 60
-                waiting = (f"  [address {'confirmed' if user.get('email_verified_at') else 'NOT confirmed'}, "
+                waiting = (f"  [{'verified with Google' if user.get('email_verified_at') else 'NOT verified'}, "
                            f"asked {age:.0f} min ago]")
             print(f"{user['username']:<20} {user['kind']:<7} "
                   f"{user['status']:<9} {user['role'] or '-':<9} "
@@ -204,18 +222,17 @@ def run(args, database: "dbmod.Database") -> int:
     user = database.user_by_name(args.username.strip().lower())
     if user is None:
         raise ValueError(f"no account named {args.username!r}")
-    # While the panel mails codes, a pending request whose address was never
-    # confirmed may be anybody's -- somebody else may have asked first for
-    # this name. Letting it in from here takes saying so.
-    mail_path = os.path.join(os.path.dirname(os.path.abspath(
-        args.db or dbmod.default_path())), mailer.SETTINGS_FILE)
+    # While requests are verified with Google, one that was not may be
+    # anybody's. Letting it in from here takes saying so.
+    google_path = os.path.join(os.path.dirname(os.path.abspath(
+        args.db or dbmod.default_path())), googlemod.SETTINGS_FILE)
     if (args.command in ("role", "enable") and user["kind"] == "person"
             and user["status"] == "pending" and not user.get("email_verified_at")
-            and mailer.Mailer(mail_path).configured
+            and googlemod.Google(google_path).configured
             and not getattr(args, "unconfirmed", False)):
-        raise ValueError(f"{user['username']} has not confirmed the address the "
-                         "code was mailed to, so this request may not be theirs. "
-                         "Check with the person, then add --unconfirmed")
+        raise ValueError(f"{user['username']}'s request was not verified with "
+                         "Google, so it may not be theirs. Check with the "
+                         "person, then add --unconfirmed")
 
     if args.command == "passwd":
         if user["kind"] != "person":
@@ -250,7 +267,7 @@ def run(args, database: "dbmod.Database") -> int:
               f"{database.role(user['id'], chamber)}.")
     database.add_event(None, "action", f"Account {user['username']}: "
                                        f"{args.command} on the machine"
-                                       + (" without a confirmed address"
+                                       + (" without a Google verification"
                                           if getattr(args, "unconfirmed", False)
                                           else ""),
                        user=user["username"])

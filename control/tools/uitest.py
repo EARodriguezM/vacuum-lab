@@ -646,6 +646,10 @@ def part_form(chrome, server, sessions, report, shots):
     page.wait("document.querySelector(\"[data-test='run-start'], [data-test='run-new']\")")
     if click(page, "run-new"):
         page.wait("document.querySelector(\"[data-test='run-start']\")")
+    # The form fills in its defaults just after it appears: a field cleared
+    # before that is filled in again, and Start rightly stays enabled.
+    page.wait("[...document.querySelectorAll(\"input[data-test^='recipe-field-']\")]"
+              ".every(e => e.value !== '')", timeout=10)
     field = page.js("(() => { const e = document.querySelector("
                     "\"[data-test^='recipe-field-'] input[type='number'],"
                     " input[data-test^='recipe-field-'][type='number']\");"
@@ -759,55 +763,61 @@ def part_history(chrome, server, sessions, report, shots):
 
 
 def part_signup(chrome, server, sessions, report, shots):
-    """Asking for an account from a phone: the institutional username, the
-    code mailed there, and the admin seeing it confirmed."""
-    from lab import mailer
-    from tools.fake_smtp import FakeSMTP
-    smtp = FakeSMTP()
-    path = os.path.join(server.folder, mailer.SETTINGS_FILE)
-    mailer.save_settings(path, smtp.settings())
+    """Asking for an account from a phone: a Google sign-in proves the
+    institutional account, then a password; the admin sees it verified."""
+    from lab import google as googlemod
+    from tools.fake_google import FakeGoogle
+    google = FakeGoogle()
+    google.interval = 1
+    urls = (googlemod.DEVICE_URL, googlemod.TOKEN_URL)
+    googlemod.DEVICE_URL, googlemod.TOKEN_URL = google.device_url, google.token_url
+    path = os.path.join(server.folder, googlemod.SETTINGS_FILE)
+    googlemod.save_settings(path, google.settings())
     try:
         page = chrome.page(*SIZES["phone"])
         open_as(page, server.base, None, "dashboard")
         page.wait("document.querySelector(\"[data-test='signin-mode-signup']\")")
         click(page, "signin-mode-signup")
-        page.wait("document.querySelector(\"[data-test='signup-username']\")")
-        note = page.js("document.querySelector(\"[data-test='signup-username']\")"
-                       ".closest('.field').innerText") or ""
-        report.check("the sign-up form asks for the institutional username",
-                     "@unal.edu.co" in note, " ".join(note.split())[:120])
-        audit(page, report, "sign-up form", shots)
-        type_into(page, "signup-username", "Nina.Ruiz@unal.edu.co")
+        page.wait("document.querySelector(\"[data-test='signup-password']\")")
+        typed = page.js("!!document.querySelector(\"[data-test='signup-username']\")")
+        report.check("with Google set up, nobody types a username: the password "
+                     "and note first, then Google", not typed)
+        audit(page, report, "sign-up: password first", shots)
         type_into(page, "signup-password", "nina-pass-1")
         type_into(page, "signup-repeat", "nina-pass-1")
+        type_into(page, "signup-note", "uitest")
         settle(page)
         click(page, "signup-submit")
-        asked = page.wait("document.querySelector(\"[data-test='signup-code']\")",
-                          timeout=15)
-        codes = smtp.codes("nina.ruiz@unal.edu.co")
-        report.check("a code is mailed to the address, and the page asks for it",
-                     asked and len(codes) == 1, f"{len(codes)} mailed")
+        code = (page.wait("(document.querySelector(\"[data-test='signup-code']\")"
+                          " || {}).innerText", timeout=15) or "").strip()
+        report.check("a code to type at google.com/device is shown",
+                     code and "google.com/device" in page.js("document.body.innerText"),
+                     code)
         audit(page, report, "sign-up: the code", shots)
-        type_into(page, "signup-code", codes[0] if codes else "")
-        settle(page)
-        click(page, "signup-confirm")
-        done = page.wait("document.body.innerText.includes('Address confirmed')",
-                         timeout=10)
+        if code:
+            google.approve(code, "nina.ruiz@unal.edu.co", "Nina Ruiz")
+        done = page.wait("document.body.innerText.includes('Request sent, as Nina Ruiz')",
+                         timeout=20)
         user = server.app.db.user_by_name("nina.ruiz") or {}
-        report.check("typed back, the address is confirmed",
-                     done and user.get("email_verified_at"),
-                     f"page {bool(done)}, stored {user.get('email_verified_at')}")
+        report.check("once the person accepts at Google, the request is made by "
+                     "itself, for the account Google proved",
+                     done and user.get("email_verified_at")
+                     and user.get("display_name") == "Nina Ruiz"
+                     and user.get("note") == "uitest",
+                     f"page {bool(done)}, stored {user.get('username')}")
+        audit(page, report, "sign-up: sent", shots)
         admin = chrome.page(*SIZES["tablet"])
         open_as(admin, server.base, sessions["admin"], "settings")
-        shown = admin.wait("(document.querySelector(\"[data-test='address-nina.ruiz']\")"
-                           " || {}).innerText", timeout=15) or ""
-        report.check("the People page shows the request's address confirmed",
-                     "confirmed" in shown and "not" not in shown, shown)
-        audit(admin, report, "People with a confirmed request", shots)
+        listed = admin.wait("(document.querySelector(\"[data-test='address-nina.ruiz']\")"
+                            " || {}).innerText", timeout=15) or ""
+        report.check("the People page shows the request verified with Google",
+                     "verified with Google" in listed, listed)
+        audit(admin, report, "People with a verified request", shots)
     finally:
         if os.path.exists(path):
             os.unlink(path)
-        smtp.close()
+        googlemod.DEVICE_URL, googlemod.TOKEN_URL = urls
+        google.close()
 
 
 def _wait(predicate, timeout: float) -> bool:

@@ -66,6 +66,8 @@ import threading
 import time
 from dataclasses import dataclass
 
+from lab import logs
+
 ROLES = ("viewer", "operator", "admin", "owner")
 RANK = {role: index for index, role in enumerate(ROLES)}
 
@@ -121,24 +123,20 @@ MAX_PENDING = 50
 #: Accounts are the people of one institution: a username is the part of
 #: their institutional address before the @ (webserver.py --email-domain).
 EMAIL_DOMAIN = "unal.edu.co"
-#: The code mailed there when somebody asks for an account (lab/mailer.py):
-#: digits, as a phone's mail shows them; good for 30 minutes and 5 tries.
-EMAIL_CODE_DIGITS = 6
-EMAIL_CODE_TTL_S = 30 * 60
-EMAIL_CODE_TRIES = 5
-#: At least a minute between two codes for one account, at most 5 a day.
-EMAIL_RESEND_S = 60
-EMAIL_SENDS_PER_DAY = 5
-#: Mail the panel sends in an hour and in a day, everybody together: a
-#: flood of sign-ups must not get the sending account blocked as a spammer.
-MAIL_PER_HOUR = 30
-MAIL_PER_DAY = 200
-#: Codes typed per minute, and codes asked for per hour, from one address.
-CODE_CHECKS_PER_MINUTE = 10
-CODE_REQUESTS_PER_HOUR = 10
-#: How long a request waits for another's mail to go (each send is bounded
-#: by mailer.SEND_TIMEOUT_S), before it is told the panel is busy.
-SEND_LOCK_WAIT_S = 20.0
+#: A request proves whose it is by a Google sign-in (lab/google.py): the
+#: device flow's code lives as long as Google says, at most this long. The
+#: request is made the moment Google says whose account it was.
+GOOGLE_FLOW_S = 30 * 60
+#: A finished sign-in keeps its answer this long, for a poll that asks again
+#: (its reply lost on the way, the panel busy): "done", not "start again".
+GOOGLE_DONE_S = 120.0
+#: Sign-ins being waited for at once, and started per hour from one address
+#: and from everybody: each one is a request to Google.
+GOOGLE_FLOWS_MAX = 50
+GOOGLE_STARTS_PER_HOUR = 10
+GOOGLE_STARTS_PER_HOUR_ALL = 60
+#: Google asks to be polled no faster than this (and slower when it says so).
+GOOGLE_POLL_MIN_S = 5.0
 
 
 # --- passwords and tokens --------------------------------------------------
@@ -202,9 +200,6 @@ def normalise_code(code: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(code or "").upper())
 
 
-def _email_digest(salt: str, code: str) -> str:
-    return hashlib.sha256(f"{salt}:{code}".encode("utf-8")).hexdigest()
-
 
 def check_username(username: str) -> str | None:
     # fullmatch, not match: `$` also matches before a final newline.
@@ -212,6 +207,35 @@ def check_username(username: str) -> str | None:
         return ("A username is 3 to 32 characters: lower-case letters, digits, "
                 "dots, dashes or underscores, starting with a letter or digit.")
     return None
+
+
+def google_identity(claims: dict, client_id, domain: str) -> tuple[dict | None, str | None]:
+    """The username and name a Google ID token vouches for, or why it does
+    not: meant for this client, unexpired, an address Google verified, and
+    an account of the institution's own organization (`hd`) -- an address at
+    the domain is not enough alone, a personal Google account can carry any
+    address it has verified."""
+    from lab import google as googlemod
+    audience = claims.get("aud")
+    audiences = audience if isinstance(audience, list) else [audience]
+    try:
+        expires = float(claims.get("exp", 0))
+    except (TypeError, ValueError):
+        expires = 0.0
+    if (claims.get("iss") not in googlemod.ISSUERS or not client_id
+            or client_id not in audiences or expires < googlemod.now() - 60):
+        return None, "Google's answer was not meant for this panel."
+    if claims.get("email_verified") not in (True, "true"):
+        return None, "Google has not verified that account's address."
+    email = str(claims.get("email") or "").strip().lower()
+    if claims.get("hd") != domain or not email.endswith(f"@{domain}"):
+        return None, (f"Sign in with your institutional account (@{domain}), "
+                      f"not {email[:80] or 'that one'}.")
+    username = email[:-len(domain) - 1]
+    if check_username(username):
+        return None, f"{email[:80]} cannot be a username here; ask an admin."
+    name = " ".join(str(claims.get("name") or "").split())[:60] or username
+    return {"username": username, "name": name, "email": email}, None
 
 
 def check_password(password: str, username: str = "") -> str | None:
@@ -446,22 +470,20 @@ class Auth:
 
     def __init__(self, database, chamber: str, enabled: bool = True,
                  idle_s: float = IDLE_S, run_idle_s: float = RUN_IDLE_S,
-                 runner=None, email_domain: str = EMAIL_DOMAIN, mailer=None):
+                 runner=None, email_domain: str = EMAIL_DOMAIN, google=None):
         self.db = database
         self.chamber = chamber
         self.enabled = enabled
-        #: Whose usernames these are, and what mails the code there
-        #: (lab/mailer.py; None or unconfigured: nobody's address is checked).
+        #: Whose usernames these are, and who proves it (lab/google.py; None
+        #: or not set up: nobody's account is checked).
         self.email_domain = str(email_domain or EMAIL_DOMAIN).strip().lower()
-        self.mailer = mailer
-        self._mail_sent = Budget(MAIL_PER_HOUR, 3600.0)
-        self._mail_daily = Budget(MAIL_PER_DAY, 86400.0)
-        self._code_checks = Budget(CODE_CHECKS_PER_MINUTE)
-        self._code_requests = Budget(CODE_REQUESTS_PER_HOUR, 3600.0)
-        #: One code mailed at a time, and one checked at a time: a burst in
-        #: parallel must not pass a limit before any of it is counted.
-        self._mail_lock = threading.Lock()
-        self._codes_lock = threading.Lock()
+        self.google = google
+        #: Google sign-ins being waited for, by the hash of the token the
+        #: browser holds for each (only it can poll it or use it).
+        self._flows: dict[str, dict] = {}
+        self._flows_lock = threading.Lock()
+        self._google_starts = Budget(GOOGLE_STARTS_PER_HOUR, 3600.0)
+        self._google_starts_all = Budget(GOOGLE_STARTS_PER_HOUR_ALL, 3600.0)
         #: How long a person may go untouched and still act, and how long
         #: when the run that is going is theirs (webserver.py --idle-minutes,
         #: --run-idle-minutes).
@@ -842,55 +864,59 @@ class Auth:
 
     def signup(self, username: str, display_name: str, password: str,
                note: str = "", address: str = "") -> dict:
-        """Ask for an account. It does nothing until an admin approves it."""
+        """Ask for an account with a typed username: only while no Google
+        sign-in is set up. It does nothing until an admin approves it."""
         if not self.enabled:
             return refusal("Accounts are switched off on this server.", 400)
-        now = time.monotonic()
-        with self._lock:
-            recent = [t for t in self._signups.get(address, []) if now - t < 3600]
-            if len(recent) >= SIGNUPS_PER_HOUR:
-                return refusal("Too many requests from this address. Try again "
-                               "later.", 429)
-            recent.append(now)
-            self._signups[address] = recent
+        if self.verifying:
+            return refusal("Requests here start with a Google sign-in of your "
+                           "institutional account: use Verify with Google.", 400)
+        if self._signup_limited(address):
+            return refusal("Too many requests from this address. Try again "
+                           "later.", 429)
         name, problem = self.username_from(username)
         problem = problem or check_password(password, name)
         if problem:
             return refusal(problem, 400)
         display = " ".join(str(display_name or "").split())[:60] or name
-        pending = [u for u in self.db.users(self.chamber)
-                   if u["status"] == "pending"]
-        if len(pending) >= MAX_PENDING:
+        if self._too_many_pending():
             return refusal("Too many requests are already waiting. Ask an "
                            "admin.", 429)
-        hashed = hash_password(password)
         try:
-            user = self.db.create_user(name, hashed, display_name=display,
-                                       status="pending", note=str(note or "")[:300])
+            self.db.create_user(name, hash_password(password), display_name=display,
+                                status="pending", note=str(note or "")[:300])
         except sqlite3.IntegrityError:
-            user = self._replace_unconfirmed(name, hashed, display, note)
-            if user is None:
-                return refusal("That username is taken.", 409)
+            return refusal("That username is taken.", 409)
         # Only the username, which check_username has limited to letters,
         # digits and . _ - : the rest was typed by somebody nobody has
         # vouched for yet, and the activity feed is on every screen.
         self.db.add_event(None, "info",
                           f"An account was requested ({name}). An admin "
                           "approves it in Settings -> People.")
-        if not self.verifying:
-            return {"ok": True, "pending": True, "verify": False}
-        sent = self._send_code(user)
-        return {"ok": True, "pending": True, "verify": True,
-                "email": self.email_of(name), "sent": bool(sent.get("ok")),
-                "problem": None if sent.get("ok") else sent.get("error")}
+        return {"ok": True, "pending": True, "verified": False, "username": name}
+
+    def _signup_limited(self, address: str) -> bool:
+        """Counts a request from `address`; True once it has made too many."""
+        now = time.monotonic()
+        with self._lock:
+            recent = [t for t in self._signups.get(address, []) if now - t < 3600]
+            if len(recent) >= SIGNUPS_PER_HOUR:
+                return True
+            recent.append(now)
+            self._signups[address] = recent
+            return False
+
+    def _too_many_pending(self) -> bool:
+        return len([u for u in self.db.users(self.chamber)
+                    if u["status"] == "pending"]) >= MAX_PENDING
 
     # --- the institutional address -----------------------------------------
 
     @property
     def verifying(self) -> bool:
-        """Whether a request must confirm its address before approval:
-        only while the panel can send the code."""
-        return self.mailer is not None and self.mailer.configured
+        """Whether a request must prove its institutional account with Google
+        before it is taken: only while a Google client is set up."""
+        return self.google is not None and self.google.configured
 
     def email_of(self, username: str) -> str:
         return f"{username}@{self.email_domain}"
@@ -907,212 +933,186 @@ class Auth:
                               f"@{self.email_domain}.")
         return name, check_username(name)
 
-    def _replace_unconfirmed(self, name: str, hashed: str, display: str,
-                             note: str) -> dict | None:
-        """A name held by a request that never confirmed its address, and
-        whose last code has expired, goes to whoever asks for it now:
-        otherwise anybody could block a colleague's username by asking for
-        it first. Never while nothing can be confirmed (no mail set up)."""
-        if not self.verifying:
-            return None
-        # Under the codes' lock: a confirmation going on for the old request
-        # finishes first, or finds it gone.
-        with self._codes_lock:
-            old = self.db.user_by_name(name)
-            now = time.time()
-            if (not old or old["kind"] != "person" or old["status"] != "pending"
-                    or old.get("email_verified_at")
-                    or now - old["created_at"] < EMAIL_CODE_TTL_S):
-                return None
-            code = self.db.email_code(name)
-            if (code and code["code_hash"] and code["user_uuid"] == old["uuid"]
-                    and now < code["expires_at"]):
-                return None
-            if not self.db.delete_unconfirmed_request(old["id"], old["uuid"]):
-                return None
-            self.db.void_email_code(name)
-            try:
-                made = self.db.create_user(name, hashed, display_name=display,
-                                           status="pending",
-                                           note=str(note or "")[:300])
-            except sqlite3.IntegrityError:
-                return None
-        self.db.add_event(None, "info", f"An unconfirmed account request for "
-                                        f"{name} was replaced by a new one.")
-        return made
+    def _identity(self, claims: dict) -> tuple[dict | None, str | None]:
+        """The username and name Google vouches for, or why it does not."""
+        settings = self.google.settings() or {}
+        return google_identity(claims, settings.get("client_id"), self.email_domain)
 
-    def _requester(self, name: str, password: str,
-                   address: str) -> tuple[dict | None, dict | None]:
-        """The request still waiting under `name`, if `password` is the one
-        chosen when it was made; else the refusal. The code alone is not
-        enough: it proves somebody reads the inbox, not that they made this
-        request -- with it alone, a stranger who asked first for a
-        colleague's username would have the colleague confirm it for them.
-        A password guess like a sign-in, so it is checked like one: budgeted
-        per address, throttled per name and address, the same cost for a
-        name that does not exist."""
-        # Keys of their own: wrong passwords here must not hold up sign-in
-        # from the same address -- all of loopback is one address, the kiosk
-        # tablet beside the rig among it. The hashing budget is shared: it
-        # is one machine's share of the slots, whatever the hash is for.
-        keys = (f"request:{name}@{address}", f"request-addr:{address}")
+    def google_start(self, address: str = "", password: str = "",
+                     note: str = "") -> dict:
+        """A request for an account, waiting for a Google sign-in: the code to
+        type at Google's device page, and the token the browser polls with.
+        The password and the note are given now and kept (the password
+        hashed) with the sign-in; the request is made the moment Google says
+        whose account it was -- so no verified identity ever waits on a
+        screen for somebody else to finish."""
+        if not self.enabled:
+            return refusal("Accounts are switched off on this server.", 400)
+        if not self.verifying:
+            return refusal("This server has no Google sign-in set up.", 409)
+        from lab import google as googlemod
+        problem = check_password(password)
+        if problem:
+            return refusal(problem, 400)
+        with self._flows_lock:
+            self._prune_flows()
+            crowded = len(self._flows) >= GOOGLE_FLOWS_MAX
+        if crowded:
+            return refusal("Too many sign-ins are waiting. Try again in a few "
+                           "minutes.", 429)
+        if self._google_starts.take(f"address:{address}"):
+            return refusal("Too many Google sign-ins started from here. Try "
+                           "again later.", 429)
+        if self._google_starts_all.take("all"):
+            self._google_starts.give_back(f"address:{address}")
+            return refusal("Too many Google sign-ins this hour. Try again "
+                           "later.", 429)
+
+        def give_back():
+            self._google_starts.give_back(f"address:{address}")
+            self._google_starts_all.give_back("all")
         busy = self._hash_budget(f"addr:{address}")
         if busy:
-            return None, busy
-        wait = self.throttle.begin(*keys)
-        if wait > 0:
-            seconds = math.ceil(wait)
-            return None, refusal(f"Too many wrong passwords. Try again in "
-                                 f"{seconds} s.", 429, retry_after=seconds)
-        wrong = False
+            give_back()
+            return busy
+        # For "the password cannot be the username", which is only known once
+        # Google says whose account it is: as a digest, in memory, folded the
+        # way check_password compares.
+        folded = hashlib.sha256(password.strip().lower().encode("utf-8")).hexdigest()
         try:
-            user = self.db.user_by_name(name) if name else None
-            if (user is None or user["kind"] != "person"
-                    or user["status"] != "pending" or not user["password_hash"]
-                    or user.get("email_verified_at")):
-                verify_password(str(password), self._dummy_hash())  # same cost
-                wrong = True
-            elif not verify_password(str(password), user["password_hash"]):
-                wrong = True
-        finally:
-            self.throttle.end(*keys, failed=wrong)
-        if wrong:
-            return None, refusal("No request is waiting under that username "
-                                 "with that password.", 403)
-        self.throttle.clear(keys[0])
-        return user, None
+            hashed = hash_password(password)
+            started = self.google.start()
+        except googlemod.GoogleError as exc:
+            give_back()
+            logs.error("google sign-in start", exc, logs.WARNING)
+            return refusal("Google could not be reached, or refused this panel. "
+                           "Try again later, or ask an admin.", 503)
+        except BaseException:
+            give_back()
+            raise
+        token = new_token()
+        now = time.monotonic()
+        interval = max(GOOGLE_POLL_MIN_S, started["interval"])
+        with self._flows_lock:
+            self._flows[token_hash(token)] = {
+                "device_code": started["device_code"], "interval": interval,
+                "expires": now + min(started["expires_in"], GOOGLE_FLOW_S),
+                "next": now + interval, "busy": False, "identity": None,
+                "hash": hashed, "folded": folded, "note": str(note or "")[:300],
+                "result": None}
+        return {"ok": True, "flow": token, "user_code": started["user_code"],
+                "url": started["url"],
+                "expires_in": round(min(started["expires_in"], GOOGLE_FLOW_S)),
+                "interval": interval}
 
-    def _send_code(self, user: dict) -> dict:
-        """Mail a new code to the request's institutional address. Nothing is
-        counted against the name unless the mail went."""
-        if not self._mail_lock.acquire(timeout=SEND_LOCK_WAIT_S):
-            return refusal("The panel is busy sending mail. Try again in a "
-                           "moment.", 503)
-        try:
-            name = user["username"]
-            now = time.time()
-            record = self.db.email_code(name)
-            if record:
-                since = now - record["sent_at"]
-                if 0 <= since < EMAIL_RESEND_S:
-                    return refusal("A code was sent less than a minute ago: "
-                                   "look for it, or ask again in a minute.", 429)
-                if (record["sends"] >= EMAIL_SENDS_PER_DAY
-                        and 0 <= now - record["first_sent_at"] < 86400):
-                    return refusal(f"{EMAIL_SENDS_PER_DAY} codes went to this "
-                                   "address today. Try again tomorrow.", 429)
-            if self._mail_sent.take("all"):
-                return refusal("The panel has sent all the mail it may this "
-                               "hour. Try again later.", 429)
-            if self._mail_daily.take("all"):
-                self._mail_sent.give_back("all")
-                return refusal("The panel has sent all the mail it may today. "
-                               "Try again tomorrow.", 429)
-            code = "".join(secrets.choice("0123456789")
-                           for _ in range(EMAIL_CODE_DIGITS))
-            address = self.email_of(name)
-            asked = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
-            try:
-                # Nothing typed by the requester goes into the mail but the
-                # username, which check_username limits to letters, digits
-                # and . _ - : the lab's account must not carry a stranger's
-                # words to anybody's inbox.
-                self.mailer.send(address, "Your code for the vacuum lab panel", (
-                    f"Your code is\n\n    {code}\n\n"
-                    f"Somebody asked at {asked} for the account \"{name}\" on "
-                    "the vacuum lab's control panel. If it was you, type the "
-                    "code there with the password you chose. It works for "
-                    f"{EMAIL_CODE_TTL_S // 60} minutes.\n\n"
-                    "If it was not you, ignore this message: without the code "
-                    "nothing happens. If it keeps happening, tell the lab's "
-                    "admin -- somebody else is asking for your username.\n"))
-            except Exception as exc:              # MailError, or a bug in it
-                self._mail_sent.give_back("all")
-                self._mail_daily.give_back("all")
-                # The reason is for the machine's log only: the person asking
-                # is not told which server, nor what it said.
-                print(f"!! could not mail a code to {address}: "
-                      f"{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
-                return refusal("The code could not be sent. Try again later, "
-                               "or ask an admin.", 503)
-            salt = secrets.token_hex(8)
-            self.db.set_email_code(name, user["uuid"],
-                                   f"{salt}${_email_digest(salt, code)}",
-                                   now + EMAIL_CODE_TTL_S)
-            return {"ok": True, "email": address}
-        finally:
-            self._mail_lock.release()
-
-    def request_code(self, typed: str, password: str, address: str = "") -> dict:
-        """A new code for a request still waiting to confirm its address --
-        asked for by whoever made it, so nobody can fill a colleague's inbox."""
+    def google_poll(self, flow: str, address: str = "") -> dict:
+        """Has the person signed in at Google yet? Google is asked at most
+        once per interval, whatever the browser does; once it says who, the
+        request is made, and the sign-in is gone."""
         if not self.enabled:
             return refusal("Accounts are switched off on this server.", 400)
-        if not self.verifying:
-            return refusal("This server cannot send mail; an admin checks "
-                           "requests without it.", 409)
-        name, problem = self.username_from(typed)
-        if problem:
-            return refusal(problem, 400)
-        if self._code_requests.take(f"address:{address}"):
-            return refusal("Too many codes asked for from here. Try again "
-                           "later.", 429)
-        user, refused = self._requester(name, password, address)
-        if refused:
-            return refused
-        sent = self._send_code(user)
-        return sent if not sent.get("ok") else {**sent, "verify": True}
+        from lab import google as googlemod
+        key = token_hash(str(flow or ""))
+        with self._flows_lock:
+            self._prune_flows()
+            entry = self._flows.get(key)
+            if entry is None:
+                return refusal("This Google sign-in has ended: start again.", 410)
+            if entry["result"] is not None:
+                return dict(entry["result"])
+            now = time.monotonic()
+            if entry["busy"] or (entry["identity"] is None and now < entry["next"]):
+                return {"ok": True, "state": "pending"}
+            entry["busy"] = True
+        try:
+            if entry["identity"] is None:
+                try:
+                    state, claims = self.google.poll(entry["device_code"])
+                except googlemod.GoogleError as exc:
+                    logs.error("google sign-in poll", exc, logs.WARNING)
+                    if exc.permanent:
+                        self._forget_flow(key)
+                        return refusal("Google refused this panel's sign-in: an "
+                                       "admin has to check its Google client.", 503, ended=True)
+                    state, claims = "unanswered", None
+                if state == "slow_down":
+                    entry["interval"] += 5.0
+                if state in ("pending", "slow_down", "unanswered"):
+                    return {"ok": True, "state": "pending"}
+                if state in ("denied", "expired"):
+                    self._forget_flow(key)
+                    return refusal("The Google sign-in was declined." if state == "denied"
+                                   else "The Google sign-in expired: start again.",
+                                   403 if state == "denied" else 410, ended=True)
+                identity, problem = self._identity(claims or {})
+                if problem:
+                    self._forget_flow(key)
+                    return refusal(problem, 403, ended=True)
+                # Kept on the sign-in before anything else: Google answers a
+                # device code once, and a step below may fail and be retried.
+                entry["identity"] = identity
+            return self._request_for(key, entry)
+        finally:
+            with self._flows_lock:
+                entry["busy"] = False
+                entry["next"] = time.monotonic() + entry["interval"]
 
-    def verify_email(self, typed: str, password: str, code: str,
-                     address: str = "") -> dict:
-        """The code mailed to a request's address, typed back by whoever
-        made the request (their password): the address is confirmed."""
-        if not self.enabled:
-            return refusal("Accounts are switched off on this server.", 400)
-        name, problem = self.username_from(typed)
-        if problem:
-            return refusal(problem, 400)
-        wait = self._code_checks.take(f"address:{address}")
-        if wait:
-            return refusal(f"Too many codes tried. Wait {math.ceil(wait)} s.", 429)
-        user, refused = self._requester(name, password, address)
-        if refused:
-            return refused
-        # Per name only once the password was right: a stranger's tries
-        # must not spend the person's own.
-        wait = self._code_checks.take(f"user:{name}")
-        if wait:
-            return refusal(f"Too many codes tried. Wait {math.ceil(wait)} s.", 429)
-        wrong = refusal("That code is not right, or it has expired: ask for a "
-                        "new one.", 400)
-        typed_code = re.sub(r"\D", "", str(code or ""))
-        with self._codes_lock:
-            # Again under the lock: the request may have been replaced,
-            # declined or confirmed while the password was being checked.
-            current = self.db.user_by_name(name)
-            if (not current or current["uuid"] != user["uuid"]
-                    or current["status"] != "pending"
-                    or current.get("email_verified_at")):
-                return wrong
-            record = self.db.email_code(name)
-            now = time.time()
-            if (not record or not record["code_hash"]
-                    or record["user_uuid"] != current["uuid"]
-                    or not record["sent_at"] - 60 <= now < record["expires_at"]
-                    or record["tries"] >= EMAIL_CODE_TRIES):
-                return wrong
-            salt, _, digest = record["code_hash"].partition("$")
-            if not hmac.compare_digest(_email_digest(salt, typed_code), digest):
-                self.db.count_email_try(name)
-                if record["tries"] + 1 >= EMAIL_CODE_TRIES:
-                    self.db.void_email_code(name)
-                return wrong
-            if not self.db.confirm_email(current["id"], current["uuid"], now):
-                return wrong
-            self.db.void_email_code(name)
-        self.db.add_event(None, "info", f"{name} confirmed their institutional "
-                                        f"address ({self.email_of(name)}).")
-        return {"ok": True, "verified": True}
+    def _request_for(self, key: str, entry: dict) -> dict:
+        """The request for the account Google proved, with the password and
+        note given at the start; the sign-in is used up."""
+        identity = entry["identity"]
+        name = identity["username"]
+        if hmac.compare_digest(entry["folded"], hashlib.sha256(
+                name.encode("utf-8")).hexdigest()):
+            self._forget_flow(key)
+            return refusal("The password cannot be the username: start again "
+                           "with another.", 400, ended=True)
+        old = self.db.user_by_name(name)
+        if old and not (old["kind"] == "person" and old["status"] == "pending"):
+            self._forget_flow(key)
+            return refusal(f"There is already an account for {name}: sign in "
+                           "with it, or ask an admin.", 409, ended=True)
+        if not old and self._too_many_pending():
+            self._forget_flow(key)
+            return refusal("Too many requests are already waiting. Ask an "
+                           "admin.", 429, ended=True)
+        made = self.db.create_request(name, entry["hash"], identity["name"],
+                                      entry["note"], time.time(), replacing=old)
+        if made is None:
+            self._forget_flow(key)
+            return refusal("That request changed meanwhile: start again.", 409, ended=True)
+        answer = {"ok": True, "state": "done", "identity": identity,
+                  "username": name, "replaced": bool(old)}
+        with self._flows_lock:
+            # Kept, before anything else can fail, for a poll that asks again
+            # -- which must find "done", never make the request a second
+            # time; the password's hash and digest go now.
+            entry.update(result=answer, hash="", folded="",
+                         expires=time.monotonic() + GOOGLE_DONE_S)
+        # Only the username: the name came from Google, the note was typed by
+        # somebody not approved yet, and the activity feed is on every screen.
+        # The record is the rig's log, not the request: a full disk loses the
+        # line, never the answer.
+        try:
+            self.db.add_event(None, "info", f"An account was requested ({name}), "
+                              "verified with Google"
+                              + (", replacing the request waiting under that name"
+                                 if old else "")
+                              + ". An admin approves it in Settings -> People.")
+        except Exception as exc:
+            logs.error("google sign-in record", exc)
+        return answer
+
+    def _forget_flow(self, key: str) -> None:
+        with self._flows_lock:
+            self._flows.pop(key, None)
+
+    def _prune_flows(self) -> None:
+        """Forget sign-ins past their time. Caller holds _flows_lock."""
+        now = time.monotonic()
+        for key in [k for k, v in self._flows.items()
+                    if now > v["expires"] and not v["busy"]]:
+            del self._flows[key]
 
     def me(self, principal: Principal) -> dict:
         """What the panel needs to know about whoever is looking at it."""
@@ -1401,7 +1401,9 @@ class Auth:
         return {"ok": True, "people": people, "tablets": tablets,
                 "requests": self.db.role_requests(self.chamber),
                 "email": {"domain": self.email_domain,
-                          "verifying": self.verifying},
+                          "google": self.verifying,
+                          "usable": bool(self.verifying
+                                         and self.google.settings() is not None)},
                 "you": {"username": actor.username, "role": actor.role}}
 
     def _target(self, actor: Principal, user_id: int,
@@ -1432,8 +1434,26 @@ class Auth:
             return refusal("Only the owner appoints admins.", 403)
         return None
 
-    def approve(self, actor: Principal, user_id: int, role: str) -> dict:
+    def _as_shown(self, user: dict, created_at) -> dict | None:
+        """Refuses a decision about a request that is not the one the admin
+        was shown: SQLite gives a deleted request's id to the next one, and a
+        request made again replaces the one waiting."""
+        if created_at is None:
+            return None
+        try:
+            same = float(created_at) == float(user["created_at"])
+        except (TypeError, ValueError):
+            same = False
+        return None if same else refusal(
+            "This request was made again since your page was loaded: look at "
+            "it again before deciding.", 409)
+
+    def approve(self, actor: Principal, user_id: int, role: str,
+                created_at=None) -> dict:
         user, problem = self._target(actor, user_id)
+        if problem:
+            return problem
+        problem = self._as_shown(user, created_at)
         if problem:
             return problem
         if user["status"] != "pending":
@@ -1442,24 +1462,33 @@ class Auth:
         if problem:
             return problem
         if self.verifying and not user.get("email_verified_at"):
-            return refusal(f"{user['username']} has not confirmed "
-                           f"{self.email_of(user['username'])} yet: the code "
-                           "mailed there is typed on the sign-up page. Decline "
-                           "the request if the address is not theirs.", 409)
-        self.db.update_user(user["id"], status="active")
+            return refusal(f"{user['username']}'s request was not verified with "
+                           "Google: ask them to request the account again (it "
+                           "now starts with a Google sign-in), or, once you "
+                           "have checked who they are, let them in on the "
+                           "machine with tools/users.py role ... --unconfirmed.",
+                           409)
+        # Only if it is still exactly the request just checked: a request
+        # made again in between must not be let in unseen.
+        if not self.db.activate_pending(user["id"], user["uuid"]):
+            return refusal("That request changed meanwhile: look at it again.", 409)
         self.db.set_role(user["id"], self.chamber, role, actor.username)
         self._log(actor, "action", f"{actor.name} approved {user['display_name']} "
                                    f"({user['username']}) as {role}")
         return {"ok": True}
 
-    def decline(self, actor: Principal, user_id: int) -> dict:
+    def decline(self, actor: Principal, user_id: int, created_at=None) -> dict:
         user, problem = self._target(actor, user_id)
+        if problem:
+            return problem
+        problem = self._as_shown(user, created_at)
         if problem:
             return problem
         if user["status"] != "pending":
             return refusal("Only a request still waiting can be declined; "
                            "disable an account instead.", 409)
-        self.db.delete_user(user["id"])
+        if not self.db.delete_pending(user["id"], user["uuid"]):
+            return refusal("That request changed meanwhile: look at it again.", 409)
         # The name only: the rest was typed by somebody nobody vouched for.
         self._log(actor, "action", f"{actor.name} declined the account request "
                                    f"of {user['username']}")
@@ -1614,7 +1643,7 @@ class Auth:
         return {"enabled": True,
                 "owner": bool(self.db.holders(self.chamber, "owner")),
                 "email_domain": self.email_domain,
-                "verify_email": self.verifying}
+                "google_signin": self.verifying}
 
 
 def bootstrap_owner(database, chamber: str, username: str, password: str,

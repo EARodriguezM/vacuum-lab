@@ -211,9 +211,39 @@ def _sections(folder: Path) -> None:
         return (rel.has_git(control)
                 and files == ["lab/kept.py", "lab/new.py"],
                 f"{files}, git {rel.has_git(control)}")
+    def ships_what_was_checked():
+        repo = folder / "edited"
+        (repo / "lab").mkdir(parents=True)
+        (repo / "lab" / "kept.py").write_text("x = 1\n")
+        for command in (["init", "-q"], ["add", "."],
+                        ["-c", "user.name=t", "-c", "user.email=t@t", "commit",
+                         "-qm", "start"]):
+            subprocess.run(["git", *command], cwd=repo, check=True,
+                           capture_output=True)
+        outcomes = {}
+        for change in ("none", "edited", "added", "removed"):
+            info = rel.preflight(repo, tests=False, log=lambda *a: None)
+            if change == "edited":               # while the tests would run
+                (repo / "lab" / "kept.py").write_text("x = 2\n")
+            elif change == "added":
+                (repo / "lab" / "late.py").write_text("y = 1\n")
+            elif change == "removed":
+                (repo / "lab" / "late.py").unlink()
+            out = folder / f"staged-{change}"
+            try:
+                rel.stage(repo, info["files"], info, out)
+                outcomes[change] = "staged"
+            except rel.ReleaseError:
+                outcomes[change] = ("refused, nothing left" if not any(
+                    out.iterdir()) else "refused, something left")
+        return (outcomes == {"none": "staged", "edited": "refused, nothing left",
+                             "added": "refused, nothing left",
+                             "removed": "refused, nothing left"}, str(outcomes))
     if rel.has_git(ROOT):
         attempt("a release carries what git tracks and new code beside it, "
                 "never a person's own files", what_travels)
+        attempt("what is copied is what was checked: a file edited or added "
+                "while the pre-flight ran stops the deploy", ships_what_was_checked)
         attempt("a release made in the panel's folder carries that folder "
                 "only, not the tablet's or the top of the tree", from_its_folder)
     else:
@@ -334,6 +364,25 @@ def _sections(folder: Path) -> None:
         return made is not None, error or f"deployed {made} without git"
     attempt("a deploy, given what to ship, never needs git on either side",
             no_git_needed)
+
+    def refused_before_sending():
+        stand_in, args = fresh("changed-deploy")
+        stand_in.on_restart = reports(current_name)
+        releases = Path(args.base) / "releases"
+
+        def there():
+            return sorted(p.name for p in releases.iterdir()) if releases.exists() else []
+        before = there()
+        try:
+            rel.deploy(args, log=QUIET, target=stand_in, wait=0.3,
+                       sleep=lambda s: None, info={**INFO, "fingerprint": "0" * 64})
+        except rel.ReleaseError as exc:
+            sent = [name for name in there() if name not in before]
+            return (not sent and "changed while the pre-flight" in str(exc),
+                    f"refused; sent to the target: {sent or 'nothing'}")
+        return False, "deployed files that were not what was checked"
+    attempt("a deploy whose files are not what was checked sends nothing",
+            refused_before_sending)
 
     def install_fails_halfway():
         stand_in, args = fresh("halfway", old_unit="OLD UNIT\n")

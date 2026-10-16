@@ -140,27 +140,10 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    REAL    NOT NULL,
     updated_at    REAL    NOT NULL,
     last_login_at REAL,
-    -- When the person typed back the code mailed to their institutional
-    -- address (username@domain): NULL until then, and for accounts made
-    -- before the panel could send mail.
+    -- When Google proved the request came from the institutional account
+    -- username@domain (lab/google.py): NULL for a request taken without a
+    -- Google sign-in, and for accounts made before there was one.
     email_verified_at REAL
-);
-
--- The code mailed to a person asking for an account, as a hash: typing it
--- back, with the password chosen for the request, proves the institutional
--- address exists and is theirs. Kept per username, not per account, so the
--- daily limits outlive a request replaced or declined; each code is for one
--- request (`user_uuid`) and stops working once used or replaced.
-CREATE TABLE IF NOT EXISTS email_codes (
-    username      TEXT    PRIMARY KEY COLLATE NOCASE,
-    user_uuid     TEXT    NOT NULL DEFAULT '',
-    code_hash     TEXT    NOT NULL DEFAULT '',
-    sent_at       REAL    NOT NULL,
-    expires_at    REAL    NOT NULL,
-    tries         INTEGER NOT NULL DEFAULT 0,
-    -- Codes sent since first_sent_at, for the daily limit.
-    sends         INTEGER NOT NULL DEFAULT 1,
-    first_sent_at REAL    NOT NULL
 );
 
 -- One role per account per chamber: owner, admin, operator or viewer.
@@ -258,6 +241,8 @@ class RunStillRunning(ValueError):
     """A run still marked running cannot be deleted."""
 
 #: Tables holding credentials. Dropped from every copy that leaves the box.
+#: (`email_codes` is gone since 2026-10-15; still named, so a database that
+#: has it is never copied out with it.)
 ACCOUNT_TABLES = ("sessions", "role_requests", "roles", "email_codes", "users")
 
 
@@ -335,6 +320,9 @@ class Database:
             elif column not in present:
                 self._db.execute(
                     f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+        # The codes once mailed to institutional addresses (2026-10-14/15),
+        # replaced by a Google sign-in: nothing reads them any more.
+        self._db.execute("DROP TABLE IF EXISTS email_codes")
 
     def close(self) -> None:
         with self._lock:
@@ -841,67 +829,58 @@ class Database:
                 self._db.commit()
         return self.user(user_id)
 
-    # --- the code mailed to an institutional address ---------------------
-
-    def email_code(self, username: str) -> dict | None:
-        with self._lock:
-            row = self._db.execute("SELECT * FROM email_codes WHERE username=?",
-                                   (username,)).fetchone()
-        return dict(row) if row else None
-
-    def set_email_code(self, username: str, user_uuid: str, code_hash: str,
-                       expires_at: float, day_s: float = 86400.0) -> dict:
-        """A new code replaces the last; `sends` counts the codes sent since
-        the first of the last `day_s` seconds, whichever request they were for."""
+    def create_request(self, username: str, password_hash: str, display_name: str,
+                       note: str, verified_at: float,
+                       replacing: dict | None = None) -> dict | None:
+        """A request for an account, verified at `verified_at`, in one
+        transaction: when `replacing` is the same person's own request still
+        waiting (id and uuid, as read), it is deleted first -- only if it is
+        still exactly that, pending -- so a failed insert never loses it.
+        None if the name is taken by anything else meanwhile."""
         now = time.time()
         with self._lock:
-            row = self._db.execute("SELECT * FROM email_codes WHERE username=?",
-                                   (username,)).fetchone()
-            fresh = (row is None or not 0 <= now - row["first_sent_at"] < day_s)
-            first = now if fresh else row["first_sent_at"]
-            sends = 1 if fresh else row["sends"] + 1
-            self._db.execute(
-                "INSERT OR REPLACE INTO email_codes (username, user_uuid, "
-                "code_hash, sent_at, expires_at, tries, sends, first_sent_at) "
-                "VALUES (?,?,?,?,?,0,?,?)",
-                (username, user_uuid, code_hash, now, expires_at, sends, first))
-            self._db.commit()
-        return self.email_code(username)  # type: ignore[return-value]
+            try:
+                if self._db.in_transaction:
+                    self._db.commit()
+                self._db.execute("BEGIN")
+                if replacing is not None:
+                    gone = self._db.execute(
+                        "DELETE FROM users WHERE id=? AND uuid=? AND kind='person' "
+                        "AND status='pending'", (replacing["id"], replacing["uuid"]))
+                    if gone.rowcount != 1:
+                        self._db.rollback()
+                        return None
+                cursor = self._db.execute(
+                    "INSERT INTO users (uuid, username, display_name, kind, "
+                    "password_hash, status, must_change, note, created_at, "
+                    "updated_at, email_verified_at) "
+                    "VALUES (?,?,?,'person',?,'pending',0,?,?,?,?)",
+                    (str(uuid.uuid4()), username, display_name or username,
+                     password_hash, note, now, now, verified_at))
+                self._db.commit()
+            except sqlite3.IntegrityError:
+                self._db.rollback()
+                return None
+            except Exception:
+                self._db.rollback()
+                raise
+        return self.user(cursor.lastrowid)  # type: ignore[arg-type]
 
-    def count_email_try(self, username: str) -> None:
-        with self._lock:
-            self._db.execute("UPDATE email_codes SET tries = tries + 1 "
-                             "WHERE username=?", (username,))
-            self._db.commit()
-
-    def void_email_code(self, username: str) -> None:
-        """The code stops working; the count of codes sent today stays."""
-        with self._lock:
-            self._db.execute("UPDATE email_codes SET code_hash='', expires_at=0 "
-                             "WHERE username=?", (username,))
-            self._db.commit()
-
-    def delete_unconfirmed_request(self, user_id: int, user_uuid: str) -> bool:
-        """Delete a request only if it is still that request (`uuid`: SQLite
-        gives a deleted id to the next row), a person's, pending and
-        unconfirmed -- in the same statement, so nothing changed meanwhile
-        is taken for it."""
+    def activate_pending(self, user_id: int, user_uuid: str) -> bool:
+        """Approve a request only if it is still that one (uuid) and waiting."""
         with self._lock:
             cursor = self._db.execute(
-                "DELETE FROM users WHERE id=? AND uuid=? AND kind='person' AND "
-                "status='pending' AND email_verified_at IS NULL",
-                (user_id, user_uuid))
+                "UPDATE users SET status='active', updated_at=? WHERE id=? AND "
+                "uuid=? AND status='pending'", (time.time(), user_id, user_uuid))
             self._db.commit()
             return cursor.rowcount > 0
 
-    def confirm_email(self, user_id: int, user_uuid: str, at: float) -> bool:
-        """Mark a request's address confirmed, only if it is still that
-        request, pending and unconfirmed."""
+    def delete_pending(self, user_id: int, user_uuid: str) -> bool:
+        """Decline a request only if it is still that one (uuid) and waiting."""
         with self._lock:
             cursor = self._db.execute(
-                "UPDATE users SET email_verified_at=?, updated_at=? WHERE id=? "
-                "AND uuid=? AND kind='person' AND status='pending' AND "
-                "email_verified_at IS NULL", (at, time.time(), user_id, user_uuid))
+                "DELETE FROM users WHERE id=? AND uuid=? AND status='pending'",
+                (user_id, user_uuid))
             self._db.commit()
             return cursor.rowcount > 0
 
