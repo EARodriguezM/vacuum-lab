@@ -317,11 +317,11 @@ function LostContact({ lost, error, kiosk, silence }) {
           ${lost.offline && kiosk && html`<li>the tablet's USB cable to the lab PC, or its Wi-Fi;</li>`}
           ${lost.offline && !kiosk && html`<li>that this device is on the lab's network;</li>`}
           ${lost.offline && html`<li>that the lab PC is on and its screen answers;</li>`}
-          <li>that the panel's service runs there:
+          <li>that the panel's service runs there:${" "}
             <span class="mono">systemctl status vacuum-lab-web</span>, and its
-            journal: <span class="mono">journalctl -u vacuum-lab-web -p err</span>.</li>
+            journal:${" "}<span class="mono">journalctl -u vacuum-lab-web -p err</span>.</li>
         </ul>
-        <span class="muted">${error}</span>
+        ${!lost.offline && html`<span class="muted">${error}</span>`}
       </div>
     <//>`;
 }
