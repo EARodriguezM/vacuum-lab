@@ -2267,9 +2267,15 @@ class RunEngine:
         def write():
             steps = self.by_hand_for(run_id)
             record = self.db.run(run_id)
-            if record and record.get("status") != dbmod.RUNNING:
-                self.db.set_result(run_id, {**(record.get("result") or {}),
-                                            "by_hand": steps})
+            if not record or record.get("status") == dbmod.RUNNING:
+                return
+            result = record.get("result") or {}
+            # Nothing to change -- a bake-out's clean-up tried again leaves no
+            # steps -- is nothing written: a record rewritten for no reason is
+            # one more read-and-write for anything else to race.
+            if steps == (result.get("by_hand") or []):
+                return
+            self.db.set_result(run_id, {**result, "by_hand": steps})
         self._write(write, f"the steps left by hand after run {run_id}")
 
     def _rebuild_by_hand(self, run_id, steps: list[dict]) -> None:
