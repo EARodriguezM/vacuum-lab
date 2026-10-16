@@ -276,9 +276,11 @@ def _sections(folder: Path) -> None:
         "a run": rel.idle_problem(busy, now),
         "a power-down": rel.idle_problem({**idle, "shutdown": {"active": True}},
                                          now),
+        "steps by hand": rel.idle_problem({**idle, "by_hand": 2}, now),
     }
-    check("a deploy is refused with a run going, a power-down under way, or "
-          "the rig's state unknown", all(refusals.values()),
+    check("a deploy is refused with a run going, a power-down under way, steps "
+          "left by hand unconfirmed, or the rig's state unknown",
+          all(refusals.values()),
           "; ".join(f"{k}: {(v or 'ALLOWED')[:30]}" for k, v in refusals.items()))
     check("... and allowed when the rig is idle",
           rel.idle_problem(idle, now) is None)

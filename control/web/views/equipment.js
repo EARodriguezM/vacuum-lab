@@ -32,15 +32,20 @@ const ACTUATOR_ABOUT = {
 export function equipmentTabs(state) {
   const devices = state?.devices || {};
   const order = state?.order || Object.keys(devices);
+  // Each with a mark and a word, never a colour alone.
   const instruments = order.filter((key) => devices[key]).map((key) => ({
     key, label: devices[key].label || key, kind: devices[key].kind,
     type: "device", tone: devices[key].connected ? "good" : "crit",
+    mark: devices[key].connected ? "✓" : "✕",
+    state: devices[key].connected ? "connected" : "no contact",
   }));
   const actuators = (state?.actuators || [])
     .filter((actuator) => actuator.installed !== false)
     .map((actuator) => ({
       key: actuator.key, label: actuator.label, type: "actuator", actuator,
       tone: actuator.available ? "good" : "idle",
+      mark: actuator.available ? "✓" : "○",
+      state: actuator.available ? "driven" : "manual",
     }));
   return [...instruments, ...actuators];
 }
@@ -155,9 +160,11 @@ export function EquipmentView({ state, sub, onSelect, pumpProps, gaugeProps }) {
         ${tabs.map((tab) => html`
           <button key=${tab.key} aria-current=${tab.key === active.key ? "page" : null}
                   data-test=${`subtab-${tab.key}`} onClick=${() => onSelect(tab.key)}>
-            <span class=${`dot-mark ${tab.tone}`} aria-hidden="true" />${tab.label}
+            <span class=${`dot-mark ${tab.tone}`} aria-hidden="true">${tab.mark}</span>${tab.label}
             ${tab.type === "actuator" && !tab.actuator.available
-              ? html`<span class="off-tag">manual</span>` : null}
+              ? html`<span class="off-tag">manual</span>`
+              : tab.tone === "crit" ? html`<span class="off-tag">no contact</span>`
+              : html`<span class="sr-only">, ${tab.state}</span>`}
           </button>`)}
       </nav>
       ${page}
@@ -165,7 +172,7 @@ export function EquipmentView({ state, sub, onSelect, pumpProps, gaugeProps }) {
         <p class="small muted">
           Not on the rig, so not listed: ${hidden.map((a) => a.label).join(", ")}.
           An admin marks equipment installed under${" "}
-          <a href="#settings">Settings → Rig equipment</a>.
+          <a href="#settings/rig">Settings → Rig</a>.
         </p>`}
     </div>`;
 }

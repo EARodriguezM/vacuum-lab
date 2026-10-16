@@ -388,6 +388,9 @@ def idle_problem(state: dict | None, now: float | None, max_age: float = 30.0,
             return "a power-down is under way: a restart would leave it unfinished"
         if state.get("securing"):
             return "the pump is being made safe after a fault"
+        if state.get("by_hand"):
+            return (f"the last run left {state['by_hand']} step(s) to do by hand "
+                    f"that nobody has confirmed: a restart would forget them")
     if force:
         return None
     if state is None:

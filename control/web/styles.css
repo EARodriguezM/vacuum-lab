@@ -10,14 +10,18 @@
  * Aqua sits at 2.69:1 on the light surface, below the 3:1 bar, so every chart
  * that uses it ships a direct label on the series and a table/CSV view of the
  * same numbers. That is the required relief, not an optional nicety.
+ *
+ * Text tokens on the light theme are dark enough for small type: --ink-faint
+ * was #7d8a93 (3.4:1 on the card) and --warn #a8791a (3.5:1); both now pass
+ * 4.5:1 (2026-10-16).
  */
 
 :root {
   --paper:#eef1f2; --card:#f8fafa; --sunk:#e9eeef; --ink:#141b21;
-  --ink-soft:#4a565f; --ink-faint:#7d8a93; --rule:#ccd5d8;
+  --ink-soft:#4a565f; --ink-faint:#5d6971; --rule:#ccd5d8;
   --accent:#0d6d78; --accent-ink:#fff; --accent-soft:#dceef0;
-  --good:#2c7a5b; --good-bg:#e3f2ea; --warn:#a8791a; --warn-bg:#fdf3e0;
-  --crit:#b8372c; --crit-bg:#fbe9e7; --idle:#6f7a82; --idle-bg:#e8edee;
+  --good:#2c7a5b; --good-bg:#e3f2ea; --warn:#7d5a0f; --warn-bg:#fdf3e0;
+  --crit:#b8372c; --crit-bg:#fbe9e7; --idle:#5f6a72; --idle-bg:#e8edee;
   --field:#fff;
   --series-1:#2a78d6; --series-2:#eb6834; --series-3:#1baf7a;
   --grid:#e1e0d9; --axis:#c3c2b7; --muted:#898781; --context:#a9b2b8;
@@ -68,6 +72,17 @@ h3 { font-size:14px; font-weight:640; }
 /* ---------- shell ---------- */
 .wrap { max-width:1180px; margin:0 auto; padding:16px 16px 80px;
         display:flex; flex-direction:column; gap:16px; }
+.wrap-inner { display:flex; flex-direction:column; gap:16px; min-width:0; position:relative; }
+/* No answer from the lab PC: what is on screen is from before, and looks it.
+   A veil over the content, never a filter or opacity on it: those make this
+   box the frame of every fixed dialog inside it, which then moved off screen. */
+.wrap-inner.stale::after { content:""; position:absolute; inset:0; pointer-events:none;
+  background:color-mix(in srgb, var(--paper) 45%, transparent);
+  -webkit-backdrop-filter:grayscale(1); backdrop-filter:grayscale(1); }
+/* For a screen reader only: a live region, a word beside a mark. */
+.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px;
+           overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+.plain-list { margin:4px 0; padding-left:18px; }
 
 header.top { display:flex; flex-wrap:wrap; gap:12px; align-items:center;
              justify-content:space-between; }
@@ -76,9 +91,14 @@ header.top { display:flex; flex-wrap:wrap; gap:12px; align-items:center;
 .top-actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 
 /* Tabs scroll horizontally on a phone rather than wrapping into a block. */
+/* Positioned, so what is hidden inside a tab (a word for a screen reader)
+   scrolls and clips with the strip instead of widening the page. */
 nav.tabs { display:flex; gap:4px; overflow-x:auto; scrollbar-width:none;
-           border-bottom:1px solid var(--rule); padding-bottom:0; }
+           border-bottom:1px solid var(--rule); padding-bottom:0; position:relative; }
 nav.tabs::-webkit-scrollbar { display:none; }
+/* More tabs to the right than fit: the edge fades, until scrolled there. */
+nav.tabs.more { -webkit-mask-image:linear-gradient(to right, #000 calc(100% - 36px), transparent);
+                mask-image:linear-gradient(to right, #000 calc(100% - 36px), transparent); }
 nav.tabs button {
   flex:0 0 auto; background:none; border:none; border-bottom:2px solid transparent;
   color:var(--ink-soft); font:inherit; font-size:14.5px; font-weight:560;
@@ -160,8 +180,8 @@ button.danger:hover:not(:disabled) { background:var(--crit-bg); }
 button.ghost { background:none; border-color:transparent; padding:6px 9px; min-height:32px; }
 button.small { font-size:12.5px; padding:5px 10px; min-height:30px; }
 
-label.field, div.field { display:flex; flex-direction:column; gap:4px; font-size:12.5px;
-              color:var(--ink-soft); font-weight:560; min-width:0; }
+label.field, div.field, form.field { display:flex; flex-direction:column; gap:4px;
+              font-size:12.5px; color:var(--ink-soft); font-weight:560; min-width:0; }
 /* The code a person types at google.com/device, read off this screen. */
 .device-code { font-size:26px; font-weight:650; letter-spacing:.12em; text-align:center;
                padding:12px; border-radius:8px; border:1px dashed var(--rule);
@@ -342,8 +362,12 @@ button.tiny { font-size:11.5px; padding:2px 8px; min-height:24px; }
 
 .toast-stack { position:fixed; right:14px; bottom:14px; z-index:60;
                display:flex; flex-direction:column; gap:8px; max-width:min(92vw,400px); }
-.toast { border-radius:9px; padding:10px 13px; font-size:13.5px;
-         border:1px solid var(--rule); background:var(--card); box-shadow:var(--shadow); }
+.toast { border-radius:9px; padding:8px 6px 8px 13px; font-size:13.5px;
+         border:1px solid var(--rule); background:var(--card); box-shadow:var(--shadow);
+         display:flex; gap:8px; align-items:flex-start; }
+.toast > span { flex:1; padding-top:2px; }
+.toast .toast-close { min-height:28px; padding:0 8px; font-size:18px; line-height:1;
+                      color:inherit; }
 .toast.error { border-color:var(--crit); color:var(--crit); background:var(--crit-bg); }
 .toast.ok    { border-color:var(--good); color:var(--good); background:var(--good-bg); }
 
@@ -413,11 +437,22 @@ button.tiny { font-size:11.5px; padding:2px 8px; min-height:24px; }
 .actuator-table td { padding:9px 8px; font-size:14.5px; }
 .actuator-table td:first-child { color:var(--ink-soft); }
 
-/* ---------- operator prompt ---------- */
-.prompt-card { border:2px solid var(--warn); background:var(--warn-bg); }
-.prompt-head { display:flex; justify-content:space-between; align-items:center; }
+/* ---------- what a person must do ----------
+ * A guided run's step and what a run's ending left by hand: on every page,
+ * under the header, as loud as an alarm but not red -- nothing is wrong. */
+.prompt-bar, .checklist-bar { border:2px solid var(--warn); background:var(--warn-bg);
+                              border-radius:10px; padding:12px 14px; display:flex;
+                              flex-direction:column; gap:8px; }
+.checklist-bar { border-color:var(--crit); background:var(--crit-bg); }
+.prompt-head { display:flex; gap:10px; align-items:center; flex-wrap:wrap; color:var(--ink); }
 .prompt-text { font-size:clamp(16px,2.6vw,20px); font-weight:600;
                color:var(--ink); margin:0; line-height:1.4; }
+.prompt-note { margin:0; font-size:14px; color:var(--ink-soft); }
+.checklist { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:6px; }
+.checklist li { display:flex; gap:10px; align-items:center; justify-content:space-between;
+                background:var(--card); border:1px solid var(--rule); border-radius:8px;
+                padding:8px 10px; color:var(--ink); }
+.checklist-text { display:flex; flex-direction:column; }
 .tile.manual { border-style:dashed; }
 
 .empty { color:var(--ink-faint); font-size:13.5px; padding:22px 4px; text-align:center; }
@@ -434,6 +469,14 @@ button.tiny { font-size:11.5px; padding:2px 8px; min-height:24px; }
   /* The theme control drops below the title here; right-aligning it reads as
      deliberate rather than as a stray button under the heading. */
   .top-actions { width:100%; justify-content:flex-end; margin-top:-6px; }
+  /* A compact header: one line under the title, cut short, not three. */
+  header.top { gap:6px; }
+  h1 { font-size:18px; }
+  /* The brand may not grow to its one-line subtitle: it shrinks to the
+     screen, and the subtitle is cut with an ellipsis. */
+  .brand { min-width:0; max-width:100%; flex:1 1 100%; }
+  .brand .sub { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
+  nav.tabs button { padding:9px 11px; }
 }
 /* No transition on a series' path: a trace that morphs between polls shows
    motion the instrument never measured, and it animates from the chart's
@@ -457,8 +500,8 @@ button.tiny { font-size:11.5px; padding:2px 8px; min-height:24px; }
 .alarm-bar { border:2px solid var(--warn); background:var(--warn-bg); border-radius:10px;
              padding:12px 14px; display:flex; flex-direction:column; gap:10px; }
 .alarm-bar.crit { border-color:var(--crit); background:var(--crit-bg); }
-.alarm-bar > header { display:flex; justify-content:space-between; align-items:center; gap:10px;
-                      color:var(--ink); }
+.alarm-bar > header { display:flex; justify-content:space-between; align-items:center; gap:6px 10px;
+                      color:var(--ink); flex-wrap:wrap; }
 .alarm { background:var(--card); border:1px solid var(--rule); border-radius:8px;
          padding:9px 11px; display:flex; flex-direction:column; gap:4px; }
 .alarm.critical { border-left:4px solid var(--crit); }
@@ -478,6 +521,8 @@ button.tiny { font-size:11.5px; padding:2px 8px; min-height:24px; }
 .alarm-log .entry { display:grid; grid-template-columns:auto auto 1fr; gap:4px 10px;
                     align-items:baseline; padding:6px 0; border-bottom:1px solid var(--rule);
                     font-size:13px; }
+.alarm-log-box { margin:0 0 10px; }
+.alarm-log-box .alarm-log { max-height:320px; overflow-y:auto; }
 
 /* ---------- dashboard v2 ----------
  * Laid out by the questions asked at the wall: what is it doing, what is
@@ -495,7 +540,7 @@ button.tiny { font-size:11.5px; padding:2px 8px; min-height:24px; }
 .guide-kicker { font-size:13px; text-transform:uppercase; letter-spacing:.06em;
                 color:var(--ink-faint); font-weight:650; }
 .guide-title { font-size:clamp(18px,2.4vw,23px); font-weight:640; margin-top:2px; }
-.guide-time { display:flex; flex-direction:column; align-items:flex-end; }
+.guide-time { display:flex; flex-direction:column; align-items:flex-end; gap:4px; }
 .guide-time .num { font-size:22px; font-weight:640; }
 .guide-label { font-size:13px; font-weight:650; color:var(--ink-soft); margin-bottom:4px; }
 .guide-next { font-size:16px; line-height:1.45; }
@@ -530,7 +575,20 @@ button.tiny { font-size:11.5px; padding:2px 8px; min-height:24px; }
 .stepper li.off { border-style:dotted; color:var(--ink-faint); opacity:.7; }
 .guide-off { margin:8px 0 0; font-size:13.5px; color:var(--ink-soft); }
 
-.dash-grid.four { grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); }
+/* 230, not 240: four across at 992 px -- the kiosk's 1024 less its gutters --
+   where 240 left three and one below. */
+.dash-grid.four { grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); }
+.dash-top { display:grid; gap:14px; grid-template-columns:minmax(0,1fr); }
+/* A short landscape screen -- the kiosk's 1024×600 -- puts the four figures
+   beside the guide, so the numbers are above the fold. */
+@media (min-width:900px) and (max-height:760px) {
+  .dash-top { grid-template-columns:minmax(0,1.05fr) minmax(0,1fr); align-items:start; }
+  .dash-top .dash-grid.four { grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+  .dash-top .panel { padding:10px 12px 8px; gap:4px; }
+  .dash-top .stat-value { font-size:clamp(26px,3.2vw,36px); }
+  .dash-headline { padding:10px 16px; }
+  .dash-state { font-size:clamp(20px,2.6vw,26px); }
+}
 .warn-text { color:var(--warn); font-weight:600; }
 .feed-text { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
              overflow:hidden; }
@@ -651,11 +709,11 @@ button.unavailable.primary { background:var(--accent-soft); color:var(--ink); bo
 nav.tabs.subtabs { border-bottom-color:var(--rule); }
 nav.tabs.subtabs button { font-size:13.5px; padding:8px 12px; min-height:40px;
                           display:inline-flex; align-items:center; gap:6px; }
-.dot-mark { width:8px; height:8px; border-radius:50%; flex:0 0 auto;
-            background:var(--idle); }
-.dot-mark.good { background:var(--good); }
-.dot-mark.crit { background:var(--crit); }
-.dot-mark.warn { background:var(--warn); }
+/* A sub-tab's state: a mark (✓ ✕ ○) and a word, never a colour alone. */
+.dot-mark { flex:0 0 auto; font-size:12px; font-weight:800; color:var(--idle); }
+.dot-mark.good { color:var(--good); }
+.dot-mark.crit { color:var(--crit); }
+.dot-mark.warn { color:var(--warn); }
 
 details > summary { cursor:pointer; color:var(--ink-soft); padding:4px 0; }
 details[open] > summary { margin-bottom:10px; }
@@ -672,6 +730,11 @@ details[open] > summary { margin-bottom:10px; }
   select { min-height:40px; }
   nav.tabs button { min-height:44px; }
   label.check input[type=checkbox] { width:20px; height:20px; }
+  /* Toasts at the top, where a finger is not covering them -- the newest two,
+     so a pile of errors cannot hide the header's controls. */
+  .toast-stack { top:14px; bottom:auto; }
+  .toast-stack .toast:nth-last-child(n+3) { display:none; }
+  .toast .toast-close { min-height:40px; min-width:40px; }
 }
 
 /* An interlocked button and, for an admin, the deliberate way past it. */

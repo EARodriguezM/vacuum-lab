@@ -21,11 +21,18 @@ const DEFAULTS = {
   alarmSound: true,
 };
 
+/** The longest poll interval allowed: the control lease (lab/auth.py, 15 s)
+ *  is renewed by the holder's polls, and a slower poll would drop it. */
+export const POLL_MAX_MS = 10000;
+
 export function loadSettings() {
   try {
     const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
     delete stored.token;           // the shared token is gone; accounts replaced it
-    return { ...DEFAULTS, ...stored };
+    const loaded = { ...DEFAULTS, ...stored };
+    // A browser that saved a slower poll before the cap keeps it no longer.
+    loaded.pollMs = Math.min(POLL_MAX_MS, Math.max(500, Number(loaded.pollMs) || 2000));
+    return loaded;
   } catch {
     return { ...DEFAULTS };
   }
@@ -121,25 +128,37 @@ export function onAuthProblem(listener) {
   return () => problems.delete(listener);
 }
 
+/** How long a request may go unanswered before it counts as no answer:
+ *  above the longest the server itself waits (30 s for a clean-up attempt in
+ *  flight), and short enough that a dialog saying "Sending…" over a dropped
+ *  Wi-Fi link does not hold the screen for minutes. Downloads are exempt. */
+const REQUEST_TIMEOUT_MS = 45000;
+
 async function request(path, options = {}) {
   const headers = { ...(options.headers || {}) };
   const token = sessions.person || sessions.device;
   if (token) headers.Authorization = `Bearer ${token}`;
   if (options.body) headers["Content-Type"] = "application/json";
+  const { raw, ...sent } = options;
+  const giveUp = raw ? null : new AbortController();
+  const timer = giveUp ? setTimeout(() => giveUp.abort(), REQUEST_TIMEOUT_MS) : null;
 
   let response;
   try {
-    response = await fetch(url(path), { ...options, headers });
+    response = await fetch(url(path), { ...sent, headers, signal: giveUp?.signal });
   } catch (error) {
-    // A network-level failure is the common case in this rig -- the server is
-    // stopped, or the address is wrong -- so it gets a message that says so
-    // rather than the browser's bare "Failed to fetch".
-    throw new Error(
-      `cannot reach the control server${base() ? ` at ${base()}` : ""}. ` +
-      `Is webserver.py running, and is the address right?`
-    );
+    // A network-level failure is the common case in this rig -- the lab PC
+    // is off, its network is down, the panel is restarting, or the address
+    // is wrong -- so it says that, rather than the browser's bare "Failed
+    // to fetch". `offline` tells the panel it is the line, not a refusal.
+    const problem = new Error(
+      `no answer from the lab PC${base() ? ` at ${base()}` : ""}`);
+    problem.offline = true;
+    throw problem;
+  } finally {
+    clearTimeout(timer);
   }
-  if (options.raw && response.ok) return response;
+  if (raw && response.ok) return response;
 
   const text = await response.text();
   let payload;
@@ -247,7 +266,9 @@ export const api = {
   command: (device, action, value, extra = {}) =>
     post("/api/command", { device, action, value, confirm: true, ...extra }),
 
-  startRun: (body) => post("/api/run/start", body),
+  // Sent from the start dialog only: a run's first step switches the
+  // pumping station on, so the server wants it asked for in so many words.
+  startRun: (body) => post("/api/run/start", { ...body, confirm: true }),
   // `shutdown` asks for the pump to be brought to rest as well. Without it
   // the run ends and the rig is left exactly as it is, still under vacuum.
   stopRun:  (reason, shutdown = false) =>
@@ -263,7 +284,14 @@ export const api = {
     get(`/api/device/${key}/diagnostics${fresh ? "?fresh=1" : ""}`),
   acknowledgeAlarms: (id = "all") => post("/api/alarms/ack", { id }),
   setAutoRecovery: (on) => post("/api/supervisor", { auto_recover: !!on, confirm: true }),
-  acknowledgeStep: (note = "") => post("/api/run/acknowledge", { note }),
+  // `prompt` is the id of the step the person was shown: a Done for one
+  // the run has since replaced is refused, not taken for the new one.
+  acknowledgeStep: (prompt, note = "") => post("/api/run/acknowledge", { prompt, note }),
+  // A step a run's ending left to a person (the plasma off, the argon shut).
+  confirmStep: (id) => post("/api/run/checklist", { id }),
+  // An admin says a run's owed clean-up was done by hand.
+  cleanupChecked: (id, reason) => post(`/api/runs/${id}/cleanup-checked`,
+                                       { reason, checked: true, confirm: true }),
 
   ports: (kind = "all", includePhantom = false) =>
     get(`/api/ports?kind=${encodeURIComponent(kind)}${includePhantom ? "&all=1" : ""}`),

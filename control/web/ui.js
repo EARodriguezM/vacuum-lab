@@ -1,8 +1,38 @@
 // Small shared components: tiles, pills, dialogs, toasts, forms.
 
 import { html } from "./html.js";
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import * as fmt from "./format.js";
+
+/**
+ * Focus into a dialog when it opens, and back where it was when it closes.
+ *
+ * Without it a keyboard or a screen reader stays on the page behind the
+ * overlay -- on the button that opened it, which can be pressed again -- and
+ * after the dialog the focus is lost at the top of the document. Escape
+ * cancels. Returns the ref for the dialog's element.
+ */
+export function useDialog(open, onCancel) {
+  const box = useRef(null);
+  // The latest: a dialog that is sending passes none, and Escape does nothing.
+  const cancel = useRef(onCancel);
+  cancel.current = onCancel;
+  useEffect(() => {
+    if (!open) return undefined;
+    const before = document.activeElement;
+    const first = box.current?.querySelector(
+      "input:not([disabled]), textarea:not([disabled]), select:not([disabled])")
+      || box.current;
+    first?.focus?.({ preventScroll: true });
+    const onKey = (event) => { if (event.key === "Escape") cancel.current?.(); };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      if (before && document.contains(before)) before.focus?.({ preventScroll: true });
+    };
+  }, [open]);
+  return box;
+}
 
 export function Pill({ tone = "idle", children, title }) {
   return html`<span class=${`pill ${tone}`} title=${title}>
@@ -45,26 +75,39 @@ export function Empty({ children }) {
   return html`<div class="empty">${children}</div>`;
 }
 
-/** A confirmation dialog. Anything that moves hardware goes through one. */
+/**
+ * A confirmation dialog. Anything that moves hardware goes through one.
+ *
+ * The button says what it does ("Start turbopump"), never "Do it". A
+ * refusal (`error`) is shown here, in the dialog that sent the request,
+ * where the person is looking -- not in a toast that fades -- and `actions`
+ * may offer the way on from it (an admin's Override…).
+ */
 export function Confirm({ open, title, body, confirmLabel = "Confirm",
-                          tone = "primary", onConfirm, onCancel, extra }) {
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (event) => { if (event.key === "Escape") onCancel(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onCancel]);
-
+                          tone = "primary", onConfirm, onCancel, extra, error,
+                          busy = false, actions = null, disabled = false,
+                          cancelLabel = "Cancel" }) {
+  // While it is sending, it cannot be cancelled: the request has gone, and
+  // its answer is shown here.
+  const box = useDialog(open, busy ? null : onCancel);
   if (!open) return null;
   return html`
-    <div class="overlay" onClick=${(e) => e.target === e.currentTarget && onCancel()}>
-      <div class="dialog" role="dialog" aria-modal="true">
-        <h2>${title}</h2>
+    <div class="overlay" onClick=${(e) => !busy && e.target === e.currentTarget && onCancel()}>
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title"
+           tabIndex="-1" ref=${box}>
+        <h2 id="confirm-title">${title}</h2>
         <div class="small">${body}</div>
         ${extra}
+        ${error && html`
+          <div class="banner crit small" role="alert" data-test="dialog-error">
+            <strong>Refused:</strong> ${error}</div>`}
         <div class="actions">
-          <button data-test="confirm-cancel" onClick=${onCancel}>Cancel</button>
-          <button class=${tone} data-test="confirm-ok" onClick=${onConfirm}>${confirmLabel}</button>
+          ${actions}
+          <button data-test="confirm-cancel" disabled=${busy} onClick=${onCancel}>
+            ${error ? "Close" : cancelLabel}</button>
+          ${!error && html`
+            <button class=${tone} data-test="confirm-ok" disabled=${busy || disabled}
+                    onClick=${onConfirm}>${busy ? "Sending…" : confirmLabel}</button>`}
         </div>
       </div>
     </div>`;
@@ -78,23 +121,18 @@ export function Confirm({ open, title, body, confirmLabel = "Confirm",
  * operator answers the wrong question.
  */
 export function Choose({ open, title, body, options = [], onChoose, onCancel }) {
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (event) => { if (event.key === "Escape") onCancel(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onCancel]);
-
+  const box = useDialog(open, onCancel);
   if (!open) return null;
   return html`
     <div class="overlay" onClick=${(e) => e.target === e.currentTarget && onCancel()}>
-      <div class="dialog" role="dialog" aria-modal="true">
-        <h2>${title}</h2>
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="choose-title"
+           tabIndex="-1" ref=${box}>
+        <h2 id="choose-title">${title}</h2>
         ${body && html`<div class="small">${body}</div>`}
         <div class="choices">
           ${options.map((option) => html`
             <button key=${option.key} class=${`choice ${option.tone || ""}`}
-                    onClick=${() => onChoose(option.key)}>
+                    data-test=${`choice-${option.key}`} onClick=${() => onChoose(option.key)}>
               <strong>${option.label}</strong>
               <span class="help">${option.description}</span>
             </button>`)}
@@ -106,12 +144,21 @@ export function Choose({ open, title, body, options = [], onChoose, onCancel }) 
     </div>`;
 }
 
+/**
+ * What just happened. A success fades by itself; an error stays until it is
+ * dismissed -- on a tablet across the room nobody reads nine seconds of
+ * text in time. Announced to a screen reader as it appears.
+ */
 export function Toasts({ items, onDismiss }) {
   return html`
-    <div class="toast-stack">
+    <div class="toast-stack" aria-live="polite">
       ${items.map((item) => html`
         <div class=${`toast ${item.tone || ""}`} key=${item.id}
-             onClick=${() => onDismiss(item.id)}>${item.message}</div>`)}
+             role=${item.tone === "error" ? "alert" : "status"}>
+          <span>${item.message}</span>
+          <button class="toast-close ghost" aria-label="Dismiss"
+                  onClick=${() => onDismiss(item.id)}>×</button>
+        </div>`)}
     </div>`;
 }
 
@@ -225,9 +272,12 @@ export function useToasts() {
   const [items, setItems] = useState([]);
   const push = (message, tone = "") => {
     const id = Math.random().toString(36).slice(2);
-    setItems((current) => [...current, { id, message, tone }]);
-    setTimeout(() => setItems((c) => c.filter((i) => i.id !== id)),
-               tone === "error" ? 9000 : 4500);
+    // The same error twice is one toast; at most four on screen.
+    setItems((current) => [...current.filter((i) => i.message !== message),
+                           { id, message, tone }].slice(-4));
+    if (tone !== "error") {
+      setTimeout(() => setItems((c) => c.filter((i) => i.id !== id)), 4500);
+    }
   };
   const dismiss = (id) => setItems((c) => c.filter((i) => i.id !== id));
   return [items, push, dismiss];

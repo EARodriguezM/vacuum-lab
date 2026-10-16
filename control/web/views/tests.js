@@ -4,10 +4,13 @@
 // procedure's fields at /api/procedures, and this builds the form from that.
 // Adding a procedure on the Python side makes it appear here with no change
 // to this file.
+//
+// The step a guided run waits for is not shown here but at the top of every
+// page (guided.js): somebody watching another tab must see it too.
 
 import { html } from "../html.js";
 import { useEffect, useMemo, useState } from "preact/hooks";
-import { Banner, Card, Empty, Field, Pairs, Pill, coerceConfig, configProblems,
+import { Banner, Card, Confirm, Empty, Field, Pairs, Pill, coerceConfig, configProblems,
          defaultConfig }
   from "../ui.js";
 import { RunCharts } from "../runcharts.js";
@@ -18,11 +21,21 @@ import { api, joinPoll } from "../api.js";
 import * as fmt from "../format.js";
 import * as status from "../status.js";
 
+/** An ended run stays on this page this long, then the form comes back. */
+const AFTER_RUN_S = 12 * 3600;
+
 function ResultSummary({ procedure, result }) {
   if (!result) return null;
   const rows = [];
   const p = (value, digits = 2) =>
     value === null || value === undefined ? "—" : fmt.pressure(value, digits);
+  const base = () => {
+    rows.push(["Base pressure", result.base_mbar != null ? `${p(result.base_mbar)} mbar` : "not reached"]);
+    if (result.time_to_base_s != null) rows.push(["Time to base", fmt.duration(result.time_to_base_s)]);
+    if (result.time_to_full_speed_s != null) {
+      rows.push(["Time to full speed", fmt.duration(result.time_to_full_speed_s)]);
+    }
+  };
 
   if (procedure === "pumpdown") {
     rows.push(["Target", p(result.target_mbar) + " mbar"]);
@@ -49,6 +62,23 @@ function ResultSummary({ procedure, result }) {
     rows.push(["Soak", `${fmt.number(result.soak_hours, 1)} h`]);
     rows.push(["Peak pressure", p(result.peak_pressure_mbar) + " mbar"]);
     rows.push(["Final pressure", p(result.final_pressure_mbar) + " mbar"]);
+  } else if (procedure === "base_calibration" || procedure === "full_vacuum") {
+    base();
+    if (result.ultimate_mbar != null) rows.push(["Best pressure", `${p(result.ultimate_mbar)} mbar`]);
+  } else if (procedure === "deposition") {
+    base();
+    rows.push(["Working pressure set", `${p(result.working_mbar_setpoint, 1)} mbar`]);
+    if (result.working_mbar_actual?.mean != null) {
+      rows.push(["Working pressure held", `${p(result.working_mbar_actual.mean)} mbar (mean)`]);
+    }
+    rows.push(["Deposited", result.deposition_s != null
+      ? `${fmt.duration(result.deposition_s)}${result.deposition_set_s
+        ? ` of ${fmt.duration(result.deposition_set_s)} set` : ""}` : "not started"]);
+    // Never "yes" by default: an older run has no such record, and a
+    // shutter that never opened was never closed by anybody either.
+    rows.push(["Shutter closed at the end", result.deposition_s == null ? "never opened"
+      : result.shutter_closed === true ? "confirmed" : result.shutter_closed === false
+        ? "NOT confirmed" : "—"]);
   }
   rows.push(["Duration", fmt.duration(result.duration_s)]);
   rows.push(["Samples", fmt.integer(result.samples)]);
@@ -73,29 +103,77 @@ function EventLog({ events }) {
     </div>`;
 }
 
-/** The manual step currently blocking the recipe. The loudest thing on screen. */
-function OperatorPrompt({ prompt, onAcknowledge, busy }) {
-  if (!prompt) return null;
-  const waiting = prompt.since ? (Date.now() / 1000) - prompt.since : 0;
+/** The phases, the current one marked, the finished ones ticked -- not only coloured. */
+function Phases({ phases, current }) {
+  const index = phases.indexOf(current);
   return html`
-    <section class="card prompt-card" data-test="prompt">
-      <div class="prompt-head">
-        <span class="pill warn"><span class="dot" />Waiting for you</span>
-        <span class="small muted">${fmt.duration(waiting)}</span>
-      </div>
-      <p class="prompt-text">${prompt.instruction}</p>
-      ${prompt.note && html`<p class="hint">${prompt.note}</p>`}
-      <div class="row">
-        <button class="primary" disabled=${busy} onClick=${onAcknowledge}
-                data-test="prompt-done">
-          Done — continue the run
-        </button>
-        <span class="small muted">
-          ${prompt.label} → ${prompt.value}. The run keeps recording while you
-          do this; nothing is unmonitored.
-        </span>
-      </div>
-    </section>`;
+    <div class="phases">
+      ${phases.map((phase, position) => html`
+        <span key=${phase} class=${`step${phase === current ? " now"
+                      : position < index ? " done" : ""}`}
+              aria-current=${phase === current ? "step" : null}>
+          ${position < index ? html`<span aria-hidden="true">✓ </span>` : null}${fmt.phaseLabel(phase)}</span>`)}
+    </div>`;
+}
+
+/** What happens first when this procedure starts, in plain words. */
+function firstMove(procedure) {
+  const phases = procedure?.phases || [];
+  if (phases.includes("rough") || phases.includes("roughing")) {
+    return "It switches the pumping station on at once, so the backing pump "
+      + "starts roughing. The turbopump starts only once the gauge reads the "
+      + "chamber below the crossover pressure.";
+  }
+  if (procedure?.name === "bakeout") {
+    return "It switches the pump's heater on at once, to the setpoint below.";
+  }
+  if (procedure?.name === "rate_of_rise") {
+    return "It closes the gate valve to isolate the chamber, then measures "
+      + "how fast the pressure rises.";
+  }
+  return "It records the instruments; it switches nothing on.";
+}
+
+/**
+ * The start dialog: the recipe repeated before it runs, because a run's
+ * first step moves hardware -- the server wants `confirm` for it like any
+ * other command. A refusal is shown here, where the person is looking.
+ */
+function StartDialog({ request, busy, error, onCancel, onConfirm }) {
+  if (!request) return null;
+  const { procedure, body, manual, noGauge } = request;
+  const config = body.config || {};
+  const shown = (field) => {
+    const value = config[field.key];
+    if (field.type === "boolean") return value ? "yes" : "no";
+    if (field.type === "select") {
+      return (field.options || []).find((o) => String(o.value) === String(value))?.label
+        ?.split(" — ")[0] || String(value);
+    }
+    if (value === null || value === undefined) return "—";
+    const number = field.type === "exponent" ? fmt.pressure(value, 1)
+      : String(Number(value));
+    return `${number}${field.unit ? ` ${field.unit}` : ""}`;
+  };
+  const guided = String(config.mode || "guided") !== "auto";
+  return html`
+    <${Confirm} open=${true} title=${`Start: ${body.name || procedure.label}`}
+      confirmLabel="Start the run" busy=${busy} error=${error}
+      onCancel=${onCancel} onConfirm=${onConfirm}
+      body=${html`
+        <div class="grid" style="gap:10px" data-test="start-dialog">
+          <p><strong>${procedure.label}</strong>${procedure.fields.some((f) => f.key === "mode")
+            ? `, ${guided ? "guided" : "automatic"}` : ""}. ${firstMove(procedure)}</p>
+          <${Pairs} items=${procedure.fields.filter((f) => f.key !== "mode")
+            .map((field) => [String(field.label).replace(/^…/, ""), shown(field)])} />
+          ${manual.length > 0 && guided && html`
+            <p>It will stop and ask you to do these by hand, and wait for your
+              Done each time: ${manual.join(", ")}.</p>`}
+          ${noGauge && html`<p class="warn-text">The gauge is offline: the curve
+            will have no pressure.</p>`}
+          <p class="muted">It drives the hardware through the same interlocks as
+            the manual controls, and holds no override.</p>
+        </div>`} />`;
 }
 
 /** What the process hardware is doing, and which of it is real. */
@@ -117,10 +195,23 @@ function Actuators({ actuators }) {
     </div>`;
 }
 
-// `busy` locks what needs control of the rig; `stopBusy` only the stop
-// button, which every operator may press whoever holds control.
-function LiveRun({ run, samples, events, onStop, onAcknowledge, busy, stopBusy,
-                   devices }) {
+/** The process timer a recipe is running, as a countdown. */
+function TimerLine({ timer }) {
+  if (!timer) return null;
+  if (timer.elapsed_s === null || timer.elapsed_s === undefined) {
+    return html`<div class="small"><strong>${timer.label}</strong>
+      ${fmt.duration(timer.total_s)} after the step above is confirmed.</div>`;
+  }
+  const left = Math.max(0, timer.total_s - timer.elapsed_s);
+  return html`
+    <div class="small"><strong>${timer.label} in ${fmt.duration(left)}</strong>
+      <span class="muted"> · ${fmt.duration(timer.elapsed_s)} of ${fmt.duration(timer.total_s)}</span>
+    </div>`;
+}
+
+// `stopBusy` locks the stop button only: every operator may press it,
+// whoever holds control.
+function LiveRun({ run, samples, events, onStop, stopBusy, devices, may }) {
   const phases = run.phases || [];
   const index = phases.indexOf(run.phase);
   const share = phases.length > 1
@@ -134,23 +225,18 @@ function LiveRun({ run, samples, events, onStop, onAcknowledge, busy, stopBusy,
         <${Banner} tone="crit">
           <strong>${pumpState.headline}.</strong> ${pumpState.detail}
         <//>`}
-      <${OperatorPrompt} prompt=${run.prompt} busy=${busy}
-                         onAcknowledge=${onAcknowledge} />
 
       <${Card} title=${run.run?.name || run.label}
                hint=${`${run.label} · ${run.mode === "auto" ? "automatic" : "guided"}` +
                       ` · started ${fmt.dateTime(run.run?.started_at)}`}
                actions=${html`
-                 <button class="danger" disabled=${stopBusy ?? busy} onClick=${onStop}
+                 <button class="danger" disabled=${stopBusy} onClick=${onStop}
                          data-test="run-stop">
-                   ${run.stopping ? "Stopping…" : "Stop run"}</button>`}>
-        <div class="phases">
-          ${phases.map((phase, position) => html`
-            <span class=${`step${phase === run.phase ? " now"
-                          : position < index ? " done" : ""}`}>
-              ${fmt.phaseLabel(phase)}</span>`)}
-        </div>
+                   ${run.stopping ? "Stopping…" : may === "signin" ? "Sign in to stop"
+                     : "Stop run"}</button>`}>
+        <${Phases} phases=${phases} current=${run.phase} />
         <div class="bar"><span style=${`width:${(share * 100).toFixed(0)}%`} /></div>
+        <${TimerLine} timer=${run.timer} />
         <div class="spread small muted">
           <span>Elapsed ${fmt.duration(run.elapsed_s)}${" "}
             · ${fmt.duration(run.in_phase_s)} in this phase</span>
@@ -181,6 +267,8 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
   const [chosen, setChosen] = useState("");
   const [notes, setNotes] = useState("");
   const [config, setConfig] = useState({});
+  // The start dialog: what is about to run, and a refusal if it is refused.
+  const [starting, setStarting] = useState(null);
 
   // Opens on the first procedure this rig can run.
   const procedure = procedures.find((p) => p.name === chosen)
@@ -206,13 +294,21 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
   // one's settings -- there is nothing of its own to judge.
   const ready = procedure.fields.every((field) => field.key in config);
   const problems = ready ? configProblems(procedure.fields, config) : [];
-  const start = () => {
-    onStart({
+  const review = () => setStarting({
+    procedure, manual, noGauge: !!blocked,
+    body: {
       procedure: procedure.name,
       name: name || procedure.label,
       notes,
       config: coerceConfig(procedure.fields, config),
-    });
+    },
+  });
+  const start = async () => {
+    const request = starting;
+    setStarting({ ...request, sending: true, error: null });
+    const result = await onStart(request.body);
+    if (result?.ok) setStarting(null);
+    else setStarting({ ...request, sending: false, error: result?.error || "the run did not start" });
   };
 
   return html`
@@ -231,7 +327,7 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
           <strong>Switched off — not installed on the rig yet:</strong>
           ${" "}${absent.join(", ")}. You can read what this procedure does, but it
           cannot run until that is in place. Then mark it installed in
-          ${" "}<a href="#settings">Settings → Rig equipment</a>.
+          ${" "}<a href="#settings/rig">Settings → Rig</a>.
         <//>`}
 
       ${noInstrument.length === 0 && absent.length === 0 && manual.length > 0 && html`
@@ -249,16 +345,15 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
             return html`
               <button key=${entry.name}
                       class=${`${entry.name === procedure.name ? "primary" : ""}${off ? " unavailable" : ""}`}
+                      aria-pressed=${entry.name === procedure.name ? "true" : "false"}
+                      data-test=${`procedure-${entry.name}`}
                       title=${off ? `Switched off: needs ${off.join(", ")}` : entry.description}
                       onClick=${() => setChosen(entry.name)}>
                 ${entry.label}${off ? html` <span class="off-tag">${tag}</span>` : null}</button>`;
           })}
         </div>
         <p class="hint">${procedure.description}</p>
-        <div class="phases">
-          ${procedure.phases.map((phase) => html`
-            <span class="step">${fmt.phaseLabel(phase)}</span>`)}
-        </div>
+        <${Phases} phases=${procedure.phases} current=${null} />
       <//>
 
       <div class="grid two">
@@ -298,9 +393,9 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
         <div class="row">
           <button class="primary"
                   disabled=${busy || noInstrument.length > 0 || absent.length > 0
-                             || problems.length > 0}
-                  data-test="run-start" onClick=${start}>
-            Start ${procedure.label.toLowerCase()}
+                             || problems.length > 0 || !ready}
+                  data-test="run-start" onClick=${review}>
+            Start: ${procedure.label}…
           </button>
           <span class="small muted">
             ${noInstrument.length > 0
@@ -309,7 +404,7 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
               ? "Switched off until its equipment is installed."
               : problems.length > 0
                 ? "Fix the settings marked below first."
-                : "The run drives the hardware through the same interlocks as the manual controls — it holds no override."}
+                : "The next step shows the recipe again before anything moves."}
           </span>
         </div>
         ${problems.length > 0 && html`
@@ -317,6 +412,10 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
             ${problems.map((problem) => html`<div key=${problem}>${problem}</div>`)}
           </div>`}
       <//>
+
+      <${StartDialog} request=${starting} busy=${!!starting?.sending}
+                      error=${starting?.error} onCancel=${() => setStarting(null)}
+                      onConfirm=${start} />
     </div>`;
 }
 
@@ -326,8 +425,9 @@ function Setup({ procedures, onStart, busy, blocked, actuators = [], unavailable
  * When a run aborted, this page used to snap straight back to an empty form,
  * and the curves vanished at exactly the moment somebody needed them: what
  * the rotor did after the fault, whether the pressure recovered. Now the run
- * stays on screen, and its charts continue live from the server's rolling
- * history in an "After the run" phase, until you start a new run.
+ * stays on screen with its result, and its charts continue live from the
+ * server's rolling history in an "After the run" phase, until a new run is
+ * started -- or for half a day, after which the form is what is wanted.
  */
 function AfterRun({ last, state, onDismiss }) {
   const [record, setRecord] = useState(null);
@@ -391,8 +491,10 @@ function AfterRun({ last, state, onDismiss }) {
     ...r, t: r.at - startedAt, phase: "after",
   }))), [stored, after, startedAt]);
 
-  const tone = last.status === "completed" ? "good"
-    : last.status === "failed" ? "crit" : "warn";
+  const said = fmt.runStatus({ status: last.status,
+                               result: { stopped: last.by_operator, message: last.message } });
+  const tone = said === "completed" ? "good" : said === "failed" ? "crit"
+    : said === "stopped" ? "idle" : "warn";
   const secure = state?.run?.secure;
   const recent = secure && secure.started_at >= last.ended_at - 5;
 
@@ -401,7 +503,7 @@ function AfterRun({ last, state, onDismiss }) {
       <section class=${`summary ${tone}`}>
         <div class="spread">
           <span class="headline">
-            Run ${last.id} ${last.status}: ${last.name || last.label}</span>
+            Run ${last.id} ${said}: ${last.name || last.label}</span>
           <div class="row">
             <a class="btn" href=${`#history/${last.id}`}>Open in History</a>
             <button class="primary" data-test="run-new" onClick=${onDismiss}>Start a new run</button>
@@ -423,6 +525,11 @@ function AfterRun({ last, state, onDismiss }) {
           </div>`}
       </section>
 
+      ${record?.result && html`
+        <${Card} title="Result">
+          <${ResultSummary} procedure=${last.procedure} result=${record.result} />
+        <//>`}
+
       <${RunCharts} run=${record || { id: last.id }} procedure=${last.procedure}
                     config=${record?.config || {}} samples=${samples} events=${events}
                     startedAt=${startedAt} pump=${state?.devices?.pump}
@@ -434,9 +541,9 @@ function AfterRun({ last, state, onDismiss }) {
     </div>`;
 }
 
-export function TestsView({ state, live, onStart, onStop, onAcknowledge, busy,
-                            stopBusy }) {
-  const [procedures, setProcedures] = useState([]);
+export function TestsView({ state, live, onStart, onStop, busy, stopBusy, may }) {
+  // null while they load: "the server published none" is a different thing.
+  const [procedures, setProcedures] = useState(null);
   const [events, setEvents] = useState([]);
   const [dismissed, setDismissed] = useStored("vacuum-lab-dismissed-run", null);
   const run = state?.run;
@@ -460,17 +567,19 @@ export function TestsView({ state, live, onStart, onStop, onAcknowledge, busy,
 
   if (run?.running) {
     return html`<${LiveRun} run=${run} samples=${live?.samples || []}
-                            events=${events} onStop=${onStop}
-                            onAcknowledge=${onAcknowledge} busy=${busy}
+                            events=${events} onStop=${onStop} may=${may}
                             stopBusy=${stopBusy} devices=${state?.devices} />`;
   }
 
   // The run that just ended stays on screen, live, until it is dismissed.
   const last = run?.last;
-  if (last && last.id !== dismissed) {
+  const now = state?.server_time || Date.now() / 1000;
+  if (last && last.id !== dismissed && now - (last.ended_at || 0) < AFTER_RUN_S) {
     return html`<${AfterRun} last=${last} state=${state}
                              onDismiss=${() => setDismissed(last.id)} />`;
   }
+
+  if (procedures === null) return html`<${Empty}>Loading the procedures…<//>`;
 
   const devices = state?.devices || {};
   const blocked = !devices.gauge?.connected

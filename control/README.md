@@ -126,17 +126,16 @@ panel has no driver for, give the ports of the ones it does have, or pass
 
 ## The web panel
 
-Six tabs, responsive down to a phone, light and dark. Everybody signs in
+Five tabs, responsive down to a phone, light and dark. Everybody signs in
 first (see **Accounts** below).
 
 | Tab | What it does |
 |---|---|
-| **Dashboard** | The wall display, read standing up. A **guide** says what the rig is doing in words, which step of the deposition route it is on, what ends that step and roughly when (countdowns to the shutter opening and closing, spin-up and pump-down estimates); four tiles for pressure, rotor, drive load and plasma/gas; a **vacuum scale** from atmosphere to UHV with the rig's landmarks on it; the run's curves with its phases and limits (or the last hour when none is recording); a **health checklist** and an **activity feed** with every run one click from its record. **Explain** adds a sentence to every figure for newcomers; **Full screen** is for a monitor on the lab wall |
-| **Overview** | Plain-language state of the rig, live tiles, the active run, the last hour |
+| **Dashboard** | The wall display, read standing up. A **guide** says what the rig is doing in words, which step of the deposition route it is on, what ends that step and roughly when (countdowns to the shutter opening and closing, spin-up and pump-down estimates); four tiles for pressure, rotor, drive load and plasma/gas; a **vacuum scale** from atmosphere to UHV with the rig's landmarks on it; the run's curves with its phases and limits (or the last hour when none is recording); a **health checklist** and an **activity feed** (Recent activity, which also keeps the alarm log) with every run one click from its record; **Stop** is in the guide card. **Explain** adds a sentence to every figure for newcomers; **Full screen** is for a monitor on the lab wall |
 | **Equipment** | One sub-tab per instrument and per installed actuator. **TC 600 turbopump**: station and turbopump control, speed setpoint, faults, all four accessory connectors — and **pump trends**: up to 24 h of pressure, rotor speed, drive current, power and supply voltage on one time axis, health tiles, the load curve, and the pump temperature where one is measured. **TPG gauge controller**: both channels, gauge on/off, filter, unit, switching functions, error register, capability probe — and **pressure history** per channel with the reason for every gap, the rate of change, and window statistics. **Argon flow, gate valve, magnetron, shutter**: whether software drives it or a person does, what it is set to — and whether that was confirmed — and its recorded history |
-| **Process** | Pick a recipe, fill in the form, watch it run on the full chart set, answer its prompts. A recipe that needs equipment not installed on the rig yet is listed but switched off, saying what it is waiting for |
-| **History** | Every recorded run: browse, search, inspect, annotate, export, delete; the full chart set per run, comparison with earlier pump-downs, and **trends across runs** |
-| **Settings** | **My account**; for admins **People** (approve sign-ups, roles, password resets) and **Tablets** (pairing); **Rig equipment** (what is physically installed — argon line, gate valve, magnetron, shutter, pump heater), instrument ports, controller address, poll rate, theme, database status |
+| **Process** | Pick a recipe, fill in the form, watch it run on the full chart set, answer its prompts. **Start** opens a dialog that repeats the recipe and says what the run will do first; nothing starts until you confirm it. A run that has ended stays here for 12 hours with its result table, then the form returns. A recipe that needs equipment not installed on the rig yet is listed but switched off, saying what it is waiting for |
+| **History** | Every recorded run: browse, search, inspect, annotate (saving notes keeps the run open), export, delete (not a run that is still going); the full chart set per run, comparison with earlier pump-downs, and **trends across runs** |
+| **Settings** | Sub-tabs (`#settings/<name>`): **My account**; for admins **People** (approve sign-ups, roles, password resets, pairing tablets); **Rig** (what is physically installed — argon line, gate valve, magnetron, shutter, pump heater — and the instrument ports); **This screen** (controller address, poll rate, theme, alarm sound); **Server** (the server and database status) |
 
 ### Reading the charts
 
@@ -195,7 +194,26 @@ happens:
 once their cause has cleared, so a fault in the night is still there in the
 morning. Each says what the panel already did about it. The browser tab's
 title carries the worst one, and critical ones can sound (Settings). The
-Overview tab keeps the log.
+Dashboard's *Recent activity* keeps the log.
+
+**If a person with an idle session sees something wrong, they do not have to
+sign in first.** *Acknowledge*, *Make safe*, *Stop*, *Done* on the checklist
+and *Cancel power-down* ask for the password and then carry on with what you
+pressed. A viewer sees "An operator answers this"; a paired tablet says
+"Sign in to ...".
+
+**Silence here** (operators and above) quiets the sounds in this browser only,
+until something new sounds. It acknowledges nothing and does not touch other
+screens.
+
+**When the panel loses contact with the lab PC**, after two failed attempts a
+banner says "No contact with the lab PC since HH:MM" with what to check (the
+lab PC and its network, then the panel's service), and the figures turn grey
+so a frozen number cannot be mistaken for a live one. A wall tablet also
+beeps, every 10 seconds for two minutes and then every 5 minutes. If the banner
+says the panel "is not answering properly", the lab PC is reachable but the
+panel is struggling: look at its service. The figures return by themselves
+when contact does.
 
 Besides drive faults and the rest, the panel raises an alarm when:
 
@@ -235,9 +253,25 @@ Besides drive faults and the rest, the panel raises an alarm when:
 One lost reply on the bus raises none of these: the panel believes a change in
 the drive only when two readings in a row show it.
 
-**An aborted run stays on the Process tab**, with its charts continuing live
-in an *After the run* band — the rotor coasting, the pressure recovering —
-until you press *Start a new run*.
+**An ended run stays on the Process tab**, with its charts continuing live
+in an *After the run* band — the rotor coasting, the pressure recovering — and
+its result table, for 12 hours or until you press *Start a new run*. A run you
+stopped yourself is shown as **stopped**; *aborted* is kept for a run the
+panel ended because something was wrong.
+
+**Steps left by hand.** If a run ends with the plasma, gas or shutter still
+to be switched off by a person (they are manual on this rig), a checklist
+appears on every page, and the alarm is critical and names each step. The
+panel sounds until every step is confirmed, no new run can start while any is
+outstanding, and it stays after a restart. After a crash, every manual step is
+listed, because nobody can know which were on. Switch each off at the rig,
+then press **Done** beside it.
+
+**An owed clean-up you have dealt with yourself.** If a run's clean-up cannot
+succeed (say, the drive refuses the heater-off) and you have switched things
+off by hand, an admin opens the run in History and presses **Mark as done by
+hand…**, types why, and ticks that the rig was checked. The panel then stops
+retrying it and clears its alarms.
 
 **Err006** is the run-up time error: with the factory settings (PM 0504 BE,
 section 4.1: run-up time 15 min, switchpoint 80 %), a rotor below 1200 Hz once
@@ -257,7 +291,7 @@ replugged USB adapter (which renumbers `/dev/ttyUSB0` and `/dev/ttyUSB1`), a
 replaced adapter, or a different USB socket does not matter. If an
 instrument stops answering for 10 s, the panel looks for it on the other free
 ports about once a minute and reconnects by itself, with an alarm saying where
-it went. **Settings → Finding the instruments** shows each instrument's port,
+it went. **Settings → Rig → Finding the instruments** shows each instrument's port,
 lets you search now, and *Detect instruments now* lists what answers on every
 port. `--no-port-search` pins the ports instead.
 
@@ -415,13 +449,14 @@ you may do depends on your role in this chamber:
   second screen never takes control from the first; **Take control here**
   does. Better still, give everyone who operates their own account — a
   shared one is fine only for watching.
-- **Lab tablets** are paired once (Settings → People → Tablets gives a
-  one-time code, typed into *Pair this tablet*). A paired tablet always shows
+- **Lab tablets** are paired once (Settings → People gives a
+  one-time code, typed into *Pair this tablet*, which is offered on the tablet's
+  own app only). A paired tablet always shows
   the rig and sounds alarms, with nobody signed in, and can never act.
 - Everything somebody does is recorded under their name in the event log.
 - After an update, open panels — tablets and phones included — reload
   themselves within a poll or two.
-- **Settings → Test the alarm sound** plays the alarm's two tones on the
+- **Settings → This screen → Test the alarm sound** plays the alarm's two tones on the
   device in your hand, to check its speaker.
 - **Messages you may meet.** *Busy, try again* means several people are
   signing in at the same moment; wait a few seconds and press again (it does
@@ -442,7 +477,7 @@ you may do depends on your role in this chamber:
   `--allow-from` can still watch and operate; and `--host-name NAME` /
   `--allow-origin URL` say which address names and which other web pages may
   talk to the panel (the panel answers "421" or "403" to anything else). The
-  tablet on its cable (127.0.0.1) always passes. If Settings → Connection
+  tablet on its cable (127.0.0.1) always passes. If Settings → This screen → Connection
   points at a panel on another machine, that machine must be started with
   `--allow-origin` for the page you are on.
 
@@ -533,7 +568,14 @@ starts in **manual** mode. Pick per run:
 - **Guided** — the software drives what it can and stops at each manual step
   with a large, plain-language instruction and a *Done* button. It keeps
   sampling and keeps its abort checks live while it waits, so a chamber with
-  the plasma on is never unmonitored.
+  the plasma on is never unmonitored. The instruction appears at the top of
+  **every page**, not only Process, with a chime that repeats each minute
+  until the step is confirmed, and the browser tab's title says a step is
+  waiting. *Done* confirms the step shown; if the step has changed meanwhile,
+  the panel refuses it rather than confirming the wrong one. A deposition's
+  pre-sputter and deposit times count from the moment you confirm the plasma
+  or the shutter, and the deposition ends when you confirm the shutter is
+  closed.
 - **Automatic** — refused up front unless every actuator is under software
   control, rather than failing at the first prompt with the chamber already
   pumped down.

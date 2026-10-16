@@ -49,14 +49,15 @@ CONFIRM_REQUIRED = GUARDED | {
 #: Who may make each POST: the lowest role, and whether the caller must hold
 #: control of the rig (lab/auth.py). Whatever moves hardware needs control.
 #: What makes the rig safer does not -- making the pump safe, cancelling a
-#: power-down, acknowledging alarms, and stopping a run without powering down
-#: (see _post_rule) -- because an operator who sees something wrong must not
+#: power-down, acknowledging alarms, confirming a step left by hand after a
+#: run, and stopping a run without powering down (see _post_rule) -- because an operator who sees something wrong must not
 #: have to wait for whoever holds control to notice. Setting the rig up --
 #: equipment, ports, automatic recovery -- is an admin's.
 POST_RULES = {
     "/api/command":              ("operator", True),
     "/api/run/start":            ("operator", True),
     "/api/run/acknowledge":      ("operator", True),
+    "/api/run/checklist":        ("operator", False),
     "/api/pump/shutdown":        ("operator", True),
     "/api/pump/secure":          ("operator", False),
     "/api/pump/cancel-shutdown": ("operator", False),
@@ -102,6 +103,27 @@ EXPORT_WAIT_S = 10.0
 #: without a cap, anyone on the network could make the server allocate
 #: whatever a Content-Length claims, before any password is checked.
 MAX_BODY_BYTES = 64 * 1024
+
+
+#: What may be done to a stored run, and which of it is an admin's.
+RUN_ACTIONS = ("update", "delete", "cleanup-checked")
+ADMIN_RUN_ACTIONS = ("delete", "cleanup-checked")
+
+
+def run_route(route: str) -> tuple[int, str] | None:
+    """`/api/runs/<id>` or `/api/runs/<id>/<action>`, exactly: (id, action).
+
+    The one parse for both who may post it and what it does. Anything else
+    -- a trailing slash, an extra segment, an unknown action -- is None.
+    """
+    parts = route.split("/")
+    if len(parts) not in (4, 5) or parts[:3] != ["", "api", "runs"]:
+        return None
+    if not (parts[3].isascii() and parts[3].isdigit()) \
+            or parts[3] != str(int(parts[3])):
+        return None
+    action = parts[4] if len(parts) == 5 else "update"
+    return (int(parts[3]), action) if action in RUN_ACTIONS else None
 
 
 def web_build(root: str = WEB_ROOT) -> str:
@@ -482,6 +504,9 @@ class Application:
             "shutdown": shutdown if shutdown and shutdown.get("active") else None,
             "securing": bool(recovering.get("active")
                              or (engine.get("secure") or {}).get("active")),
+            # Steps a run's ending left to a person: held in memory, so a
+            # restart would forget them with the plasma maybe still on.
+            "by_hand": len(engine.get("checklist") or []),
             "ports": {s.key: s.port for s in self.registry},
             "connected": {s.key: bool(s.snapshot().get("connected"))
                           for s in self.registry},
@@ -966,6 +991,12 @@ class Handler(BaseHTTPRequestHandler):
             self._command(payload)
             return
         if route == "/api/run/start":
+            # A run's first step switches the pumping station on: like every
+            # other hardware action, it must be asked for in so many words.
+            if not payload.get("confirm"):
+                self._json({"ok": False,
+                            "error": "starting a run needs confirm"}, 400)
+                return
             result = self.app.engine.start(
                 str(payload.get("procedure", "")),
                 payload.get("config") or {},
@@ -1066,10 +1097,32 @@ class Handler(BaseHTTPRequestHandler):
             self._json(result)
             return
         if route == "/api/run/acknowledge":
-            result = self.app.engine.acknowledge(str(payload.get("note", "")))
-            if result.get("ok"):
-                self._audit("confirmed the manual step")
-            self._json(result)
+            # Which step the person was shown: a Done for one that has since
+            # been replaced must not confirm the new one.
+            prompt = payload.get("prompt")
+            if isinstance(prompt, bool) or not isinstance(prompt, int):
+                self._json({"ok": False, "error": "say which step: the panel "
+                                                  "sends the prompt's id"}, 400)
+                return
+            result = self.app.engine.acknowledge(
+                str(payload.get("note", ""))[:300], prompt_id=prompt,
+                user=principal)
+            self._json(result if result.get("ok") else
+                       {"ok": False, "error": result.get("error")},
+                       200 if result.get("ok") else result.get("code", 400))
+            return
+        if route == "/api/run/checklist":
+            # A step a run's ending left to a person -- the plasma off, the
+            # argon shut. Saying it is done moves nothing, and makes the rig
+            # no less safe: open to any operator, control or not.
+            step = payload.get("id")
+            if isinstance(step, bool) or not isinstance(step, int):
+                self._json({"ok": False, "error": "which step?"}, 400)
+                return
+            result = self.app.engine.confirm_step(step, user=principal)
+            self._json(result if result.get("ok") else
+                       {"ok": False, "error": result.get("error")},
+                       200 if result.get("ok") else result.get("code", 400))
             return
         if route == "/api/control/release":
             self._json(self.app.auth.release(principal))
@@ -1158,8 +1211,15 @@ class Handler(BaseHTTPRequestHandler):
             return "operator", False
         if route.startswith("/api/runs/"):
             # Editing a run's name or notes is bookkeeping; deleting a run
-            # destroys a record, which is an admin's call.
-            return ("admin" if route.endswith("/delete") else "operator"), False
+            # destroys a record, and saying its owed clean-up was done by
+            # hand ends the panel's own attempts: both an admin's call.
+            # Judged on the same parse as the dispatch: a trailing slash or
+            # an extra segment once read as "not delete" here and as
+            # "delete" there, and let an operator through.
+            parsed = run_route(route)
+            if parsed is None:
+                return "admin", True
+            return ("admin" if parsed[1] in ADMIN_RUN_ACTIONS else "operator"), False
         # Anything not listed needs the most, not the least.
         return "admin", True
 
@@ -1385,13 +1445,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": f"no view {view!r}"}, 404)
 
     def _runs_post(self, route: str, payload: dict):
-        parts = [p for p in route.split("/") if p]
-        try:
-            run_id = int(parts[2])
-        except (IndexError, ValueError):
-            self._json({"ok": False, "error": "bad run id"}, 400)
+        parsed = run_route(route)
+        if parsed is None:
+            self._json({"ok": False, "error": "not found"}, 404)
             return
-        action = parts[3] if len(parts) > 3 else "update"
+        run_id, action = parsed
 
         if action == "update":
             def bounded(key: str, limit: int):
@@ -1462,6 +1520,21 @@ class Handler(BaseHTTPRequestHandler):
                    f"succeeded; it will not be tried again" if owed else ""),
                 user=who.username)
             self._json({"ok": True, "error": None})
+        elif action == "cleanup-checked":
+            # Moves nothing, but ends what the panel would otherwise try
+            # again at every start: confirmed, ticked and given a reason,
+            # like an override. The engine keeps the record.
+            if not payload.get("confirm") or payload.get("checked") is not True:
+                self._json({"ok": False,
+                            "error": "marking a clean-up as done by hand needs "
+                                     "confirm, and the tick that you checked "
+                                     "the rig yourself"}, 400)
+                return
+            outcome = self.app.engine.mark_cleanup_checked(
+                run_id, str(payload.get("reason", "")), user=self._who())
+            self._json(outcome if outcome.get("ok") else
+                       {"ok": False, "error": outcome.get("error")},
+                       200 if outcome.get("ok") else outcome.get("code", 400))
         else:
             self._json({"ok": False, "error": f"no action {action!r}"}, 404)
 

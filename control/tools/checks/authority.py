@@ -384,7 +384,7 @@ def test_authority(pump_port: str) -> None:
                                        "device": wall})[1].get("token")
         call("/api/control/release", {}, owner)
         code, body = call("/api/run/start", {
-            "procedure": "hold", "operator": "Wall",
+            "procedure": "hold", "operator": "Wall", "confirm": True,
             "config": {"duration_min": 5, "interval_s": 1}}, ana_here)
         there = (body.get("run") or {}).get("id")
         if there:
@@ -403,6 +403,149 @@ def test_authority(pump_port: str) -> None:
         kept = ((database.run(ran) if ran else None) or {}).get("operator")
         attempt("the store will not change it either",
                 lambda: (kept == "Olga", f"operator {kept!r}"))
+
+        # --- starting, prompts and what is left by hand, over HTTP ----------
+        call("/api/control/release", {}, ana_here)
+        unasked, said = call("/api/run/start", {
+            "procedure": "hold", "config": {"duration_min": 5, "interval_s": 1}},
+            owner)
+        attempt("a run is not started without confirm: its first step switches "
+                "the station on",
+                lambda: (unasked == 400 and not engine.status()["running"],
+                         f"{unasked}: {said.get('error') or 'started'}"))
+        stopped = (database.run(ran) if ran else None) or {}
+        attempt("a run its operator stopped is recorded as stopped, not as "
+                "something gone wrong",
+                lambda: ((stopped.get("result") or {}).get("stopped") is True,
+                         str((stopped.get("result") or {}).get("message"))[:60]))
+
+        class Plasma(runs.Procedure):
+            """Strikes a plasma by hand, then waits to be stopped."""
+            name, label, phases, interval = "selftest_plasma", "Plasma", \
+                ("running", "done"), 0.2
+            finish = runs.Deposition.finish
+
+            def step(self, engine, sample):
+                engine.require(engine.hardware.magnetron, 100)
+                return False
+
+        runs.CATALOGUE[Plasma.name] = Plasma
+        try:
+            code, body = call("/api/run/start", {"procedure": Plasma.name,
+                                                 "confirm": True}, owner)
+            wait_until(lambda: engine.prompt() is not None, 10, 0.05)
+            shown = engine.prompt() or {}
+            bare, _ = call("/api/run/acknowledge", {}, owner)
+            stale, stale_body = call("/api/run/acknowledge",
+                                     {"prompt": shown.get("id", 0) + 1000}, owner)
+            attempt("a Done says which step it confirms; one for another step "
+                    "is refused",
+                    lambda: (code == 200 and bare == 400 and stale == 409
+                             and engine.prompt() is not None,
+                             f"start {code}; no id {bare}; wrong id {stale}: "
+                             f"{stale_body.get('error', '')[:40]}"))
+            done, _ = call("/api/run/acknowledge", {"prompt": shown.get("id")},
+                           owner)
+            engine._flush()
+            said = [e for e in database.events(limit=20)
+                    if e["message"].startswith("Olga confirmed: Set the "
+                                               "magnetron")]
+            attempt("the right one is taken, and kept under who pressed it",
+                    lambda: (done == 200 and engine.prompt() is None
+                             and said and said[0].get("user") == "olga",
+                             f"{done}; " + (said[0]["message"][:50] if said
+                                            else "not recorded")))
+            engine.stop("selftest")
+            wait_until(lambda: not engine.status()["running"], 15, 0.1)
+            left = engine.status().get("checklist") or []
+            again, again_body = call("/api/run/start", {
+                "procedure": "hold", "confirm": True,
+                "config": {"duration_min": 5, "interval_s": 1}}, owner)
+            attempt("a plasma left on by hand is on the checklist, and no run "
+                    "starts until somebody confirms it off",
+                    lambda: ([x["actuator"] for x in left] == ["magnetron"]
+                             and not again_body.get("ok")
+                             and not engine.status()["running"],
+                             f"{[x['actuator'] for x in left]}; start: "
+                             f"{again_body.get('error', 'started')[:50]}"))
+            tablet = call("/api/devices/add", {"label": "Lab wall"}, owner)[1]
+            watching = call("/api/pair", {"code": tablet.get("code")})[1] \
+                .get("token")
+            watched, _ = call("/api/run/checklist", {"id": left[0]["id"]},
+                              watching) if left else (None, {})
+            # Ana does not hold control: Olga does. Confirming a step makes
+            # nothing less safe, so it does not need it.
+            confirmed, _ = call("/api/run/checklist", {"id": left[0]["id"]},
+                                ana) if left else (None, {})
+            engine._flush()
+            kept_by = [e.get("user") for e in database.events(limit=20)
+                       if "confirmed after the run" in e["message"]]
+            attempt("any operator may confirm a step left by hand, control or "
+                    "not; a tablet that only watches may not",
+                    lambda: (watched == 403 and confirmed == 200
+                             and engine.status().get("checklist") == []
+                             and kept_by[:1] == ["ana"],
+                             f"tablet {watched}, operator {confirmed}, recorded "
+                             f"under {kept_by[:1]}"))
+        finally:
+            del runs.CATALOGUE[Plasma.name]
+            engine.stop("selftest")
+            wait_until(lambda: not engine.status()["running"], 15, 0.1)
+
+        # --- an owed clean-up checked by hand -------------------------------
+        owed = database.create_run("bakeout", "Heater checked by hand", {})
+        database.finish_run(owed["id"], dbmod.ABORTED, {"cleanup_pending": True})
+        gave_up = engine._remember(owed, "its clean-up did not succeed after 5 "
+                                          "attempts", False, "unfinished")
+        route = f"/api/runs/{owed['id']}/cleanup-checked"
+        sure = {"reason": "TMS reads the heater off on the drive", "checked": True,
+                "confirm": True}
+        by_operator, _ = call(route, sure, ana)
+        unticked, _ = call(route, {**sure, "checked": False}, owner)
+        wordless, _ = call(route, {**sure, "reason": " "}, owner)
+        attempt("only an admin says an owed clean-up was done by hand, ticked "
+                "and with a reason",
+                lambda: (by_operator == 403 and unticked == 400 and wordless == 400
+                         and database.run(owed["id"])["result"]
+                         .get("cleanup_pending") is True,
+                         f"operator {by_operator}, unticked {unticked}, no "
+                         f"reason {wordless}"))
+        marked, _ = call(route, sure, owner)
+        stored = database.run(owed["id"])["result"]
+        owing = [r["id"] for r in database.runs_owing_cleanup()]
+        noted = [e for e in database.events(limit=20)
+                 if "clean-up as done by hand" in e["message"]]
+        twice, _ = call(route, sure, owner)
+        attempt("then it is owed no longer: nothing replays it at the next "
+                "start, and the record says who and why",
+                lambda: (marked == 200 and stored.get("cleanup_pending") is False
+                         and (stored.get("cleanup_checked") or {}).get("by")
+                         == "olga" and owed["id"] not in owing
+                         and gave_up["ok"] is True and gave_up["kind"] == "checked"
+                         and noted and noted[0].get("user") == "olga"
+                         and twice == 409,
+                         f"{marked}; pending {stored.get('cleanup_pending')}; "
+                         f"still listed {owed['id'] in owing}; again {twice}"))
+        # The role is judged on the same parse as the dispatch: a trailing
+        # slash or an extra segment is not a way round "admin only".
+        other = database.create_run("bakeout", "Slashed", {})
+        database.finish_run(other["id"], dbmod.ABORTED, {"cleanup_pending": True})
+        slashed, _ = call(f"/api/runs/{other['id']}/cleanup-checked/", sure, ana)
+        extra, _ = call(f"/api/runs/{other['id']}/delete/x", {"confirm": True}, ana)
+        admin_slash, _ = call(f"/api/runs/{other['id']}/cleanup-checked/", sure,
+                              owner)
+        kept = database.run(other["id"]) or {}
+        odd = [apimod.run_route(r) for r in ("/api/runs/²/delete",
+                                             "/api/runs/７/delete")]
+        attempt("a run id in other digits than 0-9 is no run at all",
+                lambda: (odd == [None, None], str(odd)))
+        attempt("a trailing slash or an extra segment is no way round an admin "
+                "route",
+                lambda: (slashed in (403, 404) and extra in (403, 404)
+                         and admin_slash == 404 and kept
+                         and kept["result"].get("cleanup_pending") is True,
+                         f"operator {slashed} and {extra}, admin {admin_slash}; "
+                         f"run {'kept' if kept else 'gone'}"))
     finally:
         server.shutdown()
         server.server_close()

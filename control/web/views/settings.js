@@ -1,5 +1,6 @@
 // Accounts, where the panel points, how often it polls, what is on the rig,
-// and what the server is running.
+// and what the server is running -- one sub-tab each, so nobody scrolls past
+// the port survey to change the theme.
 //
 // What changes the rig's set-up -- equipment, ports, the port search -- is an
 // admin's (lab/api.py POST_RULES); for everyone else those controls are
@@ -8,7 +9,7 @@
 import { html } from "../html.js";
 import { useEffect, useState } from "preact/hooks";
 import { Banner, Card, Confirm, Empty, Pairs, Pill } from "../ui.js";
-import { api, normaliseHost, settings, updateSettings } from "../api.js";
+import { POLL_MAX_MS, api, normaliseHost, settings, updateSettings } from "../api.js";
 import { MyAccount, People, Tablets } from "./people.js";
 import { beep } from "../alarms.js";
 import * as fmt from "../format.js";
@@ -314,7 +315,23 @@ function PortPicker({ devices, notify, onChanged, admin = true }) {
     <//>`;
 }
 
-export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
+
+/** The sub-tabs this person sees, in order. */
+function settingsTabs(me, connected = true) {
+  // Before the panel has ever answered, only this screen's own settings --
+  // where it points -- mean anything.
+  if (!connected) return [{ key: "screen", label: "This screen" }];
+  return [
+    me?.kind === "person" && { key: "account", label: "My account" },
+    me?.kind === "person" && me?.can?.admin && { key: "people", label: "People" },
+    { key: "rig", label: "Rig" },
+    { key: "screen", label: "This screen" },
+    { key: "server", label: "Server" },
+  ].filter(Boolean);
+}
+
+export function SettingsView({ state, onSettingsChanged, notify, onSignOut, sub = "",
+                               onSelect = () => {} }) {
   const current = settings();
   const [draft, setDraft] = useState({ ...current });
   const [stats, setStats] = useState(null);
@@ -328,7 +345,7 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
   const apply = () => {
     updateSettings({
       host: draft.host.trim(),
-      pollMs: Math.max(500, Number(draft.pollMs) || 2000),
+      pollMs: Math.min(POLL_MAX_MS, Math.max(500, Number(draft.pollMs) || 2000)),
       theme: draft.theme,
       alarmSound: draft.alarmSound !== false,
     });
@@ -339,15 +356,31 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
   const devices = state?.devices || {};
   const me = state?.me;
   const admin = !!me?.can?.admin;
+  const tabs = settingsTabs(me, !!state);
+  const active = tabs.find((tab) => tab.key === sub) || tabs[0];
+  const page = active.key;
 
   return html`
     <div class="grid" style="gap:16px">
-      <${MyAccount} me=${me} notify=${notify} onSignOut=${onSignOut}
-                    onChanged=${onSettingsChanged} />
-      <${People} me=${me} notify=${notify} />
-      <${Tablets} me=${me} notify=${notify} />
+      <nav class="tabs subtabs" aria-label="Settings">
+        ${tabs.map((tab) => html`
+          <button key=${tab.key} aria-current=${tab.key === page ? "page" : null}
+                  data-test=${`subtab-${tab.key}`} onClick=${() => onSelect(tab.key)}>
+            ${tab.label}
+            ${tab.key === "people" && me?.waiting > 0
+              ? html`<span class="badge pill warn">${me.waiting}<span class="sr-only"> waiting</span></span>`
+              : null}
+          </button>`)}
+      </nav>
 
-      <${Card} title="Connection"
+      ${page === "account" && html`
+        <${MyAccount} me=${me} notify=${notify} onSignOut=${onSignOut}
+                      onChanged=${onSettingsChanged} />`}
+      ${page === "people" && html`
+        <${People} me=${me} notify=${notify} />
+        <${Tablets} me=${me} notify=${notify} />`}
+
+      ${page === "screen" && html`<${Card} title="Connection"
                hint="Leave the address empty when this page is served by the lab PC itself. To drive that machine from a page served elsewhere, fill it in — and start that server with --allow-origin naming this page's origin, or it refuses the requests.">
         <label class="field">
           <span>Controller address</span>
@@ -363,10 +396,12 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
           <label class="field">
             <span>Poll interval</span>
             <span class="suffix">
-              <input type="number" min="500" step="500" value=${draft.pollMs}
+              <input type="number" min="500" max=${POLL_MAX_MS} step="500" value=${draft.pollMs}
                      onInput=${(e) => setDraft({ ...draft, pollMs: e.target.value })} />
               <span class="unit">ms</span>
             </span>
+            <span class="help">0.5 to 10 s. Holding control needs a poll at least
+              every 15 s.</span>
           </label>
           <label class="field">
             <span>Theme</span>
@@ -395,8 +430,9 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
           <button class="primary" onClick=${apply}>Save</button>
           <span class="small muted">Stored in this browser only.</span>
         </div>
-      <//>
+      <//>`}
 
+      ${page === "rig" && html`
       <${RigEquipment} state=${state} notify=${notify} admin=${admin} />
 
       <${AutoPorts} state=${state} notify=${notify} admin=${admin} />
@@ -431,8 +467,9 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
                 </tbody>
               </table>
             </div>`}
-      <//>
+      <//>`}
 
+      ${page === "server" && html`
       <div class="grid two">
         <${Card} title="Server">
           <${Pairs} items=${[
@@ -466,7 +503,7 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
               ${stats.stats.path && html`<div class="small muted mono">${stats.stats.path}</div>`}`
             : html`<${Empty}>Not available.<//>`}
         <//>
-      </div>
+      </div>`}
     </div>`;
 }
 

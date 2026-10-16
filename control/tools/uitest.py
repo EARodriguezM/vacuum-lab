@@ -50,7 +50,8 @@ sys.path.insert(0, ROOT)
 from tools.cdp import Chrome, Page, attach  # noqa: E402
 
 PARTS = ("pages", "maths", "gating", "override", "prompt", "fault", "idle",
-         "deploy", "form", "history", "signup")
+         "deploy", "form", "history", "signup", "start", "guided", "lost",
+         "sending")
 SIZES = {"tablet": (1024, 600, False), "phone": (390, 844, True)}
 ROLES = ("viewer", "operator", "admin", "tablet")
 PASSWORD = "uitest-pass-1"
@@ -68,6 +69,12 @@ INSTRUMENT = r"""
   window.fetch = async (input, init) => {
     const url = String(input && input.url || input);
     const method = (init && init.method) || "GET";
+    // The lab PC gone, on purpose: `ui.offline = true`. Not a failure.
+    if (ui.offline && url.includes("/api/")) throw new TypeError("offline (uitest)");
+    // A command held in flight until `ui.release()`: `ui.hold = true`.
+    if (ui.hold && url.includes("/api/command")) {
+      await new Promise((resolve) => { ui.release = resolve; });
+    }
     try {
       const response = await real(input, init);
       if (url.includes("/api/state") && response.ok) ui.polls += 1;
@@ -105,6 +112,14 @@ AUDIT = r"""
   const screenW = document.documentElement.clientWidth;
   const sideways = document.documentElement.scrollWidth > screenW + 1
     || document.body.scrollWidth > screenW + 1;
+  // What sticks out, outside the boxes meant to scroll: named in the failure.
+  const wide = sideways ? [...document.querySelectorAll("body *")]
+    .filter((e) => !e.closest(".scroll-x, nav.tabs, .table-view"))
+    .map((e) => [e, e.getBoundingClientRect()])
+    .filter(([e, r]) => r.width > 0 && r.right > screenW + 1)
+    .slice(-4).map(([e, r]) => `${e.tagName.toLowerCase()}.${String(e.className)
+      .split(" ")[0]} to ${Math.round(r.right)}: ${(e.innerText || "")
+      .trim().slice(0, 30)}`) : [];
   const coarse = matchMedia("(pointer: coarse)").matches;
   const small = coarse ? [...document.querySelectorAll("button, a.btn, select")]
     .filter((e) => e.offsetParent && !e.closest("[data-test-skip-size]"))
@@ -114,7 +129,7 @@ AUDIT = r"""
       ? e.options[e.selectedIndex]?.text : e.innerText) || e.value || e.tagName)
       .trim().slice(0, 30)} ${Math.round(r.height)}px`) : [];
   const failed = window.__ui ? window.__ui.failed.splice(0) : [];
-  return { bad, sideways, small, failed };
+  return { bad, sideways, wide, small, failed };
 })()
 """ % {"touch": TOUCH_PX}
 
@@ -200,6 +215,11 @@ class Server:
             ("hold", "failed", {"ultimate_mbar": 8.1e-6}),
             ("base_calibration", "completed",
              {"base_mbar": 2.6e-5, "ultimate_mbar": 2.5e-5, "time_to_base_s": 3300}),
+            # Stopped before its shutter ever opened, its clean-up still owed.
+            ("deposition", "aborted",
+             {"base_mbar": 3.0e-5, "deposition_s": None, "shutter_closed": True,
+              "working_mbar_setpoint": 5e-3, "cleanup_pending": True,
+              "message": "the pump reported fault Err006"}),
         ]
         first = time.time() - (len(recipes) + 1) * 86400
         for n, (procedure, status, result) in enumerate(recipes):
@@ -356,7 +376,8 @@ def audit(page: Page, report: Report, label: str, shots: str | None = None) -> N
     report.check(f"{label}: nothing thrown, logged as an error or failed to load",
                  not problems and not found.get("failed"),
                  "; ".join(problems + found.get("failed", []))[:200])
-    report.check(f"{label}: no sideways scroll", not found.get("sideways"))
+    report.check(f"{label}: no sideways scroll", not found.get("sideways"),
+                 "; ".join(found.get("wide") or [])[:200])
     report.check(f"{label}: no NaN or undefined on screen", not found.get("bad"),
                  "; ".join(found.get("bad", []))[:160])
     report.check(f"{label}: every button at least {TOUCH_PX} px to a finger",
@@ -498,7 +519,13 @@ def part_override(chrome, server, sessions, report, shots):
     type_into(page, "override-reason", "uitest: looking at the dialog only")
     page.js("document.querySelector(\"[data-test='override-checked']\").click()")
     settle(page)
-    report.check("with both it can", present(page, "override-confirm").get("enabled"))
+    report.check("with both it can", present(page, "override-confirm").get("enabled"),
+                 str(page.js("(() => { const d = document.querySelector("
+                             "\"[data-test='override-dialog']\"); return d ? {"
+                             "reason: d.querySelector('input').value, checked: "
+                             "d.querySelector('input[type=checkbox]').checked, "
+                             "text: d.innerText.slice(0, 120), dialogs: "
+                             "document.querySelectorAll('.overlay').length} : null; })()")))
     click(page, "override-cancel")
     settle(page)
     report.check("cancelling closes it and sends nothing",
@@ -599,14 +626,37 @@ def part_idle(chrome, server, sessions, report, shots):
                           timeout=10)
         report.check("Enter password asks for it", asked)
         audit(page, report, "idle prompt", shots)
+        # Keep watching, for now.
+        page.js("(document.querySelector(\"[data-test='reauth-password']\") || "
+                "document.body).closest('form')?.querySelector('button[type=button]')"
+                "?.click()")
+        settle(page)
+        # Answering an alarm stays open to an idle operator: it asks for the
+        # password, and once typed the acknowledgement goes ahead.
+        supervisor = server.app.supervisor
+        raised = supervisor.raise_alarm("uitest_idle", "warning",
+                                        "uitest: an alarm for an idle operator",
+                                        "Raised by the browser test.")
+        page.wait("document.querySelector(\"[data-test='alarm-ack']\")", timeout=10)
+        ack = present(page, "alarm-ack")
+        report.check("an idle operator's Acknowledge is not a dead button",
+                     ack.get("shown") and ack.get("enabled"), str(ack))
         if asked:
             # Back to the normal limit: three seconds would idle the session
             # again before the panel's next poll could show it active.
             auth.idle_s = saved
+            click(page, "alarm-ack")
+            reopened = page.wait("document.querySelector(\"[data-test='reauth-password']\")",
+                                 timeout=10)
+            report.check("pressing it asks for the password", reopened)
             type_into(page, "reauth-password", PASSWORD)
             click(page, "reauth-submit")
             closed = page.wait("!document.querySelector(\"[data-test='reauth-password']\")",
                                timeout=10)
+            acknowledged = _wait(lambda: not any(
+                a["id"] == raised["id"] for a in supervisor.describe()["alarms"]), 10)
+            report.check("and once it is typed, the alarm is acknowledged without "
+                         "pressing again", acknowledged)
             wait_polls(page)
             # What the password changes: the panel leaves "watching only",
             # and the server no longer calls the session idle. (Whether the
@@ -719,22 +769,34 @@ def part_history(chrome, server, sessions, report, shots):
     report.check("closing it goes back to the same place in the list",
                  abs(back - before) <= 2, f"{before} -> {back}")
 
-    # Saving a note closes the run and reloads the list: same place again.
+    # Saving a note keeps the run open; closing it goes back to the list.
     page.js("window.scrollTo(0, document.documentElement.scrollHeight)")
     settle(page)
     before = page.js("window.scrollY")
     click(page, row)
     page.wait("document.querySelector(\"[data-test='history-save']\")", timeout=10)
+    # The page fills its form after its first frame: typed before that, the
+    # note is overwritten (which the earlier version of this check missed).
+    page.wait("!document.body.innerText.includes('Loading the curves')", timeout=10)
+    settle(page)
     type_into(page, "history-notes", "uitest: a note, saved")
     click(page, "history-save")
-    page.wait("document.querySelector(\"[data-test^='history-run-']\")", timeout=10)
     run_id = int(row.rsplit("-", 1)[1])
-    _wait(lambda: (server.app.db.run(run_id) or {}).get("notes")
-          == "uitest: a note, saved", 5)
+    saved = _wait(lambda: (server.app.db.run(run_id) or {}).get("notes")
+                  == "uitest: a note, saved", 5)
     wait_polls(page)
     settle(page)
+    still = present(page, "history-close").get("shown")
+    kept = page.js("(document.querySelector(\"[data-test='history-notes']\") || {})"
+                   ".value")
+    report.check("saving a run's notes keeps the run open, with the note",
+                 saved and still and kept == "uitest: a note, saved",
+                 f"saved {saved}, still open {still}, box {kept!r}")
+    click(page, "history-close")
+    page.wait("document.querySelector(\"[data-test^='history-run-']\")", timeout=10)
+    settle(page)
     back = page.js("window.scrollY")
-    report.check("saving a run's notes goes back to the same place in the list",
+    report.check("and closing it then goes back to the same place in the list",
                  abs(back - before) <= 2, f"{before} -> {back}")
 
     # The case reported: a link to a run from low on another page.
@@ -760,6 +822,40 @@ def part_history(chrome, server, sessions, report, shots):
                       ".innerText || ''").strip()
     report.check("a paired tablet's run form names no operator", named == "—",
                  repr(named))
+
+    # A deposition whose shutter never opened is not "confirmed closed", and
+    # its owed clean-up is an admin's to mark as done by hand.
+    owed = next(r for r in server.app.db.runs(limit=50)
+                if r["procedure"] == "deposition")
+    open_as(page, server.base, sessions["operator"], f"history/{owed['id']}")
+    page.wait("document.querySelector(\"[data-test='history-close']\")", timeout=10)
+    page.wait("!document.body.innerText.includes('Loading the curves')", timeout=10)
+    text = page.js("document.body.innerText")
+    report.check("a shutter that never opened is said so, not 'confirmed'",
+                 "never opened" in text and "Its clean-up is still owed" in text
+                 and not present(page, "cleanup-checked-open").get("shown"),
+                 text[text.find("Shutter"):][:40] if "Shutter" in text else "no row")
+    admin = chrome.page(*SIZES["tablet"])
+    open_as(admin, server.base, sessions["admin"], f"history/{owed['id']}")
+    admin.wait("document.querySelector(\"[data-test='cleanup-checked-open']\")",
+               timeout=10)
+    click(admin, "cleanup-checked-open")
+    admin.wait("document.querySelector(\"[data-test='cleanup-checked-reason']\")",
+               timeout=10)
+    shut = present(admin, "confirm-ok")
+    type_into(admin, "cleanup-checked-reason", "uitest: the supply reads off")
+    admin.js("document.querySelector(\"[data-test='cleanup-checked-tick']\").click()")
+    settle(admin)
+    audit(admin, report, "an owed clean-up marked as done by hand", shots)
+    click(admin, "confirm-ok")
+    settled = _wait(lambda: (server.app.db.run(owed["id"])["result"] or {})
+                    .get("cleanup_pending") is False, 10)
+    report.check("an admin marks it done by hand, with what was checked, and "
+                 "only once both are given",
+                 not shut.get("enabled") and settled
+                 and (server.app.db.run(owed["id"])["result"].get("cleanup_checked")
+                      or {}).get("by") == "adam",
+                 f"confirm at first {shut}; settled {settled}")
 
 
 def part_signup(chrome, server, sessions, report, shots):
@@ -807,7 +903,7 @@ def part_signup(chrome, server, sessions, report, shots):
                      f"page {bool(done)}, stored {user.get('username')}")
         audit(page, report, "sign-up: sent", shots)
         admin = chrome.page(*SIZES["tablet"])
-        open_as(admin, server.base, sessions["admin"], "settings")
+        open_as(admin, server.base, sessions["admin"], "settings/people")
         listed = admin.wait("(document.querySelector(\"[data-test='address-nina.ruiz']\")"
                             " || {}).innerText", timeout=15) or ""
         report.check("the People page shows the request verified with Google",
@@ -818,6 +914,217 @@ def part_signup(chrome, server, sessions, report, shots):
             os.unlink(path)
         googlemod.DEVICE_URL, googlemod.TOKEN_URL = urls
         google.close()
+
+
+def part_start(chrome, server, sessions, report, shots):
+    """Start repeats the recipe in a dialog; only its confirm starts the run."""
+    engine = server.app.engine
+    page = chrome.page(*SIZES["tablet"])
+    open_as(page, server.base, sessions["operator"], "tests")
+    page.wait("document.querySelector(\"[data-test='run-start'], [data-test='run-new']\")")
+    if click(page, "run-new"):
+        page.wait("document.querySelector(\"[data-test='run-start']\")")
+    click(page, "procedure-hold")
+    page.wait("[...document.querySelectorAll(\"input[data-test^='recipe-field-']\")]"
+              ".every(e => e.value !== '')", timeout=10)
+    settle(page)
+    click(page, "run-start")
+    shown = page.wait("document.querySelector(\"[data-test='start-dialog']\")"
+                      " && document.querySelector(\"[data-test='start-dialog']\").innerText",
+                      timeout=10)
+    report.check("Start shows the recipe before anything runs",
+                 shown and "Hold" in shown and not engine.status()["running"],
+                 (shown or "")[:90])
+    audit(page, report, "start dialog", shots)
+    click(page, "confirm-cancel")
+    settle(page)
+    report.check("cancelling starts nothing",
+                 not present(page, "start-dialog").get("shown")
+                 and not engine.status()["running"])
+    click(page, "run-start")
+    page.wait("document.querySelector(\"[data-test='start-dialog']\")", timeout=10)
+    click(page, "confirm-ok")
+    going = _wait(lambda: engine.status()["running"], 10)
+    report.check("its confirm starts the run, sent with confirm",
+                 going and engine.status().get("procedure") == "hold",
+                 str(engine.status().get("procedure")))
+    if going:
+        stopped = page.wait("document.querySelector(\"[data-test='run-stop']\")",
+                            timeout=10)
+        report.check("and the page follows it", stopped)
+        # Stop is on the Dashboard too, through the same choice.
+        open_as(page, server.base, sessions["operator"], "dashboard")
+        page.wait("document.querySelector(\"[data-test='dash-stop']\")", timeout=10)
+        click(page, "dash-stop")
+        page.wait("document.querySelector(\"[data-test='choice-keep']\")", timeout=10)
+        click(page, "choice-keep")
+        ended = _wait(lambda: not engine.status()["running"], 15)
+        report.check("Stop on the Dashboard ends the run, keeping the vacuum", ended)
+        if not ended:
+            engine.stop("uitest")
+            _wait(lambda: not engine.status()["running"], 15)
+    open_as(page, server.base, sessions["viewer"], "overview")
+    moved = page.js("location.hash")
+    report.check("an old link to the Overview lands on the Dashboard",
+                 moved == "#dashboard", moved)
+
+
+def part_guided(chrome, server, sessions, report, shots):
+    """A guided step is answered from any page; what an ending leaves by hand
+    stays on every page, sounding, until confirmed."""
+    engine = server.app.engine
+    # An alarm left by an earlier part would rightly take the tab's title.
+    server.app.supervisor.acknowledge("all")
+    gate = engine.hardware.gate
+    driver, gate.driver = gate.driver, None      # by hand, as on the rig today
+    code, body = server.call("/api/run/start", {
+        "procedure": "rate_of_rise", "confirm": True,
+        "config": {"mode": "guided", "settle_s": 0, "duration_s": 30,
+                   "interval_s": 1, "volume_l": 10}}, sessions["operator"]["person"])
+    try:
+        if not report.check("a guided run starts", code == 200,
+                            str(body.get("error", ""))[:100]):
+            return
+        page = chrome.page(*SIZES["tablet"])
+        open_as(page, server.base, sessions["operator"], "dashboard")
+        shown = page.wait("document.querySelector(\"[data-test='prompt']\")"
+                          " && document.querySelector(\"[data-test='prompt']\").innerText",
+                          timeout=15)
+        report.check("the step it waits for is on the Dashboard too", shown,
+                     (shown or "")[:80])
+        title = page.js("document.title")
+        report.check("and in the tab's title", "Waiting for you" in title, title)
+        audit(page, report, "guided prompt on the Dashboard", shots)
+        click(page, "prompt-done")
+        gone = page.wait("!document.querySelector(\"[data-test='prompt']\")",
+                         timeout=10)
+        report.check("Done there carries the run on",
+                     gone and engine.status().get("phase") in ("settle", "measuring",
+                                                               "done"),
+                     str(engine.status().get("phase")))
+    finally:
+        engine.stop("uitest")
+        _wait(lambda: not engine.status()["running"], 15)
+        gate.driver = driver
+
+    engine.leave_by_hand([{"actuator": "magnetron", "label": "Magnetron",
+                           "instruction": "Switch the magnetron power supply OFF.",
+                           "value": "0 W"}])
+    try:
+        viewer = chrome.page(*SIZES["phone"])
+        open_as(viewer, server.base, sessions["viewer"], "history")
+        listed = viewer.wait("document.querySelector(\"[data-test='checklist']\")"
+                             " && document.querySelector(\"[data-test='checklist']\").innerText",
+                             timeout=10)
+        report.check("a step left by hand is on every page, even a viewer's",
+                     listed and "magnetron" in listed.lower()
+                     and not present(viewer, "checklist-done").get("shown"),
+                     (listed or "")[:80])
+        audit(viewer, report, "checklist, viewer on a phone", shots)
+        page = chrome.page(*SIZES["tablet"])
+        open_as(page, server.base, sessions["operator"], "equipment/gauge")
+        page.wait("document.querySelector(\"[data-test='checklist-done']\")", timeout=10)
+        # Sound is unlocked by a first touch; before it, nothing sounds.
+        before = present(page, "silence")
+        page.js("window.dispatchEvent(new PointerEvent('pointerdown'))")
+        wait_polls(page)
+        quiet = present(page, "silence")
+        click(page, "silence")
+        settle(page)
+        report.check("an operator may silence it here, once it sounds; it stays "
+                     "listed", not before.get("shown") and quiet.get("shown")
+                     and not present(page, "silence").get("shown")
+                     and present(page, "checklist-done").get("shown"),
+                     f"before a touch {before}, after {quiet}")
+        started = server.call("/api/run/start", {
+            "procedure": "hold", "confirm": True,
+            "config": {"duration_min": 5, "interval_s": 1}},
+            sessions["operator"]["person"])[1]
+        report.check("no run starts meanwhile", not started.get("ok"),
+                     str(started.get("error", "it started"))[:60])
+        click(page, "checklist-done")
+        done = page.wait("!document.querySelector(\"[data-test='checklist']\")",
+                         timeout=10)
+        report.check("Done takes it off every page", done and not engine.checklist())
+    finally:
+        for step in engine.checklist():
+            engine.confirm_step(step["id"])
+        if engine.status()["running"]:
+            engine.stop("uitest")
+            _wait(lambda: not engine.status()["running"], 15)
+
+
+def part_lost(chrome, server, sessions, report, shots):
+    """No answer from the lab PC: said, counted, the old figures greyed out --
+    and a dialog open at that moment stays where it is."""
+    page = chrome.page(*SIZES["tablet"])
+    open_as(page, server.base, sessions["operator"], "tests")
+    page.wait("document.querySelector(\"[data-test='run-start'], [data-test='run-new']\")")
+    if click(page, "run-new"):
+        page.wait("document.querySelector(\"[data-test='run-start']\")")
+    click(page, "procedure-hold")
+    page.wait("[...document.querySelectorAll(\"input[data-test^='recipe-field-']\")]"
+              ".every(e => e.value !== '')", timeout=10)
+    page.js("window.scrollTo(0, document.documentElement.scrollHeight)")
+    click(page, "run-start")
+    page.wait("document.querySelector(\"[data-test='start-dialog']\")", timeout=10)
+    page.js("window.__ui.offline = true")
+    said = page.wait("(document.querySelector(\"[data-test='lost-contact']\") || {})"
+                     ".innerText", timeout=4 * POLL_S + 6)
+    grey = page.js("!!document.querySelector('.wrap-inner.stale')")
+    report.check("after two polls without an answer the panel says so, and greys "
+                 "the old figures", said and "No contact with the lab PC since" in said
+                 and grey, f"{said!r}, grey {grey}")
+    box = page.js("(() => { const r = document.querySelector('.dialog')"
+                  ".getBoundingClientRect(); return {top: r.top, bottom: r.bottom,"
+                  " height: innerHeight}; })()") or {}
+    report.check("a dialog open then stays on the screen",
+                 box.get("top", -1) >= 0 and box.get("bottom", 1e9) <= box.get("height", 0),
+                 str(box))
+    time.sleep(2 * POLL_S + 1.5)
+    later = page.js("(document.querySelector(\"[data-test='lost-contact']\") || {})"
+                    ".innerText")
+    report.check("and keeps counting how long it has been", later and later != said,
+                 f"{said!r} then {later!r}")
+    page.js("window.__ui.offline = false")
+    back = page.wait("!document.querySelector(\"[data-test='lost-contact']\")"
+                     " && !document.querySelector('.wrap-inner.stale')",
+                     timeout=2 * POLL_S + 6)
+    report.check("and goes back to normal at the next answer", back)
+    click(page, "confirm-cancel")
+
+    # A poll slower than the control lease was saved before the cap: capped.
+    slow = chrome.page(*SIZES["tablet"])
+    open_as(slow, server.base, sessions["viewer"], "dashboard")
+    slow.js("localStorage.setItem('vacuum-lab-settings', JSON.stringify({pollMs: 30000}))")
+    slow.goto(f"{server.base}/?r={time.time()}#dashboard")
+    slow.wait("window.__ui && window.__ui.polls >= 1", timeout=15)
+    first = polls(slow)
+    time.sleep(10.0 + POLL_S)
+    report.check("a saved poll interval over 10 s is not used",
+                 polls(slow) > first, f"{polls(slow) - first} polls in 12 s")
+
+
+def part_sending(chrome, server, sessions, report, shots):
+    """A command on its way cannot be cancelled: its answer comes back to the
+    dialog that sent it."""
+    page = chrome.page(*SIZES["tablet"])
+    open_as(page, server.base, sessions["operator"], "equipment/pump")
+    page.wait("document.querySelector(\"[data-test='pump-on']\")", timeout=10)
+    if not click(page, "pump-on") and not click(page, "pump-off"):
+        report.check("a station button can be pressed", False)
+        return
+    page.wait("document.querySelector(\"[data-test='confirm-ok']\")", timeout=10)
+    page.js("window.__ui.hold = true")
+    click(page, "confirm-ok")
+    page.wait("window.__ui.release", timeout=10)
+    cancel = present(page, "confirm-cancel")
+    report.check("while it is sending, Cancel is locked",
+                 cancel.get("shown") and not cancel.get("enabled"), str(cancel))
+    page.js("window.__ui.hold = false; window.__ui.release()")
+    answered = page.wait("!document.querySelector(\"[data-test='confirm-ok']\")",
+                         timeout=10)
+    report.check("and the answer closes it, or shows the refusal in it", answered)
 
 
 def _wait(predicate, timeout: float) -> bool:
@@ -833,7 +1140,9 @@ PART_FUNCTIONS = {"pages": part_pages, "maths": part_maths,
                   "gating": part_gating, "override": part_override,
                   "prompt": part_prompt, "fault": part_fault,
                   "idle": part_idle, "deploy": part_deploy, "form": part_form,
-                  "history": part_history, "signup": part_signup}
+                  "history": part_history, "signup": part_signup,
+                  "start": part_start, "guided": part_guided, "lost": part_lost,
+                  "sending": part_sending}
 
 
 # --- the kiosk -------------------------------------------------------------------
