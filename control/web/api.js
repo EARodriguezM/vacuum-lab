@@ -297,9 +297,8 @@ export const api = {
   login:   (username, password) =>
     post("/api/login", { username, password, device: sessions.device || undefined }),
   signup:  (body) => post("/api/signup", body),
-  verifyEmail: (username, password, code) =>
-    post("/api/signup/verify", { username, password, code }),
-  requestCode: (username, password) => post("/api/signup/code", { username, password }),
+  googleStart: (password, note) => post("/api/signup/google/start", { password, note }),
+  googlePoll: (flow) => post("/api/signup/google/poll", { flow }),
   pair:    (code) => post("/api/pair", { code }),
   logout:  () => post("/api/logout", {}),
   me:      () => get("/api/me"),
@@ -312,8 +311,10 @@ export const api = {
   releaseControl: () => post("/api/control/release", {}),
 
   users:        () => get("/api/users"),
-  approveUser:  (id, role) => post("/api/users/approve", { id, role }),
-  declineUser:  (id) => post("/api/users/decline", { id }),
+  // created_at: the request as the admin was shown it (a request made again
+  // since is refused, not decided blind).
+  approveUser:  (id, role, created_at) => post("/api/users/approve", { id, role, created_at }),
+  declineUser:  (id, created_at) => post("/api/users/decline", { id, created_at }),
   setRole:      (id, role) => post("/api/users/role", { id, role }),
   setEnabled:   (id, enabled) => post("/api/users/status", { id, enabled }),
   resetPassword: (id) => post("/api/users/reset-password", { id }),

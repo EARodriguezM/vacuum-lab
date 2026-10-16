@@ -370,28 +370,25 @@ you may do depends on your role in this chamber:
 | **admin** | also set the rig up (equipment, ports, automatic recovery), approve accounts, reset passwords, pair tablets, change the drive's settings, **override interlocks** |
 | **owner** | one per chamber: also appoints admins |
 
-- **Getting an account.** *Request an account* on the sign-in page. Your
-  username is your institutional email before the @: for
-  anperez@unal.edu.co, type `anperez` (typing the whole address works too).
-  Choose a password, and a 6-digit code is mailed to that address. Type the
-  code back on the next step **with the same password**; it is good for 30
-  minutes (*Send a new code* if it lapses, at most one a minute and five a
-  day). An admin can approve the request under Settings → People, and pick
-  your role, only after the address is confirmed; People shows each
-  request's address and whether it is confirmed. If you close the page, use
-  *I already have a code* and give your username, password and code. Ask for
-  a higher role later from Settings → My account.
-- **Mail for the codes.** The lab's machine needs a mail account to send
-  them. Whoever runs it sets that up once, on the machine itself (the
-  settings are never shown on a page and are not part of a backup):
-  `./tools/users.py mail set --host smtp.gmail.com --user lab@example.org
-  --sender "Vacuum Lab <lab@example.org>"` (it asks for the account's
-  password), then `./tools/users.py mail test you@unal.edu.co` to send a
-  test message; `mail show` lists the settings without the password and
-  `mail off` stops sending. Without a mail account nothing is checked:
-  requests are approved as before, and People warns that addresses are not
-  verified. Another domain than `unal.edu.co` is set with
-  `webserver.py --email-domain`.
+- **Getting an account.** *Request an account* on the sign-in page: choose a
+  password for this panel (not your institutional one), add a note for the
+  admin, and press **Continue with Google**. The page shows a short code; on
+  your phone or computer open google.com/device, sign in with your
+  institutional (@unal.edu.co) Google account and type it. The request is
+  then sent by itself, under your institutional email before the @ as the
+  username (for anperez@unal.edu.co, `anperez`) and the name Google has.
+  Type such a code only for yourself: whoever types it lends the request
+  their account. An admin approves the request under Settings → People and
+  picks your role (an admin who does not know you should check with you
+  first); from then on you sign in with the username — or the whole address —
+  and that password, without Google. Ask for a higher role later from
+  Settings → My account. The panel keeps nothing from Google but your
+  address and name: no access to your account.
+- **Google sign-in, set up once.** The lab's machine needs a Google OAuth
+  client to do this (see *Setting up the Google sign-in* below). Without
+  one, requests are taken as before, with a typed username, and People warns
+  that nobody's account is checked. Another domain than `unal.edu.co` is set
+  with `webserver.py --email-domain`.
 - **The first account** — the owner — is made on the lab PC itself, so nobody
   on the network can claim the rig: `./tools/users.py owner YOURNAME`. The
   same command gives a forgotten owner password back.
@@ -448,6 +445,51 @@ you may do depends on your role in this chamber:
   tablet on its cable (127.0.0.1) always passes. If Settings → Connection
   points at a panel on another machine, that machine must be started with
   `--allow-origin` for the page you are on.
+
+#### Setting up the Google sign-in
+
+The panel uses Google's sign-in for devices (the one a TV uses: a code typed
+at google.com/device), because the usual "Sign in with Google" button only
+works on an `https://` address with a domain name, and the panel is plain
+HTTP on the lab's IP address. Once, by whoever runs the panel:
+
+1. **A Google Cloud project**, in an account of the institution:
+   [console.cloud.google.com](https://console.cloud.google.com) → create a
+   project (e.g. "vacuum-lab").
+2. **The consent screen** (*Google Auth Platform*, or *APIs & Services →
+   OAuth consent screen*): app name "Vacuum Lab panel", the support and
+   contact e-mail. Audience **Internal** if it is offered: only accounts of
+   the institution can then use it, and the basic scopes it asks for
+   (`openid`, `email`, `profile`) need no review by Google. If only
+   **External** is offered, **publish** the app (status *In production*):
+   while it is *Testing*, Google lets in only the test users listed there and
+   turns everybody else away, which the panel reports as a declined sign-in.
+3. **A client:** *Clients → Create client → Application type: TVs and
+   Limited Input devices*, name "Vacuum Lab panel". Download its JSON.
+4. **On the panel's machine**, with that file copied over:
+
+   ```bash
+   ./tools/users.py google set --client-file client_secret_....json
+   ./tools/users.py google test      # a real sign-in from the terminal
+   ```
+
+   Run it as the account the panel runs under, not with `sudo`: a file the
+   panel cannot read blocks every request. `google test` prints a code; type
+   it at google.com/device with an institutional account, and it says what
+   username a request from that account would get. `google show` prints the client without its secret;
+   `google off` removes it. The panel uses it at once, no restart. Then
+   **delete the downloaded file** from wherever you copied it: the panel keeps
+   its own copy.
+
+The client is kept in `google.json` beside the database, readable by the
+panel's account only, and is never sent to a page, a download or a backup.
+If that file is damaged or unreadable, no account can be requested until it
+is set again (requests are never taken unchecked by accident).
+If the institution blocks the app ("Access blocked … admin"), its IT office
+has to allow the client ID. A request made before the sign-in was set up
+cannot be approved in the panel; the person asks again, or, once you have
+checked who they are, `./tools/users.py role NAME ROLE --unconfirmed` lets
+them in from the machine.
 
 ---
 

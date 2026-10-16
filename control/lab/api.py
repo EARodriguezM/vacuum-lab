@@ -69,8 +69,8 @@ POST_RULES = {
 }
 
 #: Reachable without a session: how a sign-in page finds out where it is.
-PUBLIC_POSTS = ("/api/login", "/api/signup", "/api/signup/verify",
-                "/api/signup/code", "/api/pair")
+PUBLIC_POSTS = ("/api/login", "/api/signup", "/api/signup/google/start",
+                "/api/signup/google/poll", "/api/pair")
 
 #: GETs that need more than watching.
 ADMIN_GETS = ("/api/ports/survey",)
@@ -1182,15 +1182,13 @@ class Handler(BaseHTTPRequestHandler):
                                      str(payload.get("password", "")),
                                      str(payload.get("note", "")),
                                      self._address())
-            elif route == "/api/signup/verify":
-                result = auth.verify_email(str(payload.get("username", "")),
+            elif route == "/api/signup/google/start":
+                result = auth.google_start(self._address(),
                                            str(payload.get("password", "")),
-                                           str(payload.get("code", "")),
-                                           self._address())
-            elif route == "/api/signup/code":
-                result = auth.request_code(str(payload.get("username", "")),
-                                           str(payload.get("password", "")),
-                                           self._address())
+                                           str(payload.get("note", "")))
+            elif route == "/api/signup/google/poll":
+                result = auth.google_poll(str(payload.get("flow", "")),
+                                          self._address())
             else:
                 result = auth.pair(str(payload.get("code", "")),
                                    self._address(), agent)
@@ -1265,9 +1263,11 @@ class Handler(BaseHTTPRequestHandler):
                                  bool(payload.get("approve")))
         elif route == "/api/users/approve":
             result = auth.approve(principal, number("id"),
-                                  str(payload.get("role", "viewer")))
+                                  str(payload.get("role", "viewer")),
+                                  created_at=payload.get("created_at"))
         elif route == "/api/users/decline":
-            result = auth.decline(principal, number("id"))
+            result = auth.decline(principal, number("id"),
+                                  created_at=payload.get("created_at"))
         elif route == "/api/users/role":
             result = auth.set_role(principal, number("id"),
                                    str(payload.get("role", "")))

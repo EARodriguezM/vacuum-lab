@@ -115,8 +115,9 @@ export function People({ me, notify }) {
   };
 
   const people = report?.people || [];
-  // Whether requests prove their institutional address by a mailed code.
-  const verifying = !!report?.email?.verifying;
+  // Whether requests prove their institutional account with Google.
+  const google = !!report?.email?.google;
+  const unusable = google && report?.email?.usable === false;
   const pending = people.filter((p) => p.status === "pending");
   const others = people.filter((p) => p.status !== "pending");
   const requests = report?.requests || [];
@@ -131,12 +132,18 @@ export function People({ me, notify }) {
       actions=${html`<button class="small" onClick=${load}>Refresh</button>`}>
       ${error && html`<${Banner} tone="crit">${error}<//>`}
 
-      ${pending.length > 0 && !verifying && html`
+      ${unusable && html`
+        <${Banner} tone="crit">
+          The Google client file cannot be used (damaged, or not readable), so
+          nobody can request an account until it is set again on the machine:
+          <span class="mono">./tools/users.py google set --client-file FILE</span>
+        <//>`}
+      ${pending.length > 0 && !google && html`
         <${Banner} tone="warn">
-          This server cannot send mail, so nobody's institutional address is
-          checked: make sure each request is the person it names before
-          approving it. To check them by a mailed code, set up a mail account on
-          the machine: <span class="mono">./tools/users.py mail set</span>
+          This server has no Google sign-in, so nobody's institutional account
+          is checked: make sure each request is the person it names before
+          approving it. To have requests verified with Google, set it up on the
+          machine: <span class="mono">./tools/users.py google set --client-file FILE</span>
         <//>`}
       ${pending.length > 0 && html`
         <h3>Waiting for approval</h3>
@@ -146,15 +153,16 @@ export function People({ me, notify }) {
                        <th>Note</th><th /></tr></thead>
             <tbody>
               ${pending.map((person) => {
-                const unconfirmed = verifying && !person.email_verified_at;
+                const unconfirmed = google && !person.email_verified_at;
                 return html`
                 <tr key=${person.id}>
                   <td>${person.display_name}</td>
                   <td><span class="mono">${person.email || person.username}</span>
                     <div class="small" data-test=${`address-${person.username}`}>
                       ${person.email_verified_at
-                        ? `✓ confirmed ${fmt.dateTime(person.email_verified_at)}`
-                        : verifying ? "✗ not confirmed yet" : "not checked"}</div></td>
+                        ? `✓ verified with Google ${fmt.dateTime(person.email_verified_at)}`
+                        : google ? "✗ not verified — asked before Google sign-in"
+                        : "not checked"}</div></td>
                   <td>${fmt.dateTime(person.created_at)}</td>
                   <td class="wrap-cell small">${person.note || "—"}</td>
                   <td>
@@ -162,12 +170,12 @@ export function People({ me, notify }) {
                       ${grantable.map((role) => html`
                         <button key=${role} class=${`small${role === "viewer" ? "" : " primary"}`}
                                 disabled=${unconfirmed}
-                                title=${unconfirmed ? "Waits until the code mailed to the address is typed back" : ""}
-                                onClick=${() => act(api.approveUser(person.id, role),
+                                title=${unconfirmed ? "Not verified with Google: ask them to request again, or let them in on the machine (tools/users.py role ... --unconfirmed)" : ""}
+                                onClick=${() => act(api.approveUser(person.id, role, person.created_at),
                                   `${person.display_name} approved as ${role}.`)}>
                           Approve as ${role}</button>`)}
                       <button class="small danger"
-                              onClick=${() => act(api.declineUser(person.id),
+                              onClick=${() => act(api.declineUser(person.id, person.created_at),
                                 `Request from ${person.display_name} declined.`)}>
                         Decline</button>
                     </div>

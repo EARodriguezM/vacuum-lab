@@ -73,21 +73,23 @@ function bareUsername(typed, domain) {
 }
 
 /**
- * Asking for an account. The username is the person's institutional address
- * before the @; when the server can send mail, a code goes to that address
- * and the request waits for it to be typed back (lab/auth.py), which proves
- * the address exists and is theirs.
+ * Asking for an account. With Google sign-in set up on the server, the
+ * person chooses a password and writes the note first, then proves their
+ * institutional account with Google's device flow -- a code typed at
+ * google.com/device on their own phone or computer -- and the request is
+ * made the moment Google says whose account it was, with the username and
+ * name Google gives (lab/auth.py, lab/google.py). No verified identity ever
+ * waits on this screen for somebody else to put a password to. Without
+ * Google, they type the username, and an admin checks who they are.
  */
-function SignUp({ domain, verify }) {
+function SignUp({ domain, google }) {
   const [form, setForm] = useState({ username: "", name: "", password: "",
                                      repeat: "", note: "" });
   const [error, setError] = useState(null);
-  // form -> code (when the server mails one) -> confirmed; or form -> done
-  const [step, setStep] = useState("form");
-  const [mailed, setMailed] = useState({ email: "", problem: null });
+  const [flow, setFlow] = useState(null);   // the Google sign-in under way
+  const [sent, setSent] = useState(null);   // {username, name?, verified}
   const [working, setWorking] = useState(false);
   const set = (key) => (e) => setForm({ ...form, [key]: e.target.value });
-  const username = bareUsername(form.username, domain);
 
   const submit = async (event) => {
     event.preventDefault();
@@ -98,11 +100,15 @@ function SignUp({ domain, verify }) {
     setWorking(true);
     setError(null);
     try {
-      const result = await api.signup({ username, name: form.name.trim(),
-                                        password: form.password,
-                                        note: form.note.trim() });
-      setMailed({ email: result.email || "", problem: result.problem || null });
-      setStep(result.verify ? "code" : "done");
+      if (google) {
+        setFlow(await api.googleStart(form.password, form.note.trim()));
+      } else {
+        const username = bareUsername(form.username, domain);
+        const result = await api.signup({ username, name: form.name.trim(),
+                                          password: form.password,
+                                          note: form.note.trim() });
+        setSent({ username: result.username || username, verified: false });
+      }
     } catch (problem) {
       setError(problem.message);
     } finally {
@@ -110,42 +116,48 @@ function SignUp({ domain, verify }) {
     }
   };
 
-  if (step === "code" || step === "confirm") {
-    return html`<${ConfirmAddress} domain=${domain}
-      username=${step === "code" ? username : ""} email=${mailed.email}
-      password=${step === "code" ? form.password : ""}
-      problem=${mailed.problem} onConfirmed=${() => setStep("confirmed")} />`;
-  }
-  if (step === "done" || step === "confirmed") {
+  if (sent) {
     return html`
       <${Banner} tone="good">
-        <strong>${step === "confirmed" ? "Address confirmed." : "Request sent."}</strong> An admin
-        approves it and chooses what you may do — watch, or operate the rig. Then
-        sign in with${" "}<span class="mono">${username || "your username"}</span>${" "}and
+        <strong>Request sent${sent.verified ? `, as ${sent.name}` : ""}.</strong>
+        ${sent.verified ? " Google confirmed your institutional account." : ""} An
+        admin approves it and chooses what you may do — watch, or operate the
+        rig. Then sign in with${" "}<span class="mono">${sent.username}</span>${" "}and
         the password you chose.
       <//>`;
   }
+  if (flow) {
+    return html`<${GoogleStep} domain=${domain} flow=${flow}
+      onDone=${(answer) => setSent({ username: answer.username,
+                                     name: answer.identity?.name, verified: true })}
+      onEnd=${(problem) => { setFlow(null); setError(problem); }} />`;
+  }
   return html`
     <form class="grid" style="gap:12px" onSubmit=${submit}>
-      <label class="field"><span>Institutional username</span>
-        <span class="suffix">
-          <input value=${form.username} autocomplete="username" autocapitalize="none"
-                 spellcheck="false" placeholder="e.g. anperez" data-test="signup-username"
-                 onInput=${set("username")} />
-          <span class="unit">@${domain}</span></span>
-        <span class="help">Your institutional email before the @: for
-          anperez@${domain}, type anperez.${verify
-            ? " A code is mailed there to confirm it is yours." : ""}</span>
-      </label>
-      <label class="field"><span>Your name</span>
-        <input value=${form.name} autocomplete="name" onInput=${set("name")} />
-        <span class="help">Shown next to everything you do on the rig.</span>
-      </label>
+      ${google ? html`
+        <p class="small">Accounts are for people with an institutional account.
+          Choose a password for this panel, then sign in with your${" "}
+          <strong>@${domain}</strong>${" "}Google account: the request is made
+          with the username and name Google gives.</p>` : html`
+        <label class="field"><span>Institutional username</span>
+          <span class="suffix">
+            <input value=${form.username} autocomplete="username" autocapitalize="none"
+                   spellcheck="false" placeholder="e.g. anperez" data-test="signup-username"
+                   onInput=${set("username")} />
+            <span class="unit">@${domain}</span></span>
+          <span class="help">Your institutional email before the @: for
+            anperez@${domain}, type anperez.</span>
+        </label>
+        <label class="field"><span>Your name</span>
+          <input value=${form.name} autocomplete="name" onInput=${set("name")} />
+          <span class="help">Shown next to everything you do on the rig.</span>
+        </label>`}
       <div class="row form-row">
-        <label class="field"><span>Password</span>
+        <label class="field"><span>Password for this panel</span>
           <input type="password" value=${form.password} autocomplete="new-password"
                  data-test="signup-password" onInput=${set("password")} />
-          <span class="help">At least 8 characters. Not your email's password.</span>
+          <span class="help">At least 8 characters. Not your institutional
+            account's password.</span>
         </label>
         <label class="field"><span>Password again</span>
           <input type="password" value=${form.repeat} autocomplete="new-password"
@@ -154,98 +166,69 @@ function SignUp({ domain, verify }) {
       </div>
       <label class="field"><span>Note for the admin (optional)</span>
         <input value=${form.note} placeholder="Who you are, which project"
-               onInput=${set("note")} />
+               data-test="signup-note" onInput=${set("note")} />
       </label>
       ${error && html`<${Banner} tone="crit">${error}<//>`}
-      <div class="row">
-        <button class="primary" type="submit" data-test="signup-submit"
-                disabled=${working || !form.username || !form.password}>
-          ${working ? "Sending…" : "Request the account"}</button>
-        ${verify && html`
-          <button type="button" class="ghost" data-test="signup-have-code"
-                  onClick=${() => setStep("confirm")}>I already have a code</button>`}
-      </div>
+      <button class="primary" type="submit" data-test="signup-submit"
+              disabled=${working || !form.password || (!google && !form.username)}>
+        ${working ? (google ? "Asking Google…" : "Sending…")
+          : google ? "Continue with Google" : "Request the account"}</button>
     </form>`;
 }
 
 /**
- * The code mailed to the institutional address, typed back with the password
- * chosen for the request: the code proves somebody reads the inbox, the
- * password that it is the person who asked.
+ * The Google sign-in under way: the code to type at Google, shown here, and
+ * the server asked at the pace Google set until the request is made (or the
+ * sign-in ends). Polled only while this step is on screen -- the sign-in
+ * page has no state poll to join.
  */
-function ConfirmAddress({ domain, username: known = "", email = "", password: chosen = "",
-                          problem = null, onConfirmed }) {
-  const [typed, setTyped] = useState(known);
-  const [password, setPassword] = useState(chosen);
-  const [code, setCode] = useState("");
-  const [error, setError] = useState(problem);
-  const [note, setNote] = useState(null);
-  const [working, setWorking] = useState(false);
-  const username = bareUsername(typed, domain);
-  const address = email || (username ? `${username}@${domain}` : `your @${domain} address`);
-
-  const confirm = async (event) => {
-    event.preventDefault();
-    setWorking(true);
-    setError(null);
-    setNote(null);
-    try {
-      await api.verifyEmail(username, password, code);
-      onConfirmed();
-    } catch (failure) {
-      setError(failure.message);
-    } finally {
-      setWorking(false);
-    }
-  };
-  const again = async () => {
-    setWorking(true);
-    setError(null);
-    setNote(null);
-    try {
-      await api.requestCode(username, password);
-      setNote(`A new code went to ${address}.`);
-    } catch (failure) {
-      setError(failure.message);
-    } finally {
-      setWorking(false);
-    }
-  };
+function GoogleStep({ domain, flow, onDone, onEnd }) {
+  // Set while the panel or the network does not answer: polling goes on.
+  const [hiccup, setHiccup] = useState(null);
+  useEffect(() => {
+    let stopped = false;
+    let timer = null;
+    const wait = Math.max(2, Number(flow.interval) || 5) * 1000;
+    const tick = async () => {
+      try {
+        const answer = await api.googlePoll(flow.flow);
+        if (stopped) return;
+        setHiccup(null);
+        if (answer.state === "done") {
+          onDone(answer);
+          return;
+        }
+      } catch (problem) {
+        if (stopped) return;
+        // A refusal that ended the sign-in on the server ends it here too,
+        // with its own reason; the panel busy or the network gone a moment
+        // does not -- the sign-in is still there to ask about.
+        if (problem.payload?.ended || [400, 403, 409, 410].includes(problem.status)) {
+          onEnd(problem.message);
+          return;
+        }
+        setHiccup(problem.message);
+      }
+      timer = setTimeout(tick, wait);
+    };
+    timer = setTimeout(tick, wait);
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [flow.flow]);
 
   return html`
-    <form class="grid" style="gap:12px" onSubmit=${confirm}>
-      <p class="small">${known
-        ? html`A 6-digit code was mailed to <strong>${address}</strong>. Type it
-            here to confirm the address is yours; the request waits for it.`
-        : html`Type your username, the password you chose when you asked for the
-            account, and the code mailed to your @${domain} address.`}
-        ${" "}It works for 30 minutes.</p>
-      ${!known && html`
-        <label class="field"><span>Institutional username</span>
-          <span class="suffix">
-            <input value=${typed} autocapitalize="none" spellcheck="false"
-                   data-test="confirm-username" onInput=${(e) => setTyped(e.target.value)} />
-            <span class="unit">@${domain}</span></span>
-        </label>
-        <label class="field"><span>Password you chose</span>
-          <input type="password" value=${password} autocomplete="current-password"
-                 data-test="confirm-password" onInput=${(e) => setPassword(e.target.value)} />
-        </label>`}
-      <label class="field"><span>Code</span>
-        <input value=${code} inputmode="numeric" autocomplete="one-time-code"
-               maxlength="12" data-test="signup-code"
-               onInput=${(e) => setCode(e.target.value)} />
-      </label>
-      ${error && html`<${Banner} tone="crit">${error}<//>`}
-      ${note && html`<${Banner} tone="good">${note}<//>`}
-      <div class="row">
-        <button class="primary" type="submit" data-test="signup-confirm"
-                disabled=${working || !username || !password || !code.trim()}>Confirm</button>
-        <button type="button" data-test="signup-resend"
-                disabled=${working || !username || !password}
-                onClick=${again}>Send a new code</button>
-      </div>
-    </form>`;
+    <div class="grid" style="gap:12px">
+      <p class="small">On your phone or computer, open${" "}
+        <a href=${flow.url} target="_blank" rel="noopener noreferrer">
+          ${flow.url.replace(/^https:\/\//, "")}</a>, sign in with your${" "}
+        <strong>@${domain}</strong>${" "}account, and type this code:</p>
+      <div class="device-code mono" data-test="signup-code">${flow.user_code}</div>
+      <p class="small muted">Waiting for Google… the request is sent by itself
+        once you accept: keep this page open until it says so. Type this code
+        only on your own account; never type a code somebody else gives you. It
+        works for${" "}${Math.round((flow.expires_in || 1800) / 60)}${" "}minutes.</p>
+      ${hiccup && html`<${Banner} tone="warn">Still trying: ${hiccup}<//>`}
+      <button type="button" class="ghost" onClick=${() => onEnd(null)}>Cancel</button>
+    </div>`;
 }
 
 function Pair({ onSignedIn }) {
@@ -320,7 +303,7 @@ export function LoginView({ ping, onSignedIn, onCancel }) {
           </nav>`}
         ${mode === "signin" && html`<${SignIn} onSignedIn=${onSignedIn} />`}
         ${mode === "signup" && html`<${SignUp} domain=${ping?.auth?.email_domain || "unal.edu.co"}
-                                                verify=${!!ping?.auth?.verify_email} />`}
+                                                google=${!!ping?.auth?.google_signin} />`}
         ${mode === "pair" && html`<${Pair} onSignedIn=${onSignedIn} />`}
         ${onCancel && html`
           <button class="ghost" type="button" onClick=${onCancel}>

@@ -1,52 +1,63 @@
-"""Institutional addresses: a username is the part before the @, proved by a
-code mailed there -- typed back with the request's own password -- before an
-admin may approve the request."""
+"""Institutional accounts: a username is the institutional address before the
+@, and a request is made only by a Google sign-in of that account, before an
+admin may approve it (lab/google.py, the device flow, against
+tools/fake_google.py)."""
 
 from __future__ import annotations
 
+import http.server
+import io
+import json
 import os
-import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 
 from lab import db as dbmod
 from lab import registry, runs
-from tools.checks.common import attempt
+from tools.checks.common import ROOT, attempt
 
 
 def test_addresses() -> None:
-    """Over real HTTP against the real handler, with the fake mail server.
+    """Over real HTTP against the real handler, with a fake Google.
 
-    What it asks: is a username the institutional address before the @, does
-    nothing get approved until the code mailed there comes back from the
-    person who made the request, can nobody confirm, refill or take over
-    somebody else's request -- and does a server with no mail account behave
-    as before, and say so.
+    What it asks: is a request made only for the account Google proved, the
+    moment it proves it, once; only for an account of the institution's own
+    organization; is Google asked no faster than it allows, and nothing
+    secret repeated anywhere; does an admin decide only the request they
+    were shown -- and does a server with no Google client behave as before,
+    while a broken one takes nothing.
     """
-    import json as jsonmod
     import sqlite3
     import urllib.error
     import urllib.request
     from lab import api as apimod
     from lab import auth as authmod
-    from lab import mailer as mailermod
-    from tools.fake_smtp import FakeSMTP
+    from lab import google as googlemod
+    from tools.fake_google import FakeGoogle
 
-    print("\nInstitutional addresses: the username, and the code mailed there")
+    print("\nInstitutional accounts: a request made by a Google sign-in")
     directory = tempfile.mkdtemp(prefix="selftest-addresses-")
-    database = dbmod.Database(os.path.join(directory, "addresses.db"))
-    mail_path = os.path.join(directory, mailermod.SETTINGS_FILE)
-    # Sign-ups and code checks all come from 127.0.0.1 here; the limits on
-    # them are checked on their own below. Put back at the end.
-    saved = (authmod.SIGNUPS_PER_HOUR, authmod.CODE_CHECKS_PER_MINUTE,
-             authmod.CODE_REQUESTS_PER_HOUR, mailermod.SEND_TIMEOUT_S,
-             authmod.SEND_LOCK_WAIT_S)
+    db_path = os.path.join(directory, "addresses.db")
+    database = dbmod.Database(db_path)
+    google_path = os.path.join(directory, googlemod.SETTINGS_FILE)
+    google = FakeGoogle()
+    saved_pending = authmod.MAX_PENDING
+    saved = (authmod.SIGNUPS_PER_HOUR, authmod.GOOGLE_POLL_MIN_S,
+             authmod.GOOGLE_FLOWS_MAX, authmod.GOOGLE_STARTS_PER_HOUR,
+             authmod.GOOGLE_STARTS_PER_HOUR_ALL,
+             googlemod.DEVICE_URL, googlemod.TOKEN_URL)
+    # Every request here comes from 127.0.0.1, and nobody waits 5 s between
+    # polls: the limits and the pace are checked on their own below.
     authmod.SIGNUPS_PER_HOUR = 100
-    authmod.CODE_CHECKS_PER_MINUTE = 1000
-    authmod.CODE_REQUESTS_PER_HOUR = 1000
+    authmod.GOOGLE_POLL_MIN_S = 0.0
+    authmod.GOOGLE_STARTS_PER_HOUR = authmod.GOOGLE_STARTS_PER_HOUR_ALL = 1000
+    google.interval = 0
+    googlemod.DEVICE_URL, googlemod.TOKEN_URL = google.device_url, google.token_url
     accounts = authmod.Auth(database, "chamber-1",
-                            mailer=mailermod.Mailer(mail_path))
+                            google=googlemod.Google(google_path))
     engine = runs.RunEngine(database, registry.Registry(),
                             roles=runs.ALL_ROLES, chamber="chamber-1")
     application = apimod.Application(registry.Registry(), database, engine,
@@ -57,59 +68,56 @@ def test_addresses() -> None:
     server = apimod.Server(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
-    smtp = FakeSMTP()
-    silent = None
 
     def call(path, body=None, token=None):
         request = urllib.request.Request(
             base + path, method="POST" if body is not None else "GET",
-            data=jsonmod.dumps(body).encode() if body is not None else None,
+            data=json.dumps(body).encode() if body is not None else None,
             headers={"Content-Type": "application/json"})
         if token:
             request.add_header("Authorization", f"Bearer {token}")
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                return response.status, jsonmod.loads(response.read())
+                return response.status, json.loads(response.read())
         except urllib.error.HTTPError as error:
             raw = error.read()
-            return error.code, (jsonmod.loads(raw) if raw[:1] == b"{" else {})
-
-    def signup(name, password=None):
-        return call("/api/signup", {"username": name, "name": "Zed Quillfeather",
-                                    "password": f"{name}-pass-1" if password is None else password})
-
-    def forgive():
-        """The wrong passwords a check sent on purpose are forgotten, or the
-        throttle on this address's request passwords would hold up every
-        check after it (all of them come from 127.0.0.1)."""
-        accounts.throttle = authmod.Throttle()
-
-    def confirm(name, code, password=None):
-        return call("/api/signup/verify", {"username": name, "code": code,
-                                           "password": f"{name}-pass-1" if password is None else password})
-
-    def new_code(name, password=None):
-        return call("/api/signup/code", {"username": name,
-                                         "password": f"{name}-pass-1" if password is None else password})
+            return error.code, (json.loads(raw) if raw[:1] == b"{" else {})
 
     def user(name):
         return database.user_by_name(name) or {}
 
-    def shift(table, column, key, value, seconds):
-        """Move a stored time `seconds` into the past."""
-        with database._lock:
-            database._db.execute(f"UPDATE {table} SET {column} = {column} - ? "
-                                 f"WHERE {key}=?", (seconds, value))
-            database._db.commit()
+    def users_tool(*args):
+        return subprocess.run([sys.executable, os.path.join(ROOT, "tools", "users.py"),
+                               "--db", db_path, *args], capture_output=True,
+                              text=True, timeout=60, stdin=subprocess.DEVNULL)
 
-    def age_code(name, seconds):
-        shift("email_codes", "sent_at", "username", name, seconds)
-        shift("email_codes", "expires_at", "username", name, seconds)
+    def start(password="good-pass-1", note=""):
+        return call("/api/signup/google/start", {"password": password, "note": note})
 
-    def expire_request(name):
-        """Old enough, and its code expired, to be replaced."""
-        shift("users", "created_at", "username", name, authmod.EMAIL_CODE_TTL_S + 60)
-        age_code(name, authmod.EMAIL_CODE_TTL_S + 60)
+    def poll(flow):
+        return call("/api/signup/google/poll", {"flow": flow})
+
+    def requested(email, name="Somebody", password="good-pass-1", note="",
+                  **changes):
+        """A request started, the person signing in at Google, and polled to
+        its end: (flow, the last poll's status, its answer)."""
+        code, began = start(password, note)
+        if code != 200:
+            return None, code, began
+        google.approve(began["user_code"], email, name, **changes)
+        for _ in range(40):
+            code, answer = poll(began["flow"])
+            if code != 200 or answer.get("state") == "done":
+                return began["flow"], code, answer
+            time.sleep(0.05)
+        return began["flow"], code, answer
+
+    def entry_for(began):
+        """The server's own record of a sign-in, found by its code."""
+        with accounts._flows_lock:
+            return next(v for v in accounts._flows.values()
+                        if google.flows.get(v["device_code"], {}).get("user_code")
+                        == began["user_code"])
 
     try:
         authmod.bootstrap_owner(database, "chamber-1", "owner", "owner-pass-1")
@@ -121,391 +129,461 @@ def test_addresses() -> None:
             got = {typed: accounts.username_from(typed) for typed in
                    ("anperez", "AnPerez@UNAL.edu.co", "anperez@gmail.com",
                     "an@perez@unal.edu.co", "anperez\n@unal.edu.co")}
-            other = authmod.Auth(database, "chamber-1", email_domain="Example.EDU")
             return (got["anperez"] == ("anperez", None)
                     and got["AnPerez@UNAL.edu.co"] == ("anperez", None)
                     and got["anperez@gmail.com"][1] is not None
                     and got["an@perez@unal.edu.co"][1] is not None
                     and got["anperez\n@unal.edu.co"] == ("anperez", None)
-                    and authmod.check_username("anperez\n") is not None
-                    and other.username_from("x.y@example.edu") == ("x.y", None),
+                    and authmod.check_username("anperez\n") is not None,
                     str(got)[:150])
         attempt("a username is the institutional address before the @; another "
                 "domain, or a hidden line break, is refused", usernames)
 
-        # --- no mail account: as before, and said ------------------------------
+        # --- no Google client: as before, and said -----------------------------
         ping = call("/api/ping")[1].get("auth", {})
-        code, body = signup("ana")
+        code, body = call("/api/signup", {"username": "ana", "name": "Ana",
+                                          "password": "ana-pass-1"})
         approved = call("/api/users/approve", {"id": user("ana").get("id"),
                                                "role": "viewer"}, owner)[0]
         signed = call("/api/login", {"username": "ana@unal.edu.co",
                                      "password": "ana-pass-1"})[0]
-        attempt("with no mail account a request is not checked and can be "
+        no_start = start()[0]
+        attempt("with no Google client a request is not checked and can be "
                 "approved, the sign-in page is told, and the whole address "
-                "signs in", lambda: (code == 200 and body.get("verify") is False
+                "signs in", lambda: (code == 200 and body.get("verified") is False
                                      and approved == 200 and signed == 200
-                                     and ping.get("verify_email") is False
+                                     and no_start == 409
+                                     and ping.get("google_signin") is False
                                      and ping.get("email_domain") == "unal.edu.co",
-                                     f"{code} {body}; approve {approved}; "
-                                     f"sign-in {signed}; ping {ping}"))
-        signup("old")
-        shift("users", "created_at", "username", "old", authmod.EMAIL_CODE_TTL_S + 60)
-        kept = signup("old")[0]
-        attempt("with no mail account no request is ever replaced",
-                lambda: (kept == 409, str(kept)))
+                                     f"{code} {body}; approve {approved}; sign-in "
+                                     f"{signed}; start {no_start}; ping {ping}"))
+        call("/api/signup", {"username": "old.request", "password": "old-pass-1"})
 
-        # --- a mail account: the code ---------------------------------------
-        def ascii_only():
-            try:
-                mailermod.save_settings(mail_path, {**smtp.settings(),
-                                                    "username": "lab",
-                                                    "password": "contraseña"})
-            except ValueError as exc:
-                return not os.path.exists(mail_path), str(exc)
-            return False, "saved a password smtplib cannot send"
-        attempt("a mail password other than ASCII is refused when it is set",
-                ascii_only)
-        mailermod.save_settings(mail_path, {**smtp.settings(),
-                                            "password": "never-shown-1"})
-        mode = os.stat(mail_path).st_mode & 0o777
-        ping = call("/api/ping")[1].get("auth", {})
-        attempt("the mail settings are 0600, and the panel uses them without a "
-                "restart", lambda: (mode == 0o600 and ping.get("verify_email"),
-                                    f"mode {oct(mode)}; ping {ping}"))
+        # --- the client, set on the machine -------------------------------------
+        def client_file():
+            downloaded = os.path.join(directory, "client_secret_x.json")
+            with open(downloaded, "w") as fh:
+                json.dump({"installed": {**google.settings(),
+                                         "project_id": "p", "auth_uri": "u"}}, fh)
+            bare = os.path.join(directory, "broken.json")
+            with open(bare, "w") as fh:
+                json.dump({"web": {"client_id": "only-an-id"}}, fh)
+            refused = users_tool("google", "set", "--client-file", bare)
+            made = users_tool("google", "set", "--client-file", downloaded)
+            shown = users_tool("google", "show").stdout
+            mode = os.stat(google_path).st_mode & 0o777
+            live = call("/api/ping")[1].get("auth", {}).get("google_signin")
+            return (refused.returncode == 1 and made.returncode == 0
+                    and mode == 0o600 and google.client_secret not in shown
+                    and google.client_id in shown and live is True,
+                    f"broken file {refused.returncode}, good {made.returncode}, "
+                    f"mode {oct(mode)}, panel sees it: {live}")
+        attempt("the client is read from Google's download, kept 0600, shown "
+                "without its secret, and used without a restart", client_file)
 
-        code, body = signup("bea@unal.edu.co", "bea-pass-1")
-        mailed = smtp.codes("bea@unal.edu.co")
-        stored = database.email_code("bea") or {}
-        attempt("a request mails one 6-digit code to the address, and keeps only "
-                "a hash of it",
-                lambda: (code == 200 and body.get("verify") and body.get("sent")
-                         and body.get("email") == "bea@unal.edu.co"
-                         and len(mailed) == 1
-                         and mailed[0] not in stored.get("code_hash", mailed[0]),
-                         f"{code} {body}; mailed {mailed}"))
-        letter = (smtp.sent_to("bea@unal.edu.co") or [""])[0]
-        attempt("the mail carries nothing the requester typed but the username",
-                lambda: ("Quillfeather" not in letter and "bea" in letter,
-                         letter[:80]))
-        refused, said = call("/api/users/approve", {"id": user("bea").get("id"),
-                                                    "role": "viewer"}, owner)
-        attempt("an admin cannot approve it before the code comes back",
-                lambda: (refused == 409 and "bea@unal.edu.co" in said.get("error", "")
-                         and user("bea")["status"] == "pending",
-                         f"{refused}: {said.get('error', '')[:70]}"))
-        listed = next((p for p in call("/api/users", token=owner)[1]["people"]
-                       if p["username"] == "bea"), {})
-        report = call("/api/users", token=owner)[1].get("email", {})
-        attempt("the People page shows the address and that it is not confirmed",
-                lambda: (listed.get("email") == "bea@unal.edu.co"
-                         and listed.get("email_verified_at") is None
-                         and report == {"domain": "unal.edu.co", "verifying": True},
-                         f"{listed.get('email')}, {listed.get('email_verified_at')}, "
-                         f"{report}"))
+        # --- a request, through Google ----------------------------------------
+        code, began = start("her-pass-1", "photonics group")
+        early = poll(began.get("flow", ""))
+        nothing_yet = user("ana.perez")
+        google.approve(began.get("user_code", ""), "Ana.Perez@unal.edu.co",
+                       "Ana  María Pérez")
+        done = poll(began.get("flow", ""))
+        after = poll(began.get("flow", ""))
+        stored = user("ana.perez")
+        attempt("a request waits for Google, then is made for the account Google "
+                "proved -- with the password and note given first -- marked "
+                "verified; asked again, the sign-in says done",
+                lambda: (code == 200 and began.get("url") == "https://www.google.com/device"
+                         and early == (200, {"ok": True, "state": "pending"})
+                         and not nothing_yet
+                         and done[1].get("state") == "done"
+                         and done[1].get("username") == "ana.perez"
+                         and stored.get("display_name") == "Ana María Pérez"
+                         and stored.get("note") == "photonics group"
+                         and stored.get("status") == "pending"
+                         and stored.get("email_verified_at")
+                         and after == done,
+                         f"start {code}; {early}; then {done}; then {after}"))
+        approved = call("/api/users/approve", {"id": stored.get("id"), "role": "operator",
+                                               "created_at": stored.get("created_at")},
+                        owner)[0]
+        signed = [call("/api/login", {"username": typed, "password": "her-pass-1"})[0]
+                  for typed in ("ana.perez", "ana.perez@unal.edu.co")]
+        attempt("an admin approves it, and the person signs in with the username "
+                "and the password chosen", lambda: (approved == 200
+                                                    and signed == [200, 200],
+                                                    f"approve {approved}; {signed}"))
+        refused = [call("/api/signup", {"username": "x.y", "password": "x-pass-1"})[0],
+                   poll("made-up")[0], start("short")[0]]
+        attempt("with Google set up nothing is taken typed, an unknown sign-in "
+                "is no sign-in, and a weak password is refused before Google",
+                lambda: (refused == [400, 410, 400] and not user("x.y"), str(refused)))
 
-        right = mailed[0] if mailed else "000000"
-        wrong = f"{(int(right) + 1) % 1000000:06d}"
-        strangers = [confirm("bea", right, "not-her-pass-1")[0],
-                     confirm("bea", right, "")[0],
-                     new_code("bea", "not-her-pass-1")[0]]
-        attempt("without the request's password nobody can confirm it or have a "
-                "new code mailed, even with the right code",
-                lambda: (strangers == [403, 403, 403]
-                         and not user("bea").get("email_verified_at")
-                         and len(smtp.codes("bea@unal.edu.co")) == 1,
-                         f"{strangers}"))
-        forgive()
-        answers = [confirm("bea", wrong)[0] for _ in range(authmod.EMAIL_CODE_TRIES)]
-        late = confirm("bea", right)[0]
-        attempt(f"{authmod.EMAIL_CODE_TRIES} wrong codes and the right one no "
-                "longer works", lambda: (answers == [400] * authmod.EMAIL_CODE_TRIES
-                                         and late == 400
-                                         and not user("bea").get("email_verified_at"),
-                                         f"{answers} then {late}"))
-        soon = new_code("bea")[0]
-        age_code("bea", authmod.EMAIL_RESEND_S + 1)
-        again, _ = new_code("bea")
-        newest = smtp.codes("bea@unal.edu.co")[-1:]
-        confirmed = confirm("bea@unal.edu.co", f" {newest[0]} " if newest else "",
-                            "bea-pass-1")[0]
-        approved = call("/api/users/approve", {"id": user("bea").get("id"),
-                                               "role": "viewer"}, owner)[0]
-        logged = [e["message"] for e in database.events(limit=20)
-                  if "confirmed their institutional address" in e["message"]]
-        signed = call("/api/login", {"username": "BEA@unal.edu.co",
-                                     "password": "bea-pass-1"})[0]
-        attempt("a new code waits a minute; typed back with the password, the "
-                "address is confirmed, logged, the request can be approved, and "
-                "the whole address signs in",
-                lambda: (soon == 429 and again == 200 and confirmed == 200
-                         and approved == 200 and bool(logged) and signed == 200
-                         and not (database.email_code("bea") or {}).get("code_hash"),
-                         f"too soon {soon}; again {again}; confirm {confirmed}; "
-                         f"approve {approved}; {len(logged)} logged; sign-in {signed}"))
+        # --- what Google's answer must say --------------------------------------
+        cases = {
+            "another domain": dict(email="ana@gmail.com", hd=None),
+            "a personal account at the address": dict(email="bo@unal.edu.co", hd=None),
+            "another organization": dict(email="bo@unal.edu.co", hd="other.edu"),
+            "an address not verified": dict(email="bo@unal.edu.co", verified=False),
+            "another client": dict(email="bo@unal.edu.co", aud="other-client"),
+            "another issuer": dict(email="bo@unal.edu.co", iss="https://evil.example"),
+            "an old answer": dict(email="bo@unal.edu.co", exp=int(time.time()) - 600),
+            "no username in it": dict(email="b@unal.edu.co"),
+        }
+        outcomes = {}
+        for label, change in cases.items():
+            email = change.pop("email")
+            flow, code, answer = requested(email, **change)
+            gone = poll(flow)[0] if flow else None
+            outcomes[label] = (code, gone)
+        attempt("refused: another domain, a personal account, another "
+                "organization, an unverified address, another client or issuer, "
+                "an old answer, an address that cannot be a username",
+                lambda: (all(v == (403, 410) for v in outcomes.values())
+                         and not user("bo"),
+                         str({k: v for k, v in outcomes.items() if v != (403, 410)})
+                         or "all refused, the sign-in forgotten"))
+        flow, code, answer = requested("cyd@unal.edu.co", "Cyd",
+                                       aud=[google.client_id, "another"],
+                                       verified="true")
+        attempt("an audience given as a list, and verified as the word true, "
+                "are read as Google means them",
+                lambda: (code == 200 and user("cyd").get("email_verified_at"),
+                         f"{code} {answer}"))
+        same = [requested("gilberto@unal.edu.co", password=typed)[1]
+                for typed in ("gilberto", "GILBERTO", " Gilberto ")]
+        attempt("the password cannot be the username Google gives, in any case",
+                lambda: (same == [400, 400, 400] and not user("gilberto"), str(same)))
+        code, began = start()
+        google.deny(began["user_code"])
+        denied = poll(began["flow"])[0]
+        code, began = start()
+        google.expire(began["user_code"])
+        expired = poll(began["flow"])[0]
+        attempt("a sign-in declined or expired at Google is refused",
+                lambda: (denied == 403 and expired == 410, f"{denied}, {expired}"))
 
-        signup("cal")
-        age_code("cal", authmod.EMAIL_CODE_TTL_S + 60)
-        expired = confirm("cal", (smtp.codes("cal@unal.edu.co") or ["0"])[-1])[0]
-        attempt("an expired code is refused", lambda: (expired == 400, str(expired)))
+        # --- the pace Google asks for -------------------------------------------
+        def paced():
+            code, began = start()
+            flow = entry_for(began)
+            flow["interval"], flow["next"] = 30.0, 0.0
+            before = google.token_calls
+            answers = [poll(began["flow"])[1].get("state") for _ in range(6)]
+            asked = google.token_calls - before
+            google.slow_down = True
+            flow["next"] = 0.0
+            poll(began["flow"])
+            google.slow_down = False
+            return (asked == 1 and answers == ["pending"] * 6
+                    and flow["interval"] == 35.0,
+                    f"Google asked {asked} time(s) for 6 polls; interval "
+                    f"{flow['interval']}")
+        attempt("Google is asked at most once per interval, and slower when it "
+                "says so", paced)
 
-        # --- taking over somebody else's name -------------------------------
-        signup("anperez", "ana-real-pass-1")
-        expire_request("anperez")
-        code, body = signup("anperez", "mallory-pass-1")
-        theirs = (smtp.codes("anperez@unal.edu.co") or ["0"])[-1]
-        hijack = confirm("anperez", theirs, "ana-real-pass-1")[0]
-        forgive()
-        attempt("a request taken over after its code expired cannot be confirmed "
-                "by the address's owner for the one who took it",
-                lambda: (code == 200 and body.get("sent") and hijack == 403
-                         and not user("anperez").get("email_verified_at"),
-                         f"take-over {code}; owner's code and password: {hijack}"))
-
-        signup("cid")
-        with database._lock:
-            database._db.execute("UPDATE email_codes SET sends=?, sent_at=sent_at-? "
-                                 "WHERE username='cid'",
-                                 (authmod.EMAIL_SENDS_PER_DAY, 120))
-            database._db.commit()
-        capped = new_code("cid")[0]
-        expire_request("cid")
-        code, body = signup("cid", "another-pass-1")
-        attempt(f"at most {authmod.EMAIL_SENDS_PER_DAY} codes a day to one address, "
-                "whoever asks and however often the request is replaced",
-                lambda: (capped == 429 and code == 200 and body.get("sent") is False
-                         and (database.email_code("cid") or {}).get("sends")
-                         == authmod.EMAIL_SENDS_PER_DAY,
-                         f"then {capped}; replaced: {code} sent {body.get('sent')}"))
-
-        def leaves_alone():
-            answers = {}
-            # Confirmed but not yet approved.
-            signup("dot")
-            confirm("dot", (smtp.codes("dot@unal.edu.co") or ["0"])[-1])
-            # Disabled, and a tablet.
-            database.create_user("eli", "", status="disabled")
-            database.create_user("wall", "", kind="device", status="active")
-            for name in ("dot", "eli", "wall"):
-                shift("users", "created_at", "username", name,
-                      authmod.EMAIL_CODE_TTL_S + 60)
-                answers[name] = signup(name)[0]
-            return (answers == {"dot": 409, "eli": 409, "wall": 409}
-                    and user("dot").get("email_verified_at"), str(answers))
-        attempt("a confirmed request, a disabled account and a tablet are never "
-                "replaced", leaves_alone)
-        confirmed_name = signup("bea")[0]
-        attempt("nor an approved account", lambda: (confirmed_name == 409,
-                                                     str(confirmed_name)))
-
-        def parallel_tries():
-            signup("fox")
-            right = (smtp.codes("fox@unal.edu.co") or ["0"])[-1]
-            wrong = f"{(int(right) + 1) % 1000000:06d}"
-            threads = [threading.Thread(target=confirm, args=("fox", wrong))
-                       for _ in range(12)]
+        def once_only():
+            code, began = start()
+            google.approve(began["user_code"], "dina@unal.edu.co", "Dina")
+            answers = []
+            threads = [threading.Thread(target=lambda: answers.append(
+                poll(began["flow"]))) for _ in range(6)]
             for thread in threads:
                 thread.start()
             for thread in threads:
                 thread.join()
-            tries = (database.email_code("fox") or {}).get("tries", 0)
-            after = confirm("fox", right)[0]
-            return (tries <= authmod.EMAIL_CODE_TRIES
-                    and (tries < authmod.EMAIL_CODE_TRIES or after == 400),
-                    f"{tries} tries counted; the right code then {after}")
-        attempt("wrong codes sent in parallel never get more than the tries "
-                "allowed", parallel_tries)
+            for _ in range(20):
+                if any(a[1].get("state") == "done" for a in answers):
+                    break
+                answers.append(poll(began["flow"]))
+            made = [e for e in database.events(limit=50)
+                    if "An account was requested (dina)" in e["message"]]
+            return (len(made) == 1 and user("dina").get("email_verified_at")
+                    and sum(a[1].get("state") == "done" for a in answers) == 1,
+                    f"{len(made)} request(s) made from {len(answers)} polls")
+        attempt("polls sent at once for one sign-in make one request", once_only)
 
-        # --- the mail server failing --------------------------------------------
-        smtp.close()
-        code, body = signup("dee")
-        counted = database.email_code("dee")
-        smtp = FakeSMTP()
-        mailermod.save_settings(mail_path, smtp.settings())
-        later = new_code("dee")[0]
-        attempt("a mail server that cannot be reached: the request is kept, "
-                "nothing is counted, the reason is not shown, and a code can be "
-                "asked for later",
-                lambda: (code == 200 and body.get("sent") is False
-                         and "127.0.0.1" not in str(body.get("problem"))
-                         and user("dee").get("status") == "pending"
-                         and counted is None and later == 200
-                         and len(smtp.codes("dee@unal.edu.co")) == 1,
-                         f"{code} {body}; later {later}"))
+        def odd_answers():
+            code, began = start()
+            outcomes = []
+            for flag in ("cut_wait", "html_429"):
+                setattr(google, flag, True)
+                entry_for(began)["next"] = 0.0
+                outcomes.append(poll(began["flow"]))
+                setattr(google, flag, False)
+            google.approve(began["user_code"], "gus@unal.edu.co", "Gus")
+            entry_for(began)["next"] = 0.0
+            done = poll(began["flow"])
+            again = poll(began["flow"])
+            return (all(o == (200, {"ok": True, "state": "pending"}) for o in outcomes)
+                    and done[1].get("state") == "done" and again == done
+                    and user("gus").get("email_verified_at"),
+                    f"{outcomes}; then {done[0]}, again {again[0]}")
+        attempt("an answer cut short or an HTML 429 while waiting is a moment's "
+                "trouble, not the end of the sign-in", odd_answers)
 
-        def nothing_leaks():
-            real = accounts.mailer.send
-
-            def broken(*args, **kwargs):
-                raise UnicodeEncodeError("ascii", "secret-ñ-word", 7, 8,
-                                         "ordinal not in range(128)")
-            accounts.mailer.send = broken
+        def ended_says_so():
+            pending = len([u for u in database.users("chamber-1")
+                           if u["status"] == "pending"])
+            authmod.MAX_PENDING = pending
             try:
-                code, body = signup("gil")
+                flow, code, answer = requested("jon@unal.edu.co", "Jon")
             finally:
-                accounts.mailer.send = real
-            text = jsonmod.dumps(body, ensure_ascii=False)
-            return (code == 200 and body.get("sent") is False
-                    and "secret" not in text and "ñ" not in text, text[:120])
-        attempt("a mailer failing in any way tells the person asking nothing of "
-                "it", nothing_leaks)
+                authmod.MAX_PENDING = saved_pending
+            return (code == 429 and answer.get("ended") is True
+                    and poll(flow)[0] == 410 and not user("jon"),
+                    f"{code} {answer}")
+        attempt("a refusal that ends the sign-in says so, with its own reason",
+                ended_says_so)
 
-        def hung_server():
-            nonlocal silent
-            silent = socket.socket()
-            silent.bind(("127.0.0.1", 0))
-            silent.listen(8)                     # accepts, never says a word
-            mailermod.save_settings(mail_path, {**smtp.settings(),
-                                                "port": silent.getsockname()[1]})
-            mailermod.SEND_TIMEOUT_S = 2.0
-            authmod.SEND_LOCK_WAIT_S = 0.5
-            first = {}
-            holder = threading.Thread(target=lambda: first.update(
-                answer=signup("hal")))
-            holder.start()
-            time.sleep(0.3)
-            began = time.monotonic()
-            second = signup("ida")
-            pinged = call("/api/ping")[0]
-            took = time.monotonic() - began
-            holder.join()
-            mailermod.save_settings(mail_path, smtp.settings())
-            return (second[0] == 200 and second[1].get("sent") is False
-                    and "busy" in str(second[1].get("problem"))
-                    and pinged == 200 and took < 1.5
-                    and first.get("answer", (0, {}))[1].get("sent") is False,
-                    f"second {second}; ping {pinged} after {took:.1f} s")
-        attempt("a mail server that never answers holds up one request at most; "
-                "the next is told the panel is busy, and the panel answers",
-                hung_server)
+        def record_lost_not_request():
+            real = database.add_event
+            failures = []
 
-        # --- what never leaves ------------------------------------------------
-        bodies = (jsonmod.dumps(call("/api/ping")[1])
-                  + jsonmod.dumps(call("/api/users", token=owner)[1])
-                  + jsonmod.dumps(call("/api/state", token=owner)[1]))
-        copy = os.path.join(directory, "copy.db")
-        database.snapshot(copy)
-        with sqlite3.connect(copy) as connection:
-            tables = {r[0] for r in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")}
-        attempt("the mail password is in no page, and the codes are in no "
-                "download", lambda: ("never-shown-1" not in bodies
-                                     and "email_codes" not in tables,
-                                     f"tables {sorted(tables)}"))
-
-        def header_injection():
+            def failing(*args, **kwargs):
+                if "(kim)" in str(args[2] if len(args) > 2 else ""):
+                    failures.append(1)
+                    raise sqlite3.OperationalError("disk full (selftest)")
+                return real(*args, **kwargs)
+            database.add_event = failing
+            caught, stderr = io.StringIO(), sys.stderr
+            sys.stderr = caught
             try:
-                mailermod.Mailer(mail_path).send("a@unal.edu.co\r\nBcc: b@x.org",
-                                                 "subject", "body")
-            except mailermod.MailError:
-                return True, "refused"
-            return False, "sent with a line break in the address"
-        attempt("the mailer refuses a line break in an address", header_injection)
+                flow, code, answer = requested("kim@unal.edu.co", "Kim")
+                first = user("kim").get("uuid")
+                again = [poll(flow) for _ in range(3)]
+            finally:
+                database.add_event = real
+                sys.stderr = stderr
+            return (code == 200 and answer.get("state") == "done" and failures
+                    and all(a == (200, answer) for a in again)
+                    and user("kim").get("uuid") == first,
+                    f"{code}; {len(failures)} record(s) failed; the request kept: "
+                    f"{user('kim').get('uuid') == first}")
+        attempt("a record that cannot be written costs the log line, never a "
+                "second request", record_lost_not_request)
 
-        # --- what a stranger's wrong passwords cost -----------------------------
-        forgive()
-        signup("sam")
-        refusals = [confirm("sam", "123456", "not-sams-pass-1")[0] for _ in range(6)]
-        owner_in = call("/api/login", {"username": "owner",
-                                       "password": "owner-pass-1"})[0]
-        attempt("wrong passwords for a request do not hold up sign-in from the "
-                "same address (the kiosk is one address)",
-                lambda: (refusals[0] == 403 and owner_in == 200,
-                         f"{refusals}; then the owner's sign-in {owner_in}"))
-        forgive()
+        def decided_as_checked():
+            requested("ivo@unal.edu.co", "Ivo")
+            ivo = user("ivo")
+            wrong = [database.activate_pending(ivo["id"], "another-uuid"),
+                     database.delete_pending(ivo["id"], "another-uuid")]
+            return (wrong == [False, False] and user("ivo").get("status") == "pending",
+                    str(wrong))
+        attempt("approving or declining writes only the request that was checked",
+                decided_as_checked)
 
-        def strangers_spend_nothing():
-            accounts._code_checks = authmod.Budget(3)
-            spent = [accounts.verify_email("sam", "not-sams-pass-1", "123456",
-                                           "10.0.0.9").get("status")
-                     for _ in range(4)]
-            code = (smtp.codes("sam@unal.edu.co") or ["0"])[-1]
-            own = accounts.verify_email("sam", "sam-pass-1", code, "10.0.0.7")
-            accounts._code_checks = authmod.Budget(1000)
-            return (spent == [403, 403, 403, 429] and own.get("ok"),
-                    f"stranger {spent}; then the requester {own}")
-        attempt("a stranger's tries do not spend the requester's own",
-                strangers_spend_nothing)
+        # --- Google unreachable or refusing, and secrets -------------------------
+        caught, real = io.StringIO(), sys.stderr
+        sys.stderr = caught
+        try:
+            code, began = start()
+            google.down = True
+            outage = poll(began["flow"])
+            refused_start = start()
+            google.down = False
+            google.approve(began["user_code"], "dee@unal.edu.co", "Dee")
+            entry_for(began)["next"] = 0.0
+            recovered = poll(began["flow"])
+            code, began = start()
+            google.approve(began["user_code"], "eva@unal.edu.co", "Eva")
+            google.client_secret = "rotated"
+            entry_for(began)["next"] = 0.0
+            rotated = poll(began["flow"])
+            google.client_secret = "GOCSPX-test-secret"
+            rotated_after = poll(began["flow"])[0]
+            code, began = start()
+            google.approve(began["user_code"], "fio@unal.edu.co", "Fio")
+            google.garbage = True
+            garbled = poll(began["flow"])[0]
+            google.garbage = False
+            garbled_after = poll(began["flow"])[0]
+        finally:
+            sys.stderr = real
+            google.down = google.garbage = False
+            google.client_secret = "GOCSPX-test-secret"
+        pages = (json.dumps(call("/api/ping")[1])
+                 + json.dumps(call("/api/users", token=owner)[1])
+                 + json.dumps(call("/api/state", token=owner)[1]))
+        attempt("Google out of reach: a sign-in waits rather than failing, a new "
+                "one is refused plainly",
+                lambda: (outage == (200, {"ok": True, "state": "pending"})
+                         and refused_start[0] == 503
+                         and recovered[1].get("state") == "done",
+                         f"outage {outage}; new {refused_start[0]}; then "
+                         f"{recovered[1].get('state')}"))
+        attempt("a refusal that asking again cannot mend -- a rotated secret, an "
+                "answer that is not one -- ends the sign-in instead of waiting "
+                "30 minutes", lambda: (rotated[0] == 503 and rotated_after == 410
+                                       and garbled == 503 and garbled_after == 410
+                                       and not user("eva") and not user("fio"),
+                                       f"rotated {rotated[0]} then {rotated_after}; "
+                                       f"garbled {garbled} then {garbled_after}"))
+        attempt("the client secret and the passwords are in no page, reply or "
+                "log line", lambda: (all(secret not in caught.getvalue()
+                                         + json.dumps(refused_start[1])
+                                         + json.dumps(rotated[1]) + pages
+                                         for secret in (google.client_secret,
+                                                        "good-pass-1", "her-pass-1"))
+                                     and "google sign-in" in caught.getvalue(),
+                                     "nothing found"))
 
-        def bound_to_the_request():
-            signup("tia")
-            made = user("tia")
-            return (not database.confirm_email(made["id"], "another-uuid", time.time())
-                    and not database.delete_unconfirmed_request(made["id"],
-                                                                "another-uuid")
-                    and user("tia").get("uuid") == made["uuid"]
-                    and not user("tia").get("email_verified_at"),
-                    "nothing written for another request's uuid")
-        attempt("a confirmation and a replacement apply only to the request they "
-                "were checked against", bound_to_the_request)
+        def no_redirect():
+            seen = []
 
-        def machine_asks_first():
-            import subprocess
-            import sys
-            tool = os.path.join(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__))), "users.py")
-            db_path = os.path.join(directory, "addresses.db")
+            class Elsewhere(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    seen.append(self.path)
+                    self.send_response(200)
+                    self.end_headers()
+                do_POST = do_GET
 
-            def users(*args):
-                return subprocess.run([sys.executable, tool, "--db", db_path, *args],
-                                      capture_output=True, text=True, timeout=60)
-            listed = users("list").stdout
-            refused = users("role", "tia", "viewer")
-            allowed = users("role", "tia", "viewer", "--unconfirmed")
-            return (refused.returncode == 1 and "--unconfirmed" in refused.stderr
-                    and allowed.returncode == 0 and "NOT confirmed" in listed
-                    and user("tia").get("status") == "active",
-                    f"refused {refused.returncode}, then {allowed.returncode}")
-        attempt("on the machine, an unconfirmed request is let in only when told "
-                "so, and the list says which are unconfirmed", machine_asks_first)
+                def log_message(self, *args):
+                    pass
+            far = http.server.HTTPServer(("127.0.0.1", 0), Elsewhere)
+
+            class Redirect(Elsewhere):
+                def do_POST(self):
+                    self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                    self.send_response(302)        # urllib would follow, as a GET
+                    self.send_header("Location", f"http://127.0.0.1:"
+                                                 f"{far.server_address[1]}/x")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+            near = http.server.HTTPServer(("127.0.0.1", 0), Redirect)
+            for one in (far, near):
+                threading.Thread(target=one.serve_forever, daemon=True).start()
+            try:
+                status, _ = googlemod._post(f"http://127.0.0.1:{near.server_address[1]}/t",
+                                            {"client_secret": "s3cret"})
+            finally:
+                for one in (far, near):
+                    one.shutdown()
+                    one.server_close()
+            return status == 302 and not seen, f"HTTP {status}; followed: {bool(seen)}"
+        attempt("a redirect from Google is not followed", no_redirect)
 
         # --- limits ---------------------------------------------------------------
-        signup("ray")
-        forgive()
-        accounts._code_checks = authmod.Budget(3)
-        tries = [confirm("ray", "1")[0] for _ in range(4)]
-        attempt("codes typed from one address are limited per minute",
-                lambda: (tries[:3] == [400] * 3 and tries[3] == 429, str(tries)))
-        accounts._code_requests = authmod.Budget(1, 3600.0)
-        asked = [new_code("dee")[0], new_code("dee")[0]]
-        attempt("new codes asked for from one address are limited per hour",
-                lambda: (asked[1] == 429, str(asked)))
-        accounts._mail_sent = authmod.Budget(1, 3600.0)
-        hourly = [signup(name)[1].get("sent") for name in ("joe", "kai")]
-        accounts._mail_sent = authmod.Budget(100, 3600.0)
-        accounts._mail_daily = authmod.Budget(1, 86400.0)
-        accounts._mail_daily.take("all")          # the day's mail all sent
-        daily = signup("lee")[1]
-        attempt("the panel mails at most so much an hour and a day, everybody "
-                "together", lambda: (hourly == [True, False]
-                                     and daily.get("sent") is False,
-                                     f"hour {hourly}; day {daily}"))
+        accounts._google_starts = authmod.Budget(1, 3600.0)
+        per_address = [start()[0], start()[0]]
+        accounts._google_starts = authmod.Budget(100, 3600.0)
+        with accounts._flows_lock:
+            waiting = len(accounts._flows)
+        authmod.GOOGLE_FLOWS_MAX = waiting + 1
+        before = accounts._google_starts_all.wait("all")
+        crowded = [start()[0], start()[0]]
+        authmod.GOOGLE_FLOWS_MAX = saved[2]
+        attempt("sign-ins started per address, and waited for at once, are "
+                "limited -- the crowded one costing nobody's hourly budget",
+                lambda: (per_address == [200, 429] and crowded == [200, 429]
+                         and before == 0.0, f"{per_address}, {crowded}"))
+
+        # --- one's own request, and the request an admin was shown -----------------
+        def own_request():
+            requested("fay@unal.edu.co", "Fay", password="fay-pass-1")
+            first = user("fay")
+            report = next(p for p in call("/api/users", token=owner)[1]["people"]
+                          if p["username"] == "fay")
+            requested("fay@unal.edu.co", "Fay", password="fay-pass-2",
+                      note="second try")
+            second = user("fay")
+            stale = call("/api/users/approve", {"id": report["id"], "role": "operator",
+                                                "created_at": report["created_at"]},
+                         owner)
+            stale_decline = call("/api/users/decline", {
+                "id": report["id"], "created_at": report["created_at"]}, owner)[0]
+            logged = [e["message"] for e in database.events(limit=30)
+                      if "(fay)" in e["message"] and "replacing" in e["message"]]
+            current = call("/api/users/approve", {
+                "id": second.get("id"), "role": "viewer",
+                "created_at": second.get("created_at")}, owner)[0]
+            flow, taken, _ = requested("ana.perez@unal.edu.co", "Ana",
+                                       password="x-pass-1")
+            return (second.get("uuid") not in (None, first.get("uuid"))
+                    and second.get("note") == "second try"
+                    and stale[0] == 409 and "again" in stale[1].get("error", "")
+                    and stale_decline == 409 and bool(logged) and current == 200
+                    and call("/api/login", {"username": "fay",
+                                            "password": "fay-pass-2"})[0] == 200
+                    and taken == 409 and user("ana.perez").get("status") == "active",
+                    f"stale approve {stale[0]}, decline {stale_decline}; current "
+                    f"{current}; replacement logged {bool(logged)}; an active "
+                    f"account {taken}")
+        attempt("a verified person may make their own waiting request again; an "
+                "admin decides only the request they were shown; an account in "
+                "use is never replaced", own_request)
+
+        def unverified_kept_out():
+            pending = user("old.request")
+            refused = call("/api/users/approve", {"id": pending.get("id"),
+                                                  "role": "viewer"}, owner)
+            listed = users_tool("list").stdout
+            without = users_tool("role", "old.request", "viewer")
+            told = users_tool("role", "old.request", "viewer", "--unconfirmed")
+            return (refused[0] == 409 and "Google" in refused[1].get("error", "")
+                    and "NOT verified" in listed and "verified with Google" in listed
+                    and without.returncode == 1 and told.returncode == 0
+                    and user("old.request").get("status") == "active",
+                    f"approve {refused[0]}; on the machine {without.returncode} "
+                    f"then {told.returncode}")
+        attempt("a request made before Google was set up is not approved in the "
+                "panel; on the machine only when told so", unverified_kept_out)
+
+        def fails_closed():
+            call("/api/signup", {})                  # nothing; just the route
+            database.create_user("hal", "", status="pending")
+            outcomes = {}
+            for label in ("unreadable", "broken"):
+                if label == "unreadable":
+                    os.chmod(google_path, 0)
+                else:
+                    os.chmod(google_path, 0o600)
+                    with open(google_path) as fh:
+                        good = fh.read()
+                    with open(google_path, "w") as fh:
+                        fh.write(good[:10])
+                typed = call("/api/signup", {"username": "victim.name",
+                                             "password": "v-pass-1"})[0]
+                began = start()[0]
+                approve = call("/api/users/approve", {"id": user("hal").get("id"),
+                                                      "role": "viewer"}, owner)[0]
+                live = call("/api/ping")[1]["auth"]["google_signin"]
+                told = call("/api/users", token=owner)[1]["email"].get("usable")
+                outcomes[label] = (typed, began, approve, live, told)
+            os.chmod(google_path, 0o600)
+            with open(google_path, "w") as fh:
+                fh.write(good)
+            return (all(v == (400, 503, 409, True, False) for v in outcomes.values())
+                    and not user("victim.name"), str(outcomes))
+        if os.geteuid() != 0:                    # root reads a mode-000 file
+            attempt("a client file that cannot be read, or is broken, takes "
+                    "nothing: no typed request, no sign-in, no approval of an "
+                    "unverified one", fails_closed)
 
         def old_store():
             path = os.path.join(directory, "before.db")
             with sqlite3.connect(path) as old:
-                old.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, uuid TEXT "
-                            "NOT NULL UNIQUE, username TEXT NOT NULL UNIQUE, "
-                            "display_name TEXT NOT NULL DEFAULT '', kind TEXT NOT "
-                            "NULL DEFAULT 'person', password_hash TEXT NOT NULL "
-                            "DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', "
-                            "must_change INTEGER NOT NULL DEFAULT 0, note TEXT "
-                            "DEFAULT '', created_at REAL NOT NULL, updated_at REAL "
-                            "NOT NULL, last_login_at REAL)")
+                old.execute("CREATE TABLE email_codes (username TEXT PRIMARY KEY)")
             reopened = dbmod.Database(path)
             try:
-                made = reopened.create_user("fay", "", status="pending")
-                reopened.update_user(made["id"], email_verified_at=1.0)
-                return reopened.user(made["id"])["email_verified_at"] == 1.0, "migrated"
+                left = {r[0] for r in reopened._db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                columns = {r[1] for r in reopened._db.execute(
+                    "PRAGMA table_info(users)")}
             finally:
                 reopened.close()
-        attempt("an older database gains the column", old_store)
+            return ("email_codes" not in left and "email_verified_at" in columns,
+                    sorted(left)[:6])
+        attempt("the mailed codes' table of an older database is dropped", old_store)
+        off = users_tool("google", "off").returncode
+        attempt("google off stops the checking", lambda: (
+            off == 0 and call("/api/ping")[1]["auth"]["google_signin"] is False, str(off)))
     finally:
-        (authmod.SIGNUPS_PER_HOUR, authmod.CODE_CHECKS_PER_MINUTE,
-         authmod.CODE_REQUESTS_PER_HOUR, mailermod.SEND_TIMEOUT_S,
-         authmod.SEND_LOCK_WAIT_S) = saved
-        if silent is not None:
-            silent.close()
-        smtp.close()
+        (authmod.SIGNUPS_PER_HOUR, authmod.GOOGLE_POLL_MIN_S,
+         authmod.GOOGLE_FLOWS_MAX, authmod.GOOGLE_STARTS_PER_HOUR,
+         authmod.GOOGLE_STARTS_PER_HOUR_ALL,
+         googlemod.DEVICE_URL, googlemod.TOKEN_URL) = saved
+        google.close()
         server.shutdown()
         server.server_close()
         engine.registry.close()

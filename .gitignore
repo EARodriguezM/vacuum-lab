@@ -1,5 +1,11 @@
 **/__pycache__/
 
+# A Google OAuth client, as Google Cloud gives it for download, and as the
+# panel keeps it (google.json, beside the database): never in this public
+# repository, even by mistake.
+client_secret_*.json
+google.json
+
 # Run databases. The real one lives in ~/.local/share/vacuum-lab/, but a
 # --db path pointed inside the repo is the obvious thing to do while testing.
 *.db
