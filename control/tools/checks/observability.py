@@ -371,3 +371,54 @@ def _sections() -> None:
                 "runs, alarms, overrides and owed clean-ups reported; flagged")
     attempt("the morning report names the night's runs, alarms, overrides and "
             "what is owed, and says it needs a person", morning_report)
+
+    def waiting_step_alarm():
+        directory = _scratch()
+        database, engine, supervisor = _rig(directory)
+        try:
+            supervisor.PROMPT_ALARM_S = 0.3
+            engine._prompt = {"id": 41, "actuator": "gas", "want": "20",
+                              "label": "Argon flow", "value": "20 sccm",
+                              "instruction": "Open the argon needle valve.",
+                              "since": time.time()}
+            supervisor.check()
+            early = [a for a in supervisor.describe()["alarms"]
+                     if a["key"].startswith("prompt_")]
+            time.sleep(0.4)
+            supervisor.check()
+            raised = [a for a in supervisor.describe()["alarms"]
+                      if a["key"] == "prompt_41"]
+            engine._prompt = None                  # confirmed, by Done
+            engine.last_confirmed = {"id": 41, "user": None}
+            supervisor.check()
+            after = next((a for a in supervisor.describe()["recent"]
+                          if a["key"] == "prompt_41"), {})
+            # A new step starts its own wait; a run ending under one leaves
+            # its alarm for somebody to acknowledge.
+            engine._prompt = {"id": 42, "label": "Magnetron",
+                              "instruction": "Strike the plasma."}
+            supervisor.check()
+            fresh = [a for a in supervisor.describe()["alarms"]
+                     if a["key"] == "prompt_42"]
+            time.sleep(0.4)
+            supervisor.check()
+            engine._prompt = None                  # the run ended instead
+            supervisor.check()
+            left = next((a for a in supervisor.describe()["alarms"]
+                         if a["key"] == "prompt_42"), {})
+        finally:
+            _stop(database, engine, supervisor)
+            shutil.rmtree(directory, ignore_errors=True)
+        return (not early and raised and raised[0]["level"] == "critical"
+                and "Open the argon" in raised[0]["detail"]
+                and after.get("active") is False and after.get("acknowledged")
+                and not fresh and left.get("active") is False
+                and left.get("acknowledged") is False,
+                f"before the limit {len(early)}; after it "
+                f"{raised[0]['level'] if raised else 'nothing'}; once Done: "
+                f"active {after.get('active')}, acknowledged "
+                f"{after.get('acknowledged')}; a new step at once {len(fresh)}; "
+                f"ended under it: acknowledged {left.get('acknowledged')}")
+    attempt("a guided step waiting past its limit raises a critical alarm; "
+            "its Done clears and acknowledges it, a run ending under it only "
+            "clears it; the next step waits afresh", waiting_step_alarm)

@@ -1093,6 +1093,23 @@ def part_lost(chrome, server, sessions, report, shots):
     report.check("and goes back to normal at the next answer", back)
     click(page, "confirm-cancel")
 
+    # On a watching tablet the beep may be silenced by anyone there: nobody
+    # can sign in while the lab PC does not answer.
+    kiosk = chrome.page(*SIZES["tablet"])
+    open_as(kiosk, server.base, sessions["tablet"], "dashboard")
+    kiosk.js("window.dispatchEvent(new PointerEvent('pointerdown'))")
+    kiosk.js("window.__ui.offline = true")
+    offered = kiosk.wait("(document.querySelector(\"[data-test='silence-lost']\") || {})"
+                         ".innerText", timeout=4 * POLL_S + 6)
+    click(kiosk, "silence-lost")
+    settle(kiosk)
+    quiet = not present(kiosk, "silence-lost").get("shown")
+    still = present(kiosk, "lost-contact").get("shown")
+    kiosk.js("window.__ui.offline = false")
+    report.check("a watching tablet that loses the lab PC can be silenced by "
+                 "anyone at it; the banner stays", offered and quiet and still,
+                 f"offered {bool(offered)}, silenced {quiet}, banner {still}")
+
     # A poll slower than the control lease was saved before the cap: capped.
     slow = chrome.page(*SIZES["tablet"])
     open_as(slow, server.base, sessions["viewer"], "dashboard")

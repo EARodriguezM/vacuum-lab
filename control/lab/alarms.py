@@ -118,6 +118,10 @@ class Supervisor:
     BACKUP_MAX_AGE_S = 48 * 3600.0
     #: A chart recorder silent this long has stopped.
     RECORDER_STALL_S = 30.0
+    #: A guided step waiting this long for a person becomes a critical alarm
+    #: (the user's decision, 2026-10-16): its chime may go unheard, and a
+    #: deposition waiting with the plasma on must not wait unnoticed.
+    PROMPT_ALARM_S = 600.0
     #: How often `on_tick` (the status file) is called, at most.
     TICK_HOOK_S = 5.0
 
@@ -181,6 +185,8 @@ class Supervisor:
         self._moves_seen: dict[str, float] = {}
         self._orphans_seen: dict[str, str] = {}
         self._storage_seen = None
+        #: The guided step waiting now, and since when (monotonic), by its id.
+        self._prompt_seen: tuple | None = None
         #: The current or last automatic recovery, for the panel.
         self.recovering: dict | None = None
         #: What the last panel left: its heartbeat, read once, announced at
@@ -438,6 +444,40 @@ class Supervisor:
         else:
             self.clear("backup")
 
+    def _watch_prompt(self) -> None:
+        """A guided run waiting on a person for too long: an alarm, cleared
+        once the step is confirmed or the run ends. Timed from when this
+        supervisor first saw the step, on the monotonic clock."""
+        prompt_of = getattr(self.engine, "prompt", None)
+        prompt = prompt_of() if prompt_of else None
+        seen = self._prompt_seen
+        current = prompt.get("id") if prompt else None
+        if seen is not None and seen[0] != current:
+            key = f"prompt_{seen[0]}"
+            self.clear(key)
+            # Done is the answer to its own waiting alarm: acknowledged too,
+            # under whoever pressed it, so it does not go on sounding. A run
+            # that ended instead leaves it for somebody to acknowledge.
+            done = getattr(self.engine, "last_confirmed", None)
+            if isinstance(done, dict) and done.get("id") == seen[0]:
+                for alarm in self.describe()["alarms"]:
+                    if alarm["key"] == key:
+                        self.acknowledge(alarm["id"], user=done.get("user"))
+            self._prompt_seen = seen = None
+        if current is None:
+            return
+        if seen is None:
+            self._prompt_seen = seen = (current, time.monotonic())
+        waited = time.monotonic() - seen[1]
+        if waited >= self.PROMPT_ALARM_S:
+            self.raise_alarm(
+                f"prompt_{current}", "critical",
+                f"A guided step has waited {waited / 60:.0f} min: "
+                f"{prompt.get('label') or 'a manual step'}",
+                f"The run is waiting for somebody to do this by hand: "
+                f"{prompt.get('instruction') or '(no instruction)'} Its checks "
+                f"keep running. Do the step and press Done, or stop the run.")
+
     def _watch_recorder(self) -> None:
         age = self.recorder.beat_age() if self.recorder is not None and \
             hasattr(self.recorder, "beat_age") else None
@@ -578,6 +618,7 @@ class Supervisor:
         self._watch_recorder()
         if gauge and gsnap and gsnap.get("connected"):
             self._watch_pressure(gauge, gsnap, psnap)
+        self._watch_prompt()
 
     def _watch_link(self, key: str, snap: dict | None, label: str,
                     service=None) -> None:

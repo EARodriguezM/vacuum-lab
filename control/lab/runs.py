@@ -2088,6 +2088,8 @@ class RunEngine:
         self._checklist: list[dict] = []
         #: When the run in progress started (monotonic): its time `t` zero.
         self._run_started: float | None = None
+        #: The guided step last confirmed: {"id", "user"}, or None.
+        self.last_confirmed: dict | None = None
 
         self._close_orphans()
 
@@ -2188,6 +2190,9 @@ class RunEngine:
             except process.ActuatorError:
                 pass
             self._prompt = None
+            #: The step last confirmed, and by whom: the supervisor takes it
+            #: as the answer to that step's waiting alarm, if one was raised.
+            self.last_confirmed = {"id": pending.get("id"), "user": user}
         self.log("action",
                  (f"{user.name} " if user is not None else "Operator ")
                  + f"confirmed: {pending['instruction']}"

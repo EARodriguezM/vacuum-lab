@@ -844,7 +844,7 @@ function App() {
 
   const run = state?.run;
   const kiosk = !!held.device;
-  const [sounding, silenceSounds] = useAlarmSignals({
+  const [sounding, silenceSounds, silenceLost] = useAlarmSignals({
     alarms: state?.alarms, prompt: run?.prompt, checklist: run?.checklist,
     lost: kiosk && lost ? lost.since : null,
   });
@@ -1008,7 +1008,10 @@ function App() {
 
       ${lost && state && html`
         <${LostContact} lost=${lost} error=${error} kiosk=${kiosk}
-                        silence=${kiosk ? silence : null} />`}
+                        silence=${silenceLost && html`
+                          <button class="small" data-test="silence-lost" onClick=${silenceLost}
+                                  title="Quietens this screen only; anyone here may">
+                            Silence here</button>`} />`}
 
       <div class=${`wrap-inner${lost ? " stale" : ""}`} aria-busy=${lost ? "true" : null}>
           <${ChecklistBar} steps=${run?.checklist} now=${state?.server_time} may=${may}

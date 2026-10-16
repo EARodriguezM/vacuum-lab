@@ -206,11 +206,18 @@ pressed. A viewer sees "An operator answers this"; a paired tablet says
 until something new sounds. It acknowledges nothing and does not touch other
 screens.
 
+**A step that waits too long becomes an alarm.** A guided step chimes once a
+minute; after 10 minutes without a *Done* it raises a critical alarm on every
+screen. Pressing *Done* clears and acknowledges it; if the run ends instead,
+the alarm stays for somebody to acknowledge.
+
 **When the panel loses contact with the lab PC**, after two failed attempts a
 banner says "No contact with the lab PC since HH:MM" with what to check (the
 lab PC and its network, then the panel's service), and the figures turn grey
 so a frozen number cannot be mistaken for a live one. A wall tablet also
-beeps, every 10 seconds for two minutes and then every 5 minutes. If the banner
+beeps, every 10 seconds for two minutes and then every 5 minutes; anyone at
+the tablet may silence that beep with its own **Silence here**, since nobody
+can sign in while the lab PC does not answer. If the banner
 says the panel "is not answering properly", the lab PC is reachable but the
 panel is struggling: look at its service. The figures return by themselves
 when contact does.

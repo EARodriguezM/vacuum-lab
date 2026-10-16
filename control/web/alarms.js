@@ -175,7 +175,11 @@ const silenced = new Set();
  *
  * "Silence here" (operators and above, this browser only) quietens what is
  * sounding now; anything new sounds again. The server never hears of it.
- * Returns [what is sounding, the silence function].
+ * The lost-contact beep has a silence of its own, for anyone at the screen
+ * (the user's decision, 2026-10-16): nobody can sign in while the lab PC
+ * does not answer.
+ * Returns [what is sounding, the silence function, the lost-contact silence
+ * or null when that beep is not sounding].
  */
 export function useAlarmSignals({ alarms, prompt, checklist, lost }) {
   const base = useRef(typeof document !== "undefined" ? document.title : "");
@@ -234,5 +238,9 @@ export function useAlarmSignals({ alarms, prompt, checklist, lost }) {
     if (lostKey) silenced.add(lostKey);
     setTick((t) => t + 1);
   };
-  return [sounding, silence];
+  const silenceLost = on && !!audio && lostKey ? () => {
+    silenced.add(lostKey);
+    setTick((t) => t + 1);
+  } : null;
+  return [sounding, silence, silenceLost];
 }
