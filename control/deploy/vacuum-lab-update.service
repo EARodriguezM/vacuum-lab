@@ -1,0 +1,47 @@
+# Look for a new version of the panel on GitHub, every 15 minutes (with
+# vacuum-lab-update.timer). It never installs anything: it verifies a signed
+# version, unpacks it beside the others, runs its selftest while the rig is
+# idle, and says it is ready. An admin installs it from the panel
+# (Settings -> Server), which starts vacuum-lab-install.service.
+#
+# Installed by `tools/release.py deploy --install-units`; by hand:
+#   sudo cp deploy/vacuum-lab-update.* deploy/vacuum-lab-install.* /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vacuum-lab-update.timer vacuum-lab-install.path
+#
+# It accepts versions signed with a key it has been told to trust, once, on
+# this machine (the public key of whoever signs releases on the laptop):
+#   ~/vacuum-lab/current/tools/autoupdate.py trust NAME KEYFILE.pub
+# Without one every version is refused. See what it knows:
+#   ~/vacuum-lab/current/tools/autoupdate.py status
+#   journalctl -u vacuum-lab-update
+
+[Unit]
+Description=Look for a new version of the vacuum lab panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=esarodriguezm
+WorkingDirectory=/home/esarodriguezm/vacuum-lab/current
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /home/esarodriguezm/vacuum-lab/current/tools/autoupdate.py check
+# The selftest takes about 11 minutes; past this it is stopped.
+TimeoutStartSec=90min
+# Lowest priority: the panel's sampling and safety tick come first, and the
+# selftest is stopped as soon as the panel reports a run.
+Nice=19
+IOSchedulingClass=idle
+UMask=0077
+ProtectSystem=strict
+# Its releases and downloads, and update.json beside the database.
+ReadWritePaths=/home/esarodriguezm/vacuum-lab /home/esarodriguezm/.local/share/vacuum-lab
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes

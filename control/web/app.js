@@ -1032,6 +1032,13 @@ function App() {
               a drive fault will not be made safe. Restart the panel, and see
               <span class="mono">journalctl -u vacuum-lab-web -p err</span> for why.
             <//>`}
+          ${state?.update?.pending && html`
+            <div data-test="update-banner"><${Banner} tone="warn">
+              <strong>Installing version ${state.update.pending.tag}</strong>, asked for
+              by ${state.update.pending.name}. The panel restarts in a moment and is
+              back within about a minute; this page then reloads by itself. New runs
+              wait until it is back. The pump keeps doing what it was told.
+            <//></div>`}
 
           <${PromptBar} prompt=${run?.running ? run.prompt : null} now=${state?.server_time}
                         may=${may} busy=${busy} heldBy=${heldBy}

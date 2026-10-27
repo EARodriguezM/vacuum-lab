@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lab import (alarms, api, auth, chamber as chambermod,  # noqa: E402
                  db as dbmod, discovery, google as googlemod, history, process,
-                 pump, registry, runs)
+                 pump, registry, runs, updates as updatesmod)
 
 
 def build(args) -> api.Application:
@@ -145,7 +145,11 @@ def build(args) -> api.Application:
                            origins=[o for o in args.allow_origin.split(",") if o],
                            admin_from=api.parse_networks(args.admin_from),
                            status_file=status_path(args),
-                           version=read_version())
+                           version=read_version(),
+                           # What tools/autoupdate.py has found, beside the
+                           # database; the simulator's is a scratch folder.
+                           updates=None if args.simulate else updatesmod.Updates(
+                               data_dir, engine, database, supervisor))
     # Started once the Application has set its status hook.
     supervisor.start()
     return application

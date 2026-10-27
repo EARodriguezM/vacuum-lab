@@ -1,0 +1,13 @@
+# Start vacuum-lab-install.service when an admin asks the panel to install a
+# new version: the panel writes this file beside its database, and the
+# installer takes it first thing. The panel withdraws a request nobody took
+# within a minute, so a machine without this unit only says so.
+[Unit]
+Description=Install a new version of the vacuum lab panel when an admin asks
+
+[Path]
+PathExists=/home/esarodriguezm/.local/share/vacuum-lab/update-request.json
+Unit=vacuum-lab-install.service
+
+[Install]
+WantedBy=multi-user.target

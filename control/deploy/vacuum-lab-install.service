@@ -1,0 +1,29 @@
+# Install the version vacuum-lab-update.service made ready, when an admin
+# asks for it from the panel (vacuum-lab-install.path starts this).
+#
+# A unit of its own, not a child of the panel: it restarts the panel, and
+# must outlive that restart to see the new version come up healthy -- and to
+# go back to the version before if it does not. It checks the rig is idle,
+# makes a backup into ~/vacuum-lab/backups, refuses a version whose system
+# units differ (those are deployed from a laptop, release.py deploy
+# --install-units), switches ~/vacuum-lab/current and restarts
+# vacuum-lab-web, as tools/release.py deploy does. How it went is in
+# update.json, which the panel shows, and here:
+#   journalctl -u vacuum-lab-install
+
+[Unit]
+Description=Install a new version of the vacuum lab panel
+
+[Service]
+Type=oneshot
+User=esarodriguezm
+WorkingDirectory=/home/esarodriguezm/vacuum-lab/current
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /home/esarodriguezm/vacuum-lab/current/tools/autoupdate.py install
+# A backup, the panel's own shutdown (up to 90 s), a minute to come up
+# healthy, and the same again going back.
+TimeoutStartSec=30min
+UMask=0077
+# Not sandboxed further: it restarts the panel through `sudo systemctl`,
+# which needs what NoNewPrivileges and a read-only /run would take away.

@@ -38,6 +38,7 @@ import re
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 import threading
 import time
 import traceback
@@ -51,7 +52,7 @@ from tools.cdp import Chrome, Page, attach  # noqa: E402
 
 PARTS = ("pages", "maths", "gating", "override", "prompt", "fault", "idle",
          "deploy", "form", "history", "signup", "start", "guided", "lost",
-         "sending")
+         "sending", "update")
 SIZES = {"tablet": (1024, 600, False), "phone": (390, 844, True)}
 ROLES = ("viewer", "operator", "admin", "tablet")
 PASSWORD = "uitest-pass-1"
@@ -1144,6 +1145,78 @@ def part_sending(chrome, server, sessions, report, shots):
     report.check("and the answer closes it, or shows the refusal in it", answered)
 
 
+def part_update(chrome, server, sessions, report, shots):
+    """A version the lab PC's updater made ready: shown under Settings ->
+    Server, installed only by an admin, after a dialog that says the rig goes
+    unwatched; then every page says so and new runs wait."""
+    from lab import updates as updatesmod
+    from tools import autoupdate
+
+    folder = os.path.join(server.folder, "update")
+    os.makedirs(folder)
+    now = time.time()
+    autoupdate.save_state(Path(folder), {
+        "checked_at": now, "refused": {"v2026.10.26": "the tag is not signed"},
+        "running": {"release": "20261020-0900-11111111", "tag": "v2026.10.20"},
+        "latest": {"tag": "v2026.10.27", "release": "20261027-1200-abcdef12",
+                   "commit": "c" * 40, "state": "ready", "title": "Version v2026.10.27",
+                   "notes": "Install new versions from the panel.",
+                   "tagged_at": now - 3600, "signed_by": "lab",
+                   "tested_at": now - 600}})
+    request = os.path.join(folder, updatesmod.REQUEST_FILE)
+    engine = server.app.engine
+    server.app.updates = updatesmod.Updates(folder, engine, server.app.db)
+    try:
+        page = chrome.page(*SIZES["phone"])
+        open_as(page, server.base, sessions["operator"], "settings/server")
+        page.wait("document.querySelector(\"[data-test='update-install']\")", timeout=10)
+        offered = present(page, "update-install")
+        text = page.js("document.querySelector(\"[data-test='update-card']\").innerText")
+        report.check("an operator sees the version ready, its notes, and that an "
+                     "admin installs it",
+                     offered.get("shown") and not offered.get("enabled")
+                     and "Install new versions" in (text or "")
+                     and "An admin installs it" in (text or ""), str(offered))
+        audit(page, report, "settings/server with a version ready (phone)", shots)
+
+        server.call("/api/control/take", {"force": True}, sessions["admin"]["person"])
+        admin = chrome.page(*SIZES["tablet"])
+        open_as(admin, server.base, sessions["admin"], "settings/server")
+        admin.wait("document.querySelector(\"[data-test='update-install']:not([disabled])\")",
+                   timeout=10)
+        marked = admin.js("!!document.querySelector(\"[data-test='subtab-server'] .badge\")")
+        report.check("an admin sees the Server tab marked while a version is ready",
+                     marked)
+        audit(admin, report, "settings/server with a version ready (tablet)", shots)
+        click(admin, "update-install")
+        said = admin.wait("document.querySelector('.dialog') && "
+                          "document.querySelector('.dialog').innerText", timeout=10)
+        report.check("Install asks first: the rig goes unwatched, runs wait, it "
+                     "goes back by itself",
+                     said and "nothing watches" in said and "runs" in said
+                     and "by itself" in said and not os.path.exists(request),
+                     (said or "")[:80])
+        click(admin, "confirm-ok")
+        report.check("its confirm leaves the request for the installer",
+                     _wait(lambda: os.path.exists(request), 10))
+        # On the admin's page: the operator's is behind it now, and a hidden
+        # page does not poll.
+        banner = admin.wait("document.querySelector(\"[data-test='update-banner']\")"
+                            " && document.querySelector(\"[data-test='update-banner']\")"
+                            ".innerText", timeout=10)
+        report.check("the page says an install is under way, and by whom",
+                     banner and "v2026.10.27" in banner and "Adam" in banner,
+                     (banner or "")[:80])
+        refused = engine.start("hold", {})
+        report.check("and no run starts meanwhile",
+                     "being installed" in refused.get("error", ""),
+                     refused.get("error", "")[:80])
+    finally:
+        server.app.updates = None
+        engine.unhold()
+        server.call("/api/control/release", {}, sessions["admin"]["person"])
+
+
 def _wait(predicate, timeout: float) -> bool:
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -1159,7 +1232,7 @@ PART_FUNCTIONS = {"pages": part_pages, "maths": part_maths,
                   "idle": part_idle, "deploy": part_deploy, "form": part_form,
                   "history": part_history, "signup": part_signup,
                   "start": part_start, "guided": part_guided, "lost": part_lost,
-                  "sending": part_sending}
+                  "sending": part_sending, "update": part_update}
 
 
 # --- the kiosk -------------------------------------------------------------------

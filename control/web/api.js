@@ -303,6 +303,8 @@ export const api = {
   // What answers on every free port: probed with read-only queries.
   portSurvey: () => get("/api/ports/survey"),
   setPortSearch: (enabled) => post("/api/ports/searching", { enabled: !!enabled }),
+  // Restarts the panel into the version the updater made ready: an admin's.
+  installUpdate: (release) => post("/api/update/install", { release, confirm: true }),
   searchDevice: (key) => post(`/api/device/${key}/search`, {}),
   setPort: (device, port, extra = {}) =>
     post("/api/device/port", { device, port, confirm: true, ...extra }),

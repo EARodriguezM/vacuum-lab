@@ -2016,6 +2016,10 @@ class RunEngine:
         self._attempt_lock = threading.Lock()
         #: Set by close(): nothing is started or tried again from then on.
         self._closing = threading.Event()
+        #: While an admin's install of a new version is under way (lab/
+        #: updates.py): why runs and power-downs are refused, and until when
+        #: (monotonic). The restart ends it, or the installer saying no.
+        self._hold: tuple[str, float] | None = None
         self._procedure: Procedure | None = None
         self._run: dict | None = None
         self._samples: list[dict] = []
@@ -2830,6 +2834,53 @@ class RunEngine:
 
     # --- lifecycle --------------------------------------------------------
 
+    def hold_for_update(self, reason: str, seconds: float,
+                        force: bool = False) -> str | None:
+        """Refuse new runs and power-downs for `seconds`, because the panel
+        is about to be restarted into a new version; or, if the rig is not
+        idle, say why and hold nothing -- unless `force`, for a panel that
+        comes up while an install is still being judged. Judged under
+        `start()`'s lock, so a run cannot begin between the look and the
+        hold."""
+        with self._lock:
+            busy = None if force else self._restart_problem()
+            if busy:
+                return busy
+            self._hold = (reason, time.monotonic() + seconds)
+            return None
+
+    def unhold(self) -> None:
+        # Not under the lock: a start() writing its record holds it, and
+        # this is called from the supervisor's tick.
+        self._hold = None
+
+    def held(self) -> str | None:
+        """Why runs are held back for an install, or None."""
+        hold = self._hold
+        if hold and time.monotonic() < hold[1]:
+            return hold[0]
+        return None
+
+    def _restart_problem(self) -> str | None:
+        """What a restart would cut short: the same as tools/release.py's
+        idle_problem reads from the status file, asked of the engine."""
+        if self._thread and self._thread.is_alive():
+            run = self._run or {}
+            return f"run {run.get('id')} is going: a restart would end it"
+        if self._shutdown_thread and self._shutdown_thread.is_alive():
+            return "a power-down is under way: a restart would leave it unfinished"
+        if self._secure_thread and self._secure_thread.is_alive():
+            return "the pump is being made safe after a fault"
+        if self.checklist():
+            return ("the last run left steps to do by hand that nobody has "
+                    "confirmed")
+        if self._orphan_thread and self._orphan_thread.is_alive() \
+                and any(o["ok"] is None for o in list(self.orphans)):
+            return "the clean-up of an earlier run is being tried"
+        if self._closing.is_set():
+            return "the panel is shutting down"
+        return None
+
     def start(self, procedure_name: str, config: dict, name: str = "",
               operator: str = "", notes: str = "",
               started_by: str | None = None) -> dict:
@@ -2837,6 +2888,11 @@ class RunEngine:
             if self._thread and self._thread.is_alive():
                 return {"ok": False,
                         "error": "a run is already in progress; stop it first"}
+            held = self.held()
+            if held:
+                return {"ok": False,
+                        "error": f"{held}. Start the run once that is "
+                                 f"done, in a minute or two."}
             if procedure_name not in CATALOGUE:
                 return {"ok": False,
                         "error": f"unknown procedure {procedure_name!r}"}
@@ -3114,6 +3170,13 @@ class RunEngine:
         with self._lock:
             if self._shutdown_thread and self._shutdown_thread.is_alive():
                 return {"ok": False, "error": "a shutdown is already running"}
+            # The restart would cut it short half way; the rotor is left as
+            # it is meanwhile, backed by the forevacuum pump.
+            held = self.held()
+            if held:
+                return {"ok": False,
+                        "error": f"{held}. Power the pump down once that "
+                                 f"is done, in a minute or two."}
             if self.pump() is None:
                 return {"ok": False, "error": "no pump is configured"}
             # Cut short by the process ending, a power-down could stop half

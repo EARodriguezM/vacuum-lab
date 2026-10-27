@@ -981,6 +981,86 @@ Only this folder travels: the tablet, the manuals and anything else at the
 top of the repository are never sent. `rollback` does the same switch by hand, and also needs the rig idle.
 The restart is announced on the panel as a warning to acknowledge.
 
+## Updating the panel from GitHub
+
+Besides `release.py deploy` from the laptop, the lab PC can fetch new versions
+itself. It never installs one on its own: an admin presses a button, once they
+can see that nobody is about to start a run.
+
+**Making a version** (on the laptop, once `test` has been merged into `main`).
+A version is a signed tag named `vYYYY.MM.DD` (`.2`, `.3` for more than one a
+day). Set up git to sign with an SSH key once:
+
+```bash
+git config gpg.format ssh
+git config user.signingkey ~/.ssh/YOUR_KEY.pub
+```
+
+then, from this folder:
+
+```bash
+git fetch
+./tools/release.py tag -m "What changed, in a line or two"
+git push origin vYYYY.MM.DD          # publishes it
+```
+
+The tag carries a fingerprint (SHA-256) of every file in this folder.
+
+**Setting up the lab PC** (once). `./tools/release.py deploy --to user@labpc
+--install-units` installs the four service files that do the looking and the
+installing, and the lab PC must be told which keys to believe:
+
+```bash
+ssh user@labpc
+~/vacuum-lab/current/tools/autoupdate.py trust NAME KEY.pub
+```
+
+`KEY.pub` is the public half of the key that signs the versions. **A version is
+accepted only if it is signed with a key trusted on that machine**; a tag
+pushed by anybody else is refused, even to the right repository.
+
+**What the lab PC does by itself**, every 15 minutes: it asks GitHub for new
+tags, checks the signature, downloads the files and compares them with the
+fingerprint in the signature, unpacks them beside the running version and
+runs the self test on them. The self test runs only while the rig is idle, at
+the lowest priority, and stops if a run starts. Then the version is "ready".
+A version that fails any of this is left alone until a newer one appears (or
+you ask for another try, below). No internet, or GitHub unreachable, is only
+reported and tried again.
+
+**Installing it.** In the panel, Settings → Server shows a *Software version*
+card with the running version and the one that is ready. An admin who has
+control of the rig presses *Install*. Then:
+
+- the panel stops accepting new runs and power-downs (stopping and aborting are
+  never held);
+- the lab PC makes a backup, switches to the new version and restarts the
+  panel;
+- **the rig is unwatched for about a minute** while the panel restarts. The
+  pump carries on with what it was doing, but the interlocks, the sampling and
+  the run engine are off until the new panel is up;
+- within a minute the new panel must be running the new version, with each
+  instrument that answered before answering again and no new critical alarm.
+  If not, the lab PC **goes back to the previous version by itself** and the
+  card says why.
+
+An install is refused while a run or a power-down is under way, and a
+version that changes the service files has to be deployed from the laptop with
+`--install-units`. A request nobody picks up within a minute is withdrawn, and
+a hold on new runs ends after ten minutes at most. `release.py deploy` from the
+laptop refuses while the panel is holding for an install.
+
+**From the shell on the lab PC:**
+
+```bash
+~/vacuum-lab/current/tools/autoupdate.py status          # what it knows, and why
+~/vacuum-lab/current/tools/autoupdate.py trust NAME KEY.pub   # believe a key
+~/vacuum-lab/current/tools/autoupdate.py retry vYYYY.MM.DD    # try a refused version again
+```
+
+`retry` is for a version whose self test failed for a reason of its own (the
+machine was busy, say); a version with a bad signature stays refused.
+
 ## Backups
 
 The SQLite download in the panel is **not** a backup: it leaves the accounts
@@ -1282,7 +1362,8 @@ with 120 sccm and the gate open reproduces the failures of 2026-10-08.
 | `tc600ctl.py` / `tpgctl.py` | Command line tools |
 | `tools/` | Simulators, the self test (`tools/checks/`) and the browser test |
 | `tools/backup.py`, `tools/release.py`, `tools/report.py` | Backups, releasing a new version, the morning report |
-| `deploy/` | The service files (`vacuum-lab-web`, `vacuum-lab-backup`) and the device rules |
+| `tools/autoupdate.py`, `lab/updates.py` | The lab PC's updater and the panel's part of it (see [Updating the panel from GitHub](#updating-the-panel-from-github)) |
+| `deploy/` | The service files (`vacuum-lab-web`, `vacuum-lab-backup`, `vacuum-lab-update`, `vacuum-lab-install`) and the device rules |
 
 ## Protocol notes
 
