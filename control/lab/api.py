@@ -49,14 +49,15 @@ CONFIRM_REQUIRED = GUARDED | {
 #: Who may make each POST: the lowest role, and whether the caller must hold
 #: control of the rig (lab/auth.py). Whatever moves hardware needs control.
 #: What makes the rig safer does not -- making the pump safe, cancelling a
-#: power-down, acknowledging alarms, and stopping a run without powering down
-#: (see _post_rule) -- because an operator who sees something wrong must not
+#: power-down, acknowledging alarms, confirming a step left by hand after a
+#: run, and stopping a run without powering down (see _post_rule) -- because an operator who sees something wrong must not
 #: have to wait for whoever holds control to notice. Setting the rig up --
 #: equipment, ports, automatic recovery -- is an admin's.
 POST_RULES = {
     "/api/command":              ("operator", True),
     "/api/run/start":            ("operator", True),
     "/api/run/acknowledge":      ("operator", True),
+    "/api/run/checklist":        ("operator", False),
     "/api/pump/shutdown":        ("operator", True),
     "/api/pump/secure":          ("operator", False),
     "/api/pump/cancel-shutdown": ("operator", False),
@@ -66,6 +67,9 @@ POST_RULES = {
     "/api/supervisor":           ("admin", False),
     "/api/device/port":          ("admin", False),
     "/api/ports/searching":      ("admin", False),
+    # Restarts the panel into a new version: an admin's, holding control,
+    # so nobody else is driving the rig when it goes quiet for a minute.
+    "/api/update/install":       ("admin", True),
 }
 
 #: Reachable without a session: how a sign-in page finds out where it is.
@@ -102,6 +106,27 @@ EXPORT_WAIT_S = 10.0
 #: without a cap, anyone on the network could make the server allocate
 #: whatever a Content-Length claims, before any password is checked.
 MAX_BODY_BYTES = 64 * 1024
+
+
+#: What may be done to a stored run, and which of it is an admin's.
+RUN_ACTIONS = ("update", "delete", "cleanup-checked")
+ADMIN_RUN_ACTIONS = ("delete", "cleanup-checked")
+
+
+def run_route(route: str) -> tuple[int, str] | None:
+    """`/api/runs/<id>` or `/api/runs/<id>/<action>`, exactly: (id, action).
+
+    The one parse for both who may post it and what it does. Anything else
+    -- a trailing slash, an extra segment, an unknown action -- is None.
+    """
+    parts = route.split("/")
+    if len(parts) not in (4, 5) or parts[:3] != ["", "api", "runs"]:
+        return None
+    if not (parts[3].isascii() and parts[3].isdigit()) \
+            or parts[3] != str(int(parts[3])):
+        return None
+    action = parts[4] if len(parts) == 5 else "update"
+    return (int(parts[3]), action) if action in RUN_ACTIONS else None
 
 
 def web_build(root: str = WEB_ROOT) -> str:
@@ -319,7 +344,8 @@ class Application:
                  chamber: dict | None = None, allow: list | None = None,
                  hosts: set[str] | None = None, origins: list | None = None,
                  admin_from: list | None = None, status_file: str | None = None,
-                 version: dict | None = None, setup: dict | None = None):
+                 version: dict | None = None, setup: dict | None = None,
+                 updates=None):
         self.registry = registry
         self.db = database
         self.engine = engine
@@ -363,8 +389,18 @@ class Application:
         #: anyone on the machine: in /run (RAM), so it costs the SD card
         #: nothing. Written from the supervisor's thread, every few seconds.
         self.status_file = status_file
-        if status_file and supervisor is not None:
-            supervisor.on_tick = self.write_status
+        #: New versions found by the updater on this machine (lab/updates.py),
+        #: or None where there is none.
+        self.updates = updates
+        #: One status write at a time, each through its own temporary file:
+        #: the supervisor's tick and an install request both write it.
+        self._status_lock = threading.Lock()
+        if updates is not None:
+            # The hold must be in the status file before the request exists:
+            # the installer may read it within the second.
+            updates.publish = self.write_status
+        if supervisor is not None and (status_file or updates is not None):
+            supervisor.on_tick = self.tick
 
     #: The longest an orderly shutdown may take, all of it. Below the unit's
     #: TimeoutStopSec (90 s), so systemd never kills the process in the
@@ -439,6 +475,7 @@ class Application:
             "server_time": time.time(),
             "uptime_s": round(time.time() - self.started_at, 1),
             "release": self.version.get("release"),
+            "update": self.updates.describe() if self.updates else None,
             "health": self.health(),
         }
 
@@ -482,27 +519,52 @@ class Application:
             "shutdown": shutdown if shutdown and shutdown.get("active") else None,
             "securing": bool(recovering.get("active")
                              or (engine.get("secure") or {}).get("active")),
+            # Steps a run's ending left to a person: held in memory, so a
+            # restart would forget them with the plasma maybe still on.
+            "by_hand": len(engine.get("checklist") or []),
             "ports": {s.key: s.port for s in self.registry},
             "connected": {s.key: bool(s.snapshot().get("connected"))
                           for s in self.registry},
+            # Connected and reading now: a sampler that hangs after its first
+            # replies stays "connected" while its readings age.
+            "fresh": {s.key: fresh(s) for s in self.registry},
             "critical": sum(1 for a in alarms if a.get("level") == "critical"
                             and a.get("active")),
             "alarms": len(alarms),
+            # The install request runs are held back for: tools/autoupdate.py
+            # restarts the panel only while this names its request.
+            "update_hold": self.updates.hold_id() if self.updates else None,
         }
 
+    def tick(self) -> None:
+        """Every few seconds, from the supervisor's thread."""
+        try:
+            self.write_status()
+        finally:
+            if self.updates is not None:
+                self.updates.watch()
+
     def write_status(self) -> None:
-        """Replace the status file in one rename; readable by this user only."""
+        """Replace the status file in one rename; readable by this user only.
+        Taken and written under one lock, so an older picture never lands
+        after a newer one."""
         if not self.status_file:
             return
-        folder = os.path.dirname(self.status_file)
-        if folder and not os.path.isdir(folder):
-            os.makedirs(folder, mode=0o700, exist_ok=True)
-        temporary = self.status_file + ".tmp"
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                             0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
-            json.dump(self.status(), fh)
-        os.replace(temporary, self.status_file)
+        with self._status_lock:
+            folder = os.path.dirname(self.status_file) or "."
+            if not os.path.isdir(folder):
+                os.makedirs(folder, mode=0o700, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(prefix=".status-", dir=folder)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
+                    json.dump(self.status(), fh)
+                os.replace(temporary, self.status_file)
+            except BaseException:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
 
     def live(self, limit: int = 600, points: int | None = None,
              since: float | None = None) -> dict:
@@ -536,6 +598,17 @@ class Application:
         if self.history is None:
             return {"ok": False, "error": "this server keeps no history"}
         return self.history.window(seconds, points=points, since=since)
+
+
+def fresh(service) -> bool:
+    """Whether an instrument is answering now: connected, with a reading no
+    older than its service allows -- the pump's own limit; otherwise three
+    polls and a second, never under 5 s (the gauge polls every second)."""
+    snap = service.snapshot()
+    age = snap.get("age")
+    limit = service.stale_after(snap) if hasattr(service, "stale_after") else \
+        max(5.0, 3 * float(getattr(service, "interval", 5.0) or 5.0) + 1.0)
+    return bool(snap.get("connected")) and age is not None and age <= limit
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -966,6 +1039,12 @@ class Handler(BaseHTTPRequestHandler):
             self._command(payload)
             return
         if route == "/api/run/start":
+            # A run's first step switches the pumping station on: like every
+            # other hardware action, it must be asked for in so many words.
+            if not payload.get("confirm"):
+                self._json({"ok": False,
+                            "error": "starting a run needs confirm"}, 400)
+                return
             result = self.app.engine.start(
                 str(payload.get("procedure", "")),
                 payload.get("config") or {},
@@ -1066,10 +1145,32 @@ class Handler(BaseHTTPRequestHandler):
             self._json(result)
             return
         if route == "/api/run/acknowledge":
-            result = self.app.engine.acknowledge(str(payload.get("note", "")))
-            if result.get("ok"):
-                self._audit("confirmed the manual step")
-            self._json(result)
+            # Which step the person was shown: a Done for one that has since
+            # been replaced must not confirm the new one.
+            prompt = payload.get("prompt")
+            if isinstance(prompt, bool) or not isinstance(prompt, int):
+                self._json({"ok": False, "error": "say which step: the panel "
+                                                  "sends the prompt's id"}, 400)
+                return
+            result = self.app.engine.acknowledge(
+                str(payload.get("note", ""))[:300], prompt_id=prompt,
+                user=principal)
+            self._json(result if result.get("ok") else
+                       {"ok": False, "error": result.get("error")},
+                       200 if result.get("ok") else result.get("code", 400))
+            return
+        if route == "/api/run/checklist":
+            # A step a run's ending left to a person -- the plasma off, the
+            # argon shut. Saying it is done moves nothing, and makes the rig
+            # no less safe: open to any operator, control or not.
+            step = payload.get("id")
+            if isinstance(step, bool) or not isinstance(step, int):
+                self._json({"ok": False, "error": "which step?"}, 400)
+                return
+            result = self.app.engine.confirm_step(step, user=principal)
+            self._json(result if result.get("ok") else
+                       {"ok": False, "error": result.get("error")},
+                       200 if result.get("ok") else result.get("code", 400))
             return
         if route == "/api/control/release":
             self._json(self.app.auth.release(principal))
@@ -1137,6 +1238,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.app.finder.memory.remember(service.probe_kind, service.port)
             self._json(result)
             return
+        if route == "/api/update/install":
+            # Moves nothing, but leaves the rig unwatched while the panel
+            # restarts: asked for in so many words, naming the version seen.
+            if not payload.get("confirm"):
+                self._json({"ok": False, "error": "installing a version needs "
+                                                  "confirm"}, 400)
+                return
+            if self.app.updates is None:
+                self._json({"ok": False, "error": "this panel has no updater"},
+                           404)
+                return
+            result = self.app.updates.request(str(payload.get("release", "")),
+                                              principal)
+            if result.get("ok"):
+                self._audit(f"asked for version {result['tag']} to be "
+                            f"installed: the panel restarts")
+            self._json(result if result.get("ok") else
+                       {"ok": False, "error": result.get("error")},
+                       200 if result.get("ok") else result.get("code", 400))
+            return
         if route.startswith("/api/runs/"):
             self._runs_post(route, payload)
             return
@@ -1158,8 +1279,15 @@ class Handler(BaseHTTPRequestHandler):
             return "operator", False
         if route.startswith("/api/runs/"):
             # Editing a run's name or notes is bookkeeping; deleting a run
-            # destroys a record, which is an admin's call.
-            return ("admin" if route.endswith("/delete") else "operator"), False
+            # destroys a record, and saying its owed clean-up was done by
+            # hand ends the panel's own attempts: both an admin's call.
+            # Judged on the same parse as the dispatch: a trailing slash or
+            # an extra segment once read as "not delete" here and as
+            # "delete" there, and let an operator through.
+            parsed = run_route(route)
+            if parsed is None:
+                return "admin", True
+            return ("admin" if parsed[1] in ADMIN_RUN_ACTIONS else "operator"), False
         # Anything not listed needs the most, not the least.
         return "admin", True
 
@@ -1385,13 +1513,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": f"no view {view!r}"}, 404)
 
     def _runs_post(self, route: str, payload: dict):
-        parts = [p for p in route.split("/") if p]
-        try:
-            run_id = int(parts[2])
-        except (IndexError, ValueError):
-            self._json({"ok": False, "error": "bad run id"}, 400)
+        parsed = run_route(route)
+        if parsed is None:
+            self._json({"ok": False, "error": "not found"}, 404)
             return
-        action = parts[3] if len(parts) > 3 else "update"
+        run_id, action = parsed
 
         if action == "update":
             def bounded(key: str, limit: int):
@@ -1462,6 +1588,21 @@ class Handler(BaseHTTPRequestHandler):
                    f"succeeded; it will not be tried again" if owed else ""),
                 user=who.username)
             self._json({"ok": True, "error": None})
+        elif action == "cleanup-checked":
+            # Moves nothing, but ends what the panel would otherwise try
+            # again at every start: confirmed, ticked and given a reason,
+            # like an override. The engine keeps the record.
+            if not payload.get("confirm") or payload.get("checked") is not True:
+                self._json({"ok": False,
+                            "error": "marking a clean-up as done by hand needs "
+                                     "confirm, and the tick that you checked "
+                                     "the rig yourself"}, 400)
+                return
+            outcome = self.app.engine.mark_cleanup_checked(
+                run_id, str(payload.get("reason", "")), user=self._who())
+            self._json(outcome if outcome.get("ok") else
+                       {"ok": False, "error": outcome.get("error")},
+                       200 if outcome.get("ok") else outcome.get("code", 400))
         else:
             self._json({"ok": False, "error": f"no action {action!r}"}, 404)
 

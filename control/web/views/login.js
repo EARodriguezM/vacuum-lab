@@ -8,7 +8,7 @@
 
 import { html } from "../html.js";
 import { useEffect, useRef, useState } from "preact/hooks";
-import { Banner } from "../ui.js";
+import { Banner, useDialog } from "../ui.js";
 import { api, setDeviceSession, setPersonSession } from "../api.js";
 
 const MODES = [
@@ -275,11 +275,23 @@ function Pair({ onSignedIn }) {
  * The sign-in page. `onCancel` is offered on a paired tablet, which has a
  * live view to go back to.
  */
+/**
+ * Whether this page runs in the kiosk tablet's app: an Android WebView,
+ * whose user agent always says "; wv)". The kiosk is the only app here that
+ * shows the panel; a phone's browser is not one. `?pair` in the address
+ * offers pairing anywhere, for a tablet set up some other way.
+ */
+const KIOSK = typeof navigator !== "undefined"
+  && (/; wv\)/.test(navigator.userAgent || "")
+      || new URLSearchParams(location.search).has("pair"));
+
 export function LoginView({ ping, onSignedIn, onCancel }) {
   const [mode, setMode] = useState("signin");
   const chamber = ping?.chamber?.name;
   const noOwner = ping?.auth?.enabled && ping?.auth?.owner === false;
-  const modes = onCancel ? MODES.filter((m) => m.key === "signin") : MODES;
+  // Pairing is for the lab's tablets: a personal phone signs in instead.
+  const modes = onCancel ? MODES.filter((m) => m.key === "signin")
+    : MODES.filter((m) => m.key !== "pair" || KIOSK);
 
   return html`
     <div class="login">
@@ -294,17 +306,17 @@ export function LoginView({ ping, onSignedIn, onCancel }) {
             made on the machine itself, so nobody on the network can claim the
             rig: <span class="mono">./tools/users.py owner YOURNAME</span>
           <//>`}
-        ${modes.length > 1 && html`
+        ${!noOwner && modes.length > 1 && html`
           <nav class="tabs subtabs" aria-label="Sign-in options">
             ${modes.map((entry) => html`
               <button key=${entry.key} type="button" data-test=${`signin-mode-${entry.key}`}
                       aria-current=${mode === entry.key ? "page" : null}
                       onClick=${() => setMode(entry.key)}>${entry.label}</button>`)}
           </nav>`}
-        ${mode === "signin" && html`<${SignIn} onSignedIn=${onSignedIn} />`}
-        ${mode === "signup" && html`<${SignUp} domain=${ping?.auth?.email_domain || "unal.edu.co"}
+        ${!noOwner && mode === "signin" && html`<${SignIn} onSignedIn=${onSignedIn} />`}
+        ${!noOwner && mode === "signup" && html`<${SignUp} domain=${ping?.auth?.email_domain || "unal.edu.co"}
                                                 google=${!!ping?.auth?.google_signin} />`}
-        ${mode === "pair" && html`<${Pair} onSignedIn=${onSignedIn} />`}
+        ${!noOwner && mode === "pair" && html`<${Pair} onSignedIn=${onSignedIn} />`}
         ${onCancel && html`
           <button class="ghost" type="button" onClick=${onCancel}>
             Back to watching</button>`}
@@ -317,15 +329,10 @@ export function ReauthDialog({ open, me, onDone, onCancel }) {
   const [password, setPassword] = useState("");
   const [error, setError] = useState(null);
   const [working, setWorking] = useState(false);
-  const input = useRef(null);
-
-  useEffect(() => {
-    if (open) {
-      setPassword("");
-      setError(null);
-      setTimeout(() => input.current?.focus(), 0);
-    }
-  }, [open]);
+  // Starts empty because the panel mounts it only while it is open -- never
+  // emptied by an effect after its first frame, which wiped a password
+  // typed in that frame (and left Continue disabled).
+  const box = useDialog(open, onCancel);
   if (!open) return null;
 
   const submit = async (event) => {
@@ -345,13 +352,14 @@ export function ReauthDialog({ open, me, onDone, onCancel }) {
 
   return html`
     <div class="overlay" onClick=${(e) => e.target === e.currentTarget && onCancel()}>
-      <form class="dialog" role="dialog" aria-modal="true" onSubmit=${submit}>
-        <h2>Still there, ${me?.name || "operator"}?</h2>
+      <form class="dialog" role="dialog" aria-modal="true" aria-labelledby="reauth-title"
+            onSubmit=${submit} ref=${box} tabIndex="-1">
+        <h2 id="reauth-title">Still there, ${me?.name || "operator"}?</h2>
         <div class="small">Nothing was touched for a while, so the panel only
           watches until you type your password again. That keeps somebody else
           from acting in your name on a screen you walked away from.</div>
         <label class="field"><span>Password</span>
-          <input ref=${input} type="password" value=${password}
+          <input type="password" value=${password}
                  autocomplete="current-password" data-test="reauth-password"
                  onInput=${(e) => setPassword(e.target.value)} />
         </label>

@@ -30,6 +30,29 @@ const OUT4_MODES = [
   { value: 1, label: "Sealing gas valve" },
 ];
 
+/** Each guarded action, as a person would name it when it is held. */
+const ACTION_NAMES = {
+  on: "Starting the pumping station", off: "Stopping the pumping station",
+  motor_on: "Starting the turbopump", motor_off: "Stopping the turbopump",
+  standby_on: "Standby", standby_off: "Leaving standby", vent: "Venting",
+  ack: "Acknowledging the fault", speed: "Changing the speed",
+};
+
+/** What each one does, said in the dialog before it is sent. */
+const ACTION_ABOUT = {
+  on: "Switches the pumping station on, so the backing pump runs. If the drive "
+    + "has its motor flag set, it is switched off first: this never starts the "
+    + "turbopump.",
+  off: "Stops the pumping station and with it the backing pump: nothing pumps "
+    + "the chamber afterwards. Refused while the rotor turns. At the end of the "
+    + "day, Power down does the whole sequence instead.",
+  motor_on: "Starts the turbopump motor. Allowed only with the backing pump on "
+    + "and the chamber below the crossover pressure; the rotor then takes a few "
+    + "minutes to reach full speed.",
+  motor_off: "Switches the turbopump motor off. The rotor coasts down, backed by "
+    + "the forevacuum pump, which keeps running.",
+};
+
 /**
  * A button that refuses itself, with the interlock's own words as the reason.
  *
@@ -47,7 +70,8 @@ function Guarded({ action, label, interlocks, onRun, tone = "", disabled, onOver
   return html`
     <span class="guarded">
       <button class=${tone} disabled=${disabled || blocked} title=${reason}
-              data-test=${`pump-${action}`} onClick=${() => onRun(action, label, reason)}>
+              data-test=${`pump-${action}`}
+              onClick=${() => onRun(action, label, reason || ACTION_ABOUT[action] || "")}>
         ${label}${blocked && rule.wait ? html` <span class="muted">${rule.wait}s</span>` : null}
       </button>
       ${blocked && onOverride && !disabled && rule.rule && html`
@@ -94,7 +118,7 @@ function InterlockNotes({ interlocks }) {
     <div class="grid" style="gap:8px">
       ${blocked.map(([action, rule]) => html`
         <div class="banner warn small">
-          <strong>${fmt.titleCase(action)} is held:</strong> ${rule.reason}
+          <strong>${ACTION_NAMES[action] || fmt.titleCase(action)} is held:</strong> ${rule.reason}
           ${rule.wait ? ` About ${rule.wait}s to go.` : ""}
         </div>`)}
     </div>`;
@@ -114,19 +138,23 @@ function Accessories({ data, busy, onWrite, reload }) {
   const set = (name, next) => setDraft((d) => ({ ...d, [name]: next }));
   const commit = (name) => onWrite(name, value(name));
 
+  // A form, so Enter in the box sets it, as a person typing expects.
   const NumberRow = ({ name, label, min, max, help }) => html`
-    <label class="field">
-      <span>${label}</span>
+    <form class="field" onSubmit=${(e) => {
+      e.preventDefault();
+      if (writable.has(name) && !busy && name in draft) commit(name);
+    }}>
+      <label for=${`acc-${name}`}>${label}</label>
       <span class="suffix">
-        <input type="number" min=${min} max=${max} value=${value(name) ?? ""}
+        <input id=${`acc-${name}`} type="number" min=${min} max=${max} value=${value(name) ?? ""}
                disabled=${!writable.has(name) || busy}
                onInput=${(e) => set(name, e.target.value)} />
         <span class="unit">${units[name] || ""}</span>
-        <button class="small" disabled=${!writable.has(name) || busy
-                  || !(name in draft)} onClick=${() => commit(name)}>Set</button>
+        <button class="small" type="submit" disabled=${!writable.has(name) || busy
+                  || !(name in draft)}>Set</button>
       </span>
       ${help && html`<span class="help">${help}</span>`}
-    </label>`;
+    </form>`;
 
   const SelectRow = ({ name, label, options, help }) => html`
     <label class="field">
@@ -223,7 +251,7 @@ const BKP_MODE_NAMES = { 0: "continuous", 1: "intermittent", 2: "delayed" };
 // `safeBusy` locks only Make safe, which every operator may press whoever
 // holds control; switching automatic recovery is an admin's (`canAdmin`).
 function FaultsCard({ pump, alarms, busy, safeBusy, canAdmin = true, onCommand,
-                      onSecure, notify }) {
+                      onSecure, notify, may }) {
   const [diagnostics, setDiagnostics] = useState(null);
   const [loading, setLoading] = useState(false);
   const [showCodes, setShowCodes] = useState(false);
@@ -272,7 +300,8 @@ function FaultsCard({ pump, alarms, busy, safeBusy, canAdmin = true, onCommand,
       <div class="row">
         <button class="primary" disabled=${(safeBusy ?? busy) || !pump?.connected}
                 onClick=${onSecure}
-                title="Motor off, fault acknowledged, forevacuum pump on">Make safe now</button>
+                title="Motor off, fault acknowledged, forevacuum pump on">
+          ${may === "signin" ? "Sign in to make safe" : "Make safe now"}</button>
         <button disabled=${busy || !fault}
                 onClick=${() => onCommand("ack", "Acknowledge fault", ACK_NOTE)}>
           Acknowledge only</button>
@@ -491,7 +520,7 @@ function TemperaturePanel({ samples, pump }) {
 }
 
 export function PumpView({ state, onCommand, onWriteParam, busy, safeBusy,
-                           onShutdown, onSecure, notify, shutdown, onOverride }) {
+                           onShutdown, onSecure, notify, shutdown, onOverride, may }) {
   const pump = state?.devices?.pump;
   const [accessories, setAccessories] = useState(null);
   const [speed, setSpeed] = useState("");
@@ -556,10 +585,11 @@ export function PumpView({ state, onCommand, onWriteParam, busy, safeBusy,
             ${setpoints.Standby ? "Leave standby" : `Enter standby (${
               fmt.integer(setpoints.StdbySVal)}%)`}
           </button>
-          <button disabled=${busy || !fault}
-                  onClick=${() => onCommand("ack", "Acknowledge fault", ACK_NOTE)}>
-            Acknowledge fault
-          </button>
+          ${fault && html`
+            <button class="primary" disabled=${safeBusy}
+                    title="Motor off, fault acknowledged, forevacuum pump on"
+                    onClick=${onSecure}>${may === "signin" ? "Sign in to make safe"
+                      : "Make safe"}</button>`}
           <button class="danger"
                   disabled=${busy || !!shutdown?.active
                              || setpoints.PumpgStatn !== true}
@@ -580,12 +610,21 @@ export function PumpView({ state, onCommand, onWriteParam, busy, safeBusy,
 
       <${FaultsCard} pump=${pump} alarms=${state?.alarms} busy=${busy}
                      safeBusy=${safeBusy} canAdmin=${state?.me?.can?.admin !== false}
-                     onCommand=${onCommand} onSecure=${onSecure} notify=${notify} />
+                     onCommand=${onCommand} onSecure=${onSecure} notify=${notify}
+                     may=${may} />
 
       <div class="grid two">
         <${Card} title="Speed setpoint"
                  hint="Applies only in rotation-speed setting mode; setting it switches the drive unit into that mode.">
-          <div class="row">
+          <form class="row" onSubmit=${(e) => {
+            e.preventDefault();
+            if (!busy && speed !== "") {
+              onCommand("speed", `Set the speed setpoint to ${speed}%`,
+                        "Switches the drive to rotation-speed setting mode at this "
+                        + "speed. Refused during a run, which keeps the rotor at "
+                        + "full speed.", Number(speed));
+            }
+          }}>
             <label class="field">
               <span>Setpoint</span>
               <span class="suffix">
@@ -596,11 +635,8 @@ export function PumpView({ state, onCommand, onWriteParam, busy, safeBusy,
               </span>
               <span class="help">20–100% of nominal.</span>
             </label>
-            <button class="primary" disabled=${busy || speed === ""}
-                    onClick=${() => onCommand("speed",
-                                              `Set the speed setpoint to ${speed}%`,
-                                              "", Number(speed))}>Apply</button>
-          </div>
+            <button class="primary" type="submit" disabled=${busy || speed === ""}>Apply</button>
+          </form>
           <${Pairs} items=${[
             ["Current setpoint", `${fmt.number(setpoints.SpdSVal, 1)} %`],
             ["Standby setpoint", `${fmt.integer(setpoints.StdbySVal)} %`],

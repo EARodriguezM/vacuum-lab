@@ -511,6 +511,18 @@ class Database:
                 raise
             return cursor.rowcount > 0
 
+    def runs_with_steps_by_hand(self) -> list[dict]:
+        """Ended runs whose record still lists steps left to do by hand,
+        oldest first -- by id, never by date: a clock that was wrong when a
+        run started must not hide it among older ones."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM runs WHERE status != ? AND result LIKE ? "
+                "ORDER BY id", (RUNNING, '%"by_hand": [{%')).fetchall()
+        return [run for run in map(_run_row, rows)
+                if isinstance((run.get("result") or {}).get("by_hand"), list)
+                and (run.get("result") or {}).get("by_hand")]
+
     def runs_owing_cleanup(self) -> list[dict]:
         """Ended runs whose clean-up has not been done yet, oldest first --
         cut off by a crash, or ended with a clean-up that failed -- however

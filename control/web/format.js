@@ -111,3 +111,23 @@ const PHASE_NAMES = {
 export function phaseLabel(phase) {
   return PHASE_NAMES[phase] || titleCase(phase);
 }
+
+/**
+ * A run's status as people say it. The store keeps "aborted" for a run its
+ * operator stopped -- only full vacuum, which has no ending of its own,
+ * counts a stop as completing -- but nothing went wrong there, and calling
+ * it aborted read like a fault. Older runs are known by their message.
+ */
+export function runStatus(run) {
+  const result = run?.result || {};
+  if (run?.status === "aborted"
+      && (result.stopped || /^stopped by the operator/.test(result.message || ""))) {
+    return "stopped";
+  }
+  return run?.status || "—";
+}
+
+/** The pill tone for a run's status, as `runStatus` names it. */
+export const STATUS_TONE = {
+  completed: "good", running: "accent", stopped: "idle", aborted: "warn", failed: "crit",
+};

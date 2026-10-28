@@ -5,6 +5,8 @@
     ./tools/release.py deploy --to USER@HOST     the whole release
     ./tools/release.py status --to USER@HOST     what runs there, what is kept
     ./tools/release.py rollback --to USER@HOST   back to the release before
+    ./tools/release.py tag [-m NOTES]            sign a version for the lab PC
+                                                 to find (tools/autoupdate.py)
 
 A release is the tracked files (`git ls-files`) and a `VERSION.json` saying
 which commit they are, copied to `<base>/releases/<id>/` on the target; the
@@ -63,6 +65,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import tokenize
@@ -75,16 +78,30 @@ ROOT = Path(__file__).resolve().parent.parent
 VERSIONS = ((3, 11), (3, 12), (3, 13), (3, 14))
 KEEP_RELEASES = 5
 HEALTH_WAIT_S = 60.0
+#: How long after a restart before a release may be called healthy: the
+#: instruments are opened and found in the first seconds, and the alarm for
+#: one that never answers takes 15 s. A third of the wait, at most this.
+HEALTH_SETTLE_S = 20.0
 DEFAULT_BASE = "~/vacuum-lab"
 DEFAULT_STATUS = "/run/vacuum-lab/status.json"
 DEFAULT_BACKUP_DEST = "/mnt/vacuum-backup/vacuum-lab"
 SERVICE = "vacuum-lab-web"
 BACKUP_TIMER = "vacuum-lab-backup.timer"
+#: tools/autoupdate.py: the check every 15 minutes, and the install an
+#: admin asks for from the panel.
+UPDATE_TIMER = "vacuum-lab-update.timer"
+INSTALL_PATH = "vacuum-lab-install.path"
+#: Units enabled -- and started -- once installed, besides the panel's own.
+ENABLED = (BACKUP_TIMER, UPDATE_TIMER, INSTALL_PATH)
 #: Installed file -> its source in a release, compared before switching.
 UNITS = {
     "/etc/systemd/system/vacuum-lab-web.service": "deploy/vacuum-lab-web.service",
     "/etc/systemd/system/vacuum-lab-backup.service": "deploy/vacuum-lab-backup.service",
     "/etc/systemd/system/vacuum-lab-backup.timer": "deploy/vacuum-lab-backup.timer",
+    "/etc/systemd/system/vacuum-lab-update.service": "deploy/vacuum-lab-update.service",
+    "/etc/systemd/system/vacuum-lab-update.timer": "deploy/vacuum-lab-update.timer",
+    "/etc/systemd/system/vacuum-lab-install.service": "deploy/vacuum-lab-install.service",
+    "/etc/systemd/system/vacuum-lab-install.path": "deploy/vacuum-lab-install.path",
     "/etc/udev/rules.d/99-vacuum-lab.rules": "deploy/99-vacuum-lab.rules",
 }
 #: The units' names until 2026-10, which `--install-units` moves a machine
@@ -388,6 +405,12 @@ def idle_problem(state: dict | None, now: float | None, max_age: float = 30.0,
             return "a power-down is under way: a restart would leave it unfinished"
         if state.get("securing"):
             return "the pump is being made safe after a fault"
+        if state.get("by_hand"):
+            return (f"the last run left {state['by_hand']} step(s) to do by hand "
+                    f"that nobody has confirmed: a restart would forget them")
+        if state.get("update_hold"):
+            return ("an install an admin asked for in the panel is under way "
+                    "(tools/autoupdate.py)")
     if force:
         return None
     if state is None:
@@ -521,9 +544,9 @@ def _install_units(target: Target, release: str, saved: str,
                       f"stopping the old {OLD_BACKUP_TIMER}"))
     # Enabled, so the panel comes back after a power cut: a unit installed
     # under a new name starts nowhere until it is.
-    steps += [(f"systemctl enable {SERVICE}", "enabling the panel's unit"),
-              (f"systemctl enable --now {BACKUP_TIMER}",
-               "enabling the backup timer")]
+    steps += [(f"systemctl enable {SERVICE}", "enabling the panel's unit")]
+    steps += [(f"systemctl enable --now {name}", f"enabling {name}")
+              for name in ENABLED]
     for command, what in steps:
         code, out = target.run(target.sudo + command)
         if code != 0:
@@ -543,7 +566,7 @@ def restore_units(target: Target, saved: str, old: list[str] = ()) -> list[str]:
             command = (f"{target.sudo}install -m 644 {_q(saved + '/' + name)} "
                        f"{shlex.quote(installed)}")
         else:
-            if name in (BACKUP_TIMER, f"{SERVICE}.service"):
+            if name in (*ENABLED, f"{SERVICE}.service"):
                 code, out = target.run(f"{target.sudo}systemctl disable --now {name}")
                 if code != 0:
                     # Kept: while the new panel may still run, its unit's
@@ -597,8 +620,15 @@ def healthy(target: Target, release: str | None, before: dict | None,
             gone: str | None = None) -> str | None:
     """None once the service is up running `release` and well, else what is
     wrong. With `release` None (a panel from before releases), only that
-    the service is active."""
-    deadline = time.monotonic() + wait
+    the service is active.
+
+    Well means, `settle` seconds or more after the restart: the new release
+    reported, each instrument on the port it was on and answering if it was
+    answering before, and no new critical alarm. Judged sooner, a release
+    that cannot talk to the pump passed before its first reply was due."""
+    started = time.monotonic()
+    deadline = started + wait
+    settle = min(HEALTH_SETTLE_S, wait / 3)
     problem = "no status yet"
     while time.monotonic() < deadline:
         sleep(3)
@@ -625,9 +655,21 @@ def healthy(target: Target, release: str | None, before: dict | None,
                 problem = "instruments are not on the ports they were on: " \
                     + ", ".join(f"{k} {a} -> {b}" for k, (a, b) in moved.items())
                 continue
+            # Answering *now*, not merely connected: a sampler that hangs after
+            # its first replies stays connected while its readings age.
+            was = before.get("fresh") or before.get("connected") or {}
+            now = state.get("fresh") if "fresh" in before else state.get("connected")
+            silent = [key for key, answered in was.items()
+                      if answered and not (now or {}).get(key)]
+            if silent:
+                problem = f"not answering, as it was before: {', '.join(silent)}"
+                continue
             if (state.get("critical") or 0) > (before.get("critical") or 0):
                 problem = "a new critical alarm is up"
                 continue
+        if time.monotonic() - started < settle:
+            problem = "too soon after the restart to judge"
+            continue
         return None
     return problem
 
@@ -797,11 +839,137 @@ def deploy(args, log=print, target: Target | None = None,
     raise ReleaseError(f"release {release} was rolled back to {what}: {problem}")
 
 
+# --- a version for the lab PC to find -------------------------------------------------
+
+
+def signing_key(root: Path = ROOT) -> str | None:
+    """The public key git signs tags with (`user.signingkey`, with
+    `gpg.format ssh`), as a line of a .pub file; None if git is not set up
+    to sign with SSH."""
+    def config(key):
+        result = subprocess.run(["git", "config", "--get", key], cwd=root,
+                                capture_output=True, text=True)
+        return result.stdout.strip() if result.returncode == 0 else ""
+    if config("gpg.format") != "ssh":
+        return None
+    key = config("user.signingkey")
+    if key.startswith("key::"):
+        return key[5:].strip()
+    path = Path(os.path.expanduser(key)) if key else None
+    if path is None or not path.exists():
+        return None
+    if path.suffix != ".pub" and Path(str(path) + ".pub").exists():
+        path = Path(str(path) + ".pub")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def next_tag(root: Path = ROOT, day: str | None = None) -> str:
+    """Today's version name: vYYYY.MM.DD, then .2, .3 ... for more that day,
+    counting the tags here and on GitHub."""
+    day = day or time.strftime("v%Y.%m.%d")
+    known = set(_git(root, "tag", "--list", f"{day}*").split())
+    remote = subprocess.run(["git", "ls-remote", "--tags", "origin", f"{day}*"],
+                            cwd=root, capture_output=True, text=True, timeout=30)
+    known |= {line.split("refs/tags/")[-1].removesuffix("^{}")
+              for line in remote.stdout.splitlines() if "refs/tags/" in line}
+    if day not in known:
+        return day
+    count = 2
+    while f"{day}.{count}" in known:
+        count += 1
+    return f"{day}.{count}"
+
+
+def tag(args, log=print, root: Path = ROOT) -> str:
+    """Sign a version of `control/` at a commit of main, for the lab PC's
+    updater to find once it is pushed; returns its name. Nothing is pushed."""
+    # Here, not at the top: it imports this module. Run as a script, this
+    # file sees tools/ only, so the folder above goes on the path first.
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from tools import autoupdate
+    repo = Path(root).parent
+    commit = _git(root, "rev-parse", "--verify", f"{args.commit}^{{commit}}").strip()
+    if not args.not_main:
+        main = subprocess.run(["git", "merge-base", "--is-ancestor", commit,
+                               "origin/main"], cwd=root)
+        if main.returncode != 0:
+            raise ReleaseError(f"{commit[:8]} is not on origin/main: a version "
+                               f"is made from main, once test has been merged "
+                               f"into it (git fetch first; --not-main to sign "
+                               f"another commit anyway)")
+    key = signing_key(root)
+    if not key:
+        raise ReleaseError("git is not set up to sign with an SSH key: "
+                           "git config gpg.format ssh; git config "
+                           "user.signingkey ~/.ssh/YOUR_KEY.pub")
+    name = args.name or next_tag(root)
+    if not autoupdate.TAG.fullmatch(name):
+        raise ReleaseError(f"{name}: a version is named vYYYY.MM.DD[.N]")
+    if _git(root, "tag", "--list", name).strip():
+        raise ReleaseError(f"{name} exists already")
+
+    archive = subprocess.run(["git", "archive", "--format=tar", commit, "control"],
+                             cwd=repo, capture_output=True, check=True).stdout
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        found, files = autoupdate.digest(tar, strip=0)
+    notes = args.message or (Path(args.notes_file).read_text(encoding="utf-8")
+                             if args.notes_file else "")
+    message = (f"Version {name}\n\n{notes.strip() or 'No notes.'}\n\n"
+               f"{autoupdate.DIGEST_LINE} {found}\n")
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+        fh.write(message)
+    try:
+        # Not captured: signing may ask for the key's passphrase.
+        made = subprocess.run(["git", "tag", "-s", "-F", fh.name, name, commit],
+                              cwd=root)
+    finally:
+        os.unlink(fh.name)
+    if made.returncode != 0:
+        raise ReleaseError("git tag -s failed")
+
+    # Checked here exactly as the lab PC will check it.
+    raw = subprocess.run(["git", "cat-file", "tag", name], cwd=root,
+                         capture_output=True, check=True).stdout
+    marker = b"-----BEGIN SSH SIGNATURE-----"
+    payload, signature = raw[:raw.find(marker)], raw[raw.find(marker):]
+    with tempfile.TemporaryDirectory(prefix="release-tag-") as scratch:
+        signers = Path(scratch) / "allowed_signers"
+        fields = key.split()
+        signers.write_text(f'me namespaces="git" {fields[0]} {fields[1]}\n')
+        try:
+            autoupdate.verify(payload, signature, signers)
+            parsed = autoupdate.parse_tag(payload)
+        except autoupdate.UpdateError as exc:
+            subprocess.run(["git", "tag", "-d", name], cwd=root,
+                           capture_output=True)
+            raise ReleaseError(f"the tag did not verify, and was deleted: {exc}")
+    if parsed["digest"] != found or parsed["object"] != commit:
+        subprocess.run(["git", "tag", "-d", name], cwd=root, capture_output=True)
+        raise ReleaseError("the signed tag does not say what was meant; deleted")
+    log(f"Signed {name}: {commit[:8]}, {files} files under control/.")
+    log(f"Nothing is published yet. To offer it to the lab PC:\n"
+        f"  git push origin {name}")
+    return name
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("check", help="pre-flight here, without deploying")
     p.add_argument("--skip-tests", action="store_true")
+    p = sub.add_parser("tag", help="sign a version of main for the lab PC's "
+                                   "updater (nothing is pushed)")
+    p.add_argument("--commit", default="origin/main",
+                   help="what to sign (default origin/main)")
+    p.add_argument("--name", default=None,
+                   help="the version's name (default today's, vYYYY.MM.DD)")
+    p.add_argument("-m", "--message", default="",
+                   help="release notes: what changed, for the admin who "
+                        "installs it")
+    p.add_argument("--notes-file", default=None, help="the notes, from a file")
+    p.add_argument("--not-main", action="store_true",
+                   help="sign a commit that is not on origin/main")
     for name in ("deploy", "status", "rollback"):
         p = sub.add_parser(name)
         p.add_argument("--to", required=True, help="USER@HOST")
@@ -839,6 +1007,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "deploy":
             deploy(args)
+            return 0
+        if args.command == "tag":
+            tag(args)
             return 0
         target = Target(args.to, args.base)
         if args.command == "status":

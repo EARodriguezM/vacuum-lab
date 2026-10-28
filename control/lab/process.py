@@ -309,24 +309,60 @@ class ProcessHardware:
             "shutter": None if shutter is None else (1 if shutter else 0),
         }
 
-    def safe_shutdown(self, log=None) -> bool:
+    def unknown_steps(self, keys=None) -> list[dict]:
+        """Every manual step a run using `keys` may have left on, when what it
+        left is not known -- it was cut off by a crash, and the process that
+        knew went with it. Each manual one is marked asked-for-off and not
+        confirmed, as `safe_shutdown` would have left it. Driven ones are
+        not listed: an owed clean-up sets them itself.
+        """
+        steps = []
+        for actuator, value in ((self.magnetron, 0), (self.gas, 0),
+                                (self.shutter, False)):
+            if actuator.available or (keys is not None and actuator.key not in keys):
+                continue
+            try:
+                actuator.set(value)
+            except OperatorRequired as prompt:
+                steps.append({"actuator": actuator.key, "label": actuator.label,
+                              "instruction": prompt.instruction,
+                              "value": actuator.format(value)})
+            except ActuatorError:
+                pass
+        return steps
+
+    def safe_shutdown(self, log=None, steps: list | None = None) -> bool:
         """Put the process hardware in its safe state, best effort.
 
         Called when a run ends for any reason. Order matters: the plasma goes
         first, then the gas, then the shutter closes. Every step is attempted
         even if an earlier one failed, because "the magnetron would not switch
         off" must not also leave the gas running. Returns False if a wired
-        actuator failed; one worked by hand cannot be confirmed from here and
-        is left to the operator's prompt.
+        actuator failed; one worked by hand cannot be confirmed from here.
+
+        Each step left to a person is appended to `steps`, so the run engine
+        can keep it on every screen until somebody confirms it -- a line in
+        the run log is not enough when the plasma may still be burning. A
+        manual actuator already confirmed off, or never asked for anything,
+        needs nobody: asking it again would only mark it unconfirmed.
         """
         done = True
         for actuator, value in ((self.magnetron, 0), (self.gas, 0),
                                 (self.shutter, False)):
+            if not actuator.available and (
+                    actuator.requested is None
+                    or (actuator.confirmed and not actuator.requested)):
+                continue
             try:
                 actuator.set(value)
             except OperatorRequired as prompt:
                 if log:
                     log("warning", f"MANUAL STEP: {prompt.instruction}")
+                if steps is not None:
+                    steps.append({"actuator": actuator.key,
+                                  "label": actuator.label,
+                                  "instruction": prompt.instruction,
+                                  "value": actuator.format(value)})
             except ActuatorError as exc:
                 done = False
                 if log:

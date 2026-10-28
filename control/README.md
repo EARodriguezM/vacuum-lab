@@ -126,17 +126,16 @@ panel has no driver for, give the ports of the ones it does have, or pass
 
 ## The web panel
 
-Six tabs, responsive down to a phone, light and dark. Everybody signs in
+Five tabs, responsive down to a phone, light and dark. Everybody signs in
 first (see **Accounts** below).
 
 | Tab | What it does |
 |---|---|
-| **Dashboard** | The wall display, read standing up. A **guide** says what the rig is doing in words, which step of the deposition route it is on, what ends that step and roughly when (countdowns to the shutter opening and closing, spin-up and pump-down estimates); four tiles for pressure, rotor, drive load and plasma/gas; a **vacuum scale** from atmosphere to UHV with the rig's landmarks on it; the run's curves with its phases and limits (or the last hour when none is recording); a **health checklist** and an **activity feed** with every run one click from its record. **Explain** adds a sentence to every figure for newcomers; **Full screen** is for a monitor on the lab wall |
-| **Overview** | Plain-language state of the rig, live tiles, the active run, the last hour |
+| **Dashboard** | The wall display, read standing up. A **guide** says what the rig is doing in words, which step of the deposition route it is on, what ends that step and roughly when (countdowns to the shutter opening and closing, spin-up and pump-down estimates); four tiles for pressure, rotor, drive load and plasma/gas; a **vacuum scale** from atmosphere to UHV with the rig's landmarks on it; the run's curves with its phases and limits (or the last hour when none is recording); a **health checklist** and an **activity feed** (Recent activity, which also keeps the alarm log) with every run one click from its record; **Stop** is in the guide card. **Explain** adds a sentence to every figure for newcomers; **Full screen** is for a monitor on the lab wall |
 | **Equipment** | One sub-tab per instrument and per installed actuator. **TC 600 turbopump**: station and turbopump control, speed setpoint, faults, all four accessory connectors — and **pump trends**: up to 24 h of pressure, rotor speed, drive current, power and supply voltage on one time axis, health tiles, the load curve, and the pump temperature where one is measured. **TPG gauge controller**: both channels, gauge on/off, filter, unit, switching functions, error register, capability probe — and **pressure history** per channel with the reason for every gap, the rate of change, and window statistics. **Argon flow, gate valve, magnetron, shutter**: whether software drives it or a person does, what it is set to — and whether that was confirmed — and its recorded history |
-| **Process** | Pick a recipe, fill in the form, watch it run on the full chart set, answer its prompts. A recipe that needs equipment not installed on the rig yet is listed but switched off, saying what it is waiting for |
-| **History** | Every recorded run: browse, search, inspect, annotate, export, delete; the full chart set per run, comparison with earlier pump-downs, and **trends across runs** |
-| **Settings** | **My account**; for admins **People** (approve sign-ups, roles, password resets) and **Tablets** (pairing); **Rig equipment** (what is physically installed — argon line, gate valve, magnetron, shutter, pump heater), instrument ports, controller address, poll rate, theme, database status |
+| **Process** | Pick a recipe, fill in the form, watch it run on the full chart set, answer its prompts. **Start** opens a dialog that repeats the recipe and says what the run will do first; nothing starts until you confirm it. A run that has ended stays here for 12 hours with its result table, then the form returns. A recipe that needs equipment not installed on the rig yet is listed but switched off, saying what it is waiting for |
+| **History** | Every recorded run: browse, search, inspect, annotate (saving notes keeps the run open), export, delete (not a run that is still going); the full chart set per run, comparison with earlier pump-downs, and **trends across runs** |
+| **Settings** | Sub-tabs (`#settings/<name>`): **My account**; for admins **People** (approve sign-ups, roles, password resets, pairing tablets); **Rig** (what is physically installed — argon line, gate valve, magnetron, shutter, pump heater — and the instrument ports); **This screen** (controller address, poll rate, theme, alarm sound); **Server** (the server and database status) |
 
 ### Reading the charts
 
@@ -195,7 +194,33 @@ happens:
 once their cause has cleared, so a fault in the night is still there in the
 morning. Each says what the panel already did about it. The browser tab's
 title carries the worst one, and critical ones can sound (Settings). The
-Overview tab keeps the log.
+Dashboard's *Recent activity* keeps the log.
+
+**If a person with an idle session sees something wrong, they do not have to
+sign in first.** *Acknowledge*, *Make safe*, *Stop*, *Done* on the checklist
+and *Cancel power-down* ask for the password and then carry on with what you
+pressed. A viewer sees "An operator answers this"; a paired tablet says
+"Sign in to ...".
+
+**Silence here** (operators and above) quiets the sounds in this browser only,
+until something new sounds. It acknowledges nothing and does not touch other
+screens.
+
+**A step that waits too long becomes an alarm.** A guided step chimes once a
+minute; after 10 minutes without a *Done* it raises a critical alarm on every
+screen. Pressing *Done* clears and acknowledges it; if the run ends instead,
+the alarm stays for somebody to acknowledge.
+
+**When the panel loses contact with the lab PC**, after two failed attempts a
+banner says "No contact with the lab PC since HH:MM" with what to check (the
+lab PC and its network, then the panel's service), and the figures turn grey
+so a frozen number cannot be mistaken for a live one. A wall tablet also
+beeps, every 10 seconds for two minutes and then every 5 minutes; anyone at
+the tablet may silence that beep with its own **Silence here**, since nobody
+can sign in while the lab PC does not answer. If the banner
+says the panel "is not answering properly", the lab PC is reachable but the
+panel is struggling: look at its service. The figures return by themselves
+when contact does.
 
 Besides drive faults and the rest, the panel raises an alarm when:
 
@@ -235,9 +260,25 @@ Besides drive faults and the rest, the panel raises an alarm when:
 One lost reply on the bus raises none of these: the panel believes a change in
 the drive only when two readings in a row show it.
 
-**An aborted run stays on the Process tab**, with its charts continuing live
-in an *After the run* band — the rotor coasting, the pressure recovering —
-until you press *Start a new run*.
+**An ended run stays on the Process tab**, with its charts continuing live
+in an *After the run* band — the rotor coasting, the pressure recovering — and
+its result table, for 12 hours or until you press *Start a new run*. A run you
+stopped yourself is shown as **stopped**; *aborted* is kept for a run the
+panel ended because something was wrong.
+
+**Steps left by hand.** If a run ends with the plasma, gas or shutter still
+to be switched off by a person (they are manual on this rig), a checklist
+appears on every page, and the alarm is critical and names each step. The
+panel sounds until every step is confirmed, no new run can start while any is
+outstanding, and it stays after a restart. After a crash, every manual step is
+listed, because nobody can know which were on. Switch each off at the rig,
+then press **Done** beside it.
+
+**An owed clean-up you have dealt with yourself.** If a run's clean-up cannot
+succeed (say, the drive refuses the heater-off) and you have switched things
+off by hand, an admin opens the run in History and presses **Mark as done by
+hand…**, types why, and ticks that the rig was checked. The panel then stops
+retrying it and clears its alarms.
 
 **Err006** is the run-up time error: with the factory settings (PM 0504 BE,
 section 4.1: run-up time 15 min, switchpoint 80 %), a rotor below 1200 Hz once
@@ -257,7 +298,7 @@ replugged USB adapter (which renumbers `/dev/ttyUSB0` and `/dev/ttyUSB1`), a
 replaced adapter, or a different USB socket does not matter. If an
 instrument stops answering for 10 s, the panel looks for it on the other free
 ports about once a minute and reconnects by itself, with an alarm saying where
-it went. **Settings → Finding the instruments** shows each instrument's port,
+it went. **Settings → Rig → Finding the instruments** shows each instrument's port,
 lets you search now, and *Detect instruments now* lists what answers on every
 port. `--no-port-search` pins the ports instead.
 
@@ -415,13 +456,14 @@ you may do depends on your role in this chamber:
   second screen never takes control from the first; **Take control here**
   does. Better still, give everyone who operates their own account — a
   shared one is fine only for watching.
-- **Lab tablets** are paired once (Settings → People → Tablets gives a
-  one-time code, typed into *Pair this tablet*). A paired tablet always shows
+- **Lab tablets** are paired once (Settings → People gives a
+  one-time code, typed into *Pair this tablet*, which is offered on the tablet's
+  own app only). A paired tablet always shows
   the rig and sounds alarms, with nobody signed in, and can never act.
 - Everything somebody does is recorded under their name in the event log.
 - After an update, open panels — tablets and phones included — reload
   themselves within a poll or two.
-- **Settings → Test the alarm sound** plays the alarm's two tones on the
+- **Settings → This screen → Test the alarm sound** plays the alarm's two tones on the
   device in your hand, to check its speaker.
 - **Messages you may meet.** *Busy, try again* means several people are
   signing in at the same moment; wait a few seconds and press again (it does
@@ -442,7 +484,7 @@ you may do depends on your role in this chamber:
   `--allow-from` can still watch and operate; and `--host-name NAME` /
   `--allow-origin URL` say which address names and which other web pages may
   talk to the panel (the panel answers "421" or "403" to anything else). The
-  tablet on its cable (127.0.0.1) always passes. If Settings → Connection
+  tablet on its cable (127.0.0.1) always passes. If Settings → This screen → Connection
   points at a panel on another machine, that machine must be started with
   `--allow-origin` for the page you are on.
 
@@ -533,7 +575,14 @@ starts in **manual** mode. Pick per run:
 - **Guided** — the software drives what it can and stops at each manual step
   with a large, plain-language instruction and a *Done* button. It keeps
   sampling and keeps its abort checks live while it waits, so a chamber with
-  the plasma on is never unmonitored.
+  the plasma on is never unmonitored. The instruction appears at the top of
+  **every page**, not only Process, with a chime that repeats each minute
+  until the step is confirmed, and the browser tab's title says a step is
+  waiting. *Done* confirms the step shown; if the step has changed meanwhile,
+  the panel refuses it rather than confirming the wrong one. A deposition's
+  pre-sputter and deposit times count from the moment you confirm the plasma
+  or the shutter, and the deposition ends when you confirm the shutter is
+  closed.
 - **Automatic** — refused up front unless every actuator is under software
   control, rather than failing at the first prompt with the chamber already
   pumped down.
@@ -932,6 +981,86 @@ Only this folder travels: the tablet, the manuals and anything else at the
 top of the repository are never sent. `rollback` does the same switch by hand, and also needs the rig idle.
 The restart is announced on the panel as a warning to acknowledge.
 
+## Updating the panel from GitHub
+
+Besides `release.py deploy` from the laptop, the lab PC can fetch new versions
+itself. It never installs one on its own: an admin presses a button, once they
+can see that nobody is about to start a run.
+
+**Making a version** (on the laptop, once `test` has been merged into `main`).
+A version is a signed tag named `vYYYY.MM.DD` (`.2`, `.3` for more than one a
+day). Set up git to sign with an SSH key once:
+
+```bash
+git config gpg.format ssh
+git config user.signingkey ~/.ssh/YOUR_KEY.pub
+```
+
+then, from this folder:
+
+```bash
+git fetch
+./tools/release.py tag -m "What changed, in a line or two"
+git push origin vYYYY.MM.DD          # publishes it
+```
+
+The tag carries a fingerprint (SHA-256) of every file in this folder.
+
+**Setting up the lab PC** (once). `./tools/release.py deploy --to user@labpc
+--install-units` installs the four service files that do the looking and the
+installing, and the lab PC must be told which keys to believe:
+
+```bash
+ssh user@labpc
+~/vacuum-lab/current/tools/autoupdate.py trust NAME KEY.pub
+```
+
+`KEY.pub` is the public half of the key that signs the versions. **A version is
+accepted only if it is signed with a key trusted on that machine**; a tag
+pushed by anybody else is refused, even to the right repository.
+
+**What the lab PC does by itself**, every 15 minutes: it asks GitHub for new
+tags, checks the signature, downloads the files and compares them with the
+fingerprint in the signature, unpacks them beside the running version and
+runs the self test on them. The self test runs only while the rig is idle, at
+the lowest priority, and stops if a run starts. Then the version is "ready".
+A version that fails any of this is left alone until a newer one appears (or
+you ask for another try, below). No internet, or GitHub unreachable, is only
+reported and tried again.
+
+**Installing it.** In the panel, Settings → Server shows a *Software version*
+card with the running version and the one that is ready. An admin who has
+control of the rig presses *Install*. Then:
+
+- the panel stops accepting new runs and power-downs (stopping and aborting are
+  never held);
+- the lab PC makes a backup, switches to the new version and restarts the
+  panel;
+- **the rig is unwatched for about a minute** while the panel restarts. The
+  pump carries on with what it was doing, but the interlocks, the sampling and
+  the run engine are off until the new panel is up;
+- within a minute the new panel must be running the new version, with each
+  instrument that answered before answering again and no new critical alarm.
+  If not, the lab PC **goes back to the previous version by itself** and the
+  card says why.
+
+An install is refused while a run or a power-down is under way, and a
+version that changes the service files has to be deployed from the laptop with
+`--install-units`. A request nobody picks up within a minute is withdrawn, and
+a hold on new runs ends after ten minutes at most. `release.py deploy` from the
+laptop refuses while the panel is holding for an install.
+
+**From the shell on the lab PC:**
+
+```bash
+~/vacuum-lab/current/tools/autoupdate.py status          # what it knows, and why
+~/vacuum-lab/current/tools/autoupdate.py trust NAME KEY.pub   # believe a key
+~/vacuum-lab/current/tools/autoupdate.py retry vYYYY.MM.DD    # try a refused version again
+```
+
+`retry` is for a version whose self test failed for a reason of its own (the
+machine was busy, say); a version with a bad signature stays refused.
+
 ## Backups
 
 The SQLite download in the panel is **not** a backup: it leaves the accounts
@@ -1233,7 +1362,8 @@ with 120 sccm and the gate open reproduces the failures of 2026-10-08.
 | `tc600ctl.py` / `tpgctl.py` | Command line tools |
 | `tools/` | Simulators, the self test (`tools/checks/`) and the browser test |
 | `tools/backup.py`, `tools/release.py`, `tools/report.py` | Backups, releasing a new version, the morning report |
-| `deploy/` | The service files (`vacuum-lab-web`, `vacuum-lab-backup`) and the device rules |
+| `tools/autoupdate.py`, `lab/updates.py` | The lab PC's updater and the panel's part of it (see [Updating the panel from GitHub](#updating-the-panel-from-github)) |
+| `deploy/` | The service files (`vacuum-lab-web`, `vacuum-lab-backup`, `vacuum-lab-update`, `vacuum-lab-install`) and the device rules |
 
 ## Protocol notes
 

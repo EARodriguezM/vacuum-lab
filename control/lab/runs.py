@@ -22,8 +22,10 @@ the API publishes its `fields` and the UI builds the form from them.
 
 from __future__ import annotations
 
+import itertools
 import math
 import queue
+import secrets
 import sys
 import threading
 import time
@@ -91,6 +93,14 @@ def statistics(values: list[float]) -> dict:
         "stdev": math.sqrt(variance), "first": values[0], "last": values[-1],
         "count": n,
     }
+
+
+def _minutes(seconds: float) -> str:
+    """A process time for the run log: "20 min 05 s", "45 s"."""
+    seconds = max(0, round(seconds))
+    if seconds < 60:
+        return f"{seconds} s"
+    return f"{seconds // 60} min {seconds % 60:02d} s"
 
 
 # --- procedures -----------------------------------------------------------
@@ -264,6 +274,16 @@ class Procedure:
     def summarise(self, engine: "RunEngine", samples: list[dict]) -> dict:
         """Compute the run's result from everything recorded."""
         return {}
+
+    def timer(self, now: float) -> dict | None:
+        """The process timer running now, for the panel's countdown, or None.
+
+        `now` is the run time `t`. A dict with `label` (what happens when it
+        runs out), `total_s` and `elapsed_s` -- None while the timer waits for
+        its start to be confirmed, so the panel never counts down a
+        pre-sputter whose plasma nobody has struck yet.
+        """
+        return None
 
     def finish(self, engine: "RunEngine") -> bool | None:
         """Called after the last sample, whatever the outcome.
@@ -1334,9 +1354,18 @@ class Deposition(VacuumSequence):
             raise Abort("the pressure ceiling must be above zero",
                         dbmod.FAILED)
 
-        self.deposition_started_at: float | None = None
-        self.deposition_ended_at: float | None = None
+        #: Run times `t`. Each process timer counts from the moment its step
+        #: took effect -- a person's Done, or a driver's answer -- not from
+        #: the phase's start: a guided pre-sputter used to lose however long
+        #: it took somebody to strike the plasma.
         self.plasma_started_at: float | None = None
+        self.deposition_started_at: float | None = None
+        #: When the deposition time ran out, and when the shutter was then
+        #: confirmed closed. The film grows until the second: by hand that
+        #: is later, and the record says by how much.
+        self.deposit_time_done_at: float | None = None
+        self.deposition_ended_at: float | None = None
+        self._recovering_since: float | None = None
         self._working_since: float | None = None
 
         if self.working <= 0:
@@ -1393,11 +1422,17 @@ class Deposition(VacuumSequence):
                 + f". {self.argon:g} sccm through a {self.gate_open:g}% gate "
                   f"does not reach that pressure: change the flow or the "
                   f"throttle and run it again.")
-        if not engine.require(engine.hardware.shutter, False):
+        if not engine.require(engine.hardware.shutter, False,
+                              note="Before any argon goes in: the shutter stays "
+                                   "closed until the target has been cleaned."):
             return None
-        if not engine.require(engine.hardware.gate, self.gate_open):
+        if not engine.require(engine.hardware.gate, self.gate_open,
+                              note="The turbopump stays at full speed; the gate "
+                                   "is what holds the working pressure."):
             return None
-        if not engine.require(engine.hardware.gas, self.argon):
+        if not engine.require(engine.hardware.gas, self.argon,
+                              note=f"Aim for {self.working:.1E} mbar on the "
+                                   f"gauge; the run waits until it holds there."):
             return None
 
         pressure = sample.get("p_best")
@@ -1417,50 +1452,112 @@ class Deposition(VacuumSequence):
             self._working_since = None
         return None
 
+    def _since(self, engine: "RunEngine", actuator, sample: dict) -> float:
+        """When this actuator's step took effect, in run time; the sample's
+        own time if the engine cannot say (it always can, on a real run)."""
+        at = engine.satisfied_at(actuator)
+        return at if at is not None else sample["t"]
+
     def phase_presputter(self, engine: "RunEngine", sample: dict) -> str | None:
         """Clean the target with the shutter closed."""
-        if not engine.require(engine.hardware.magnetron, self.power):
+        if not engine.require(engine.hardware.magnetron, self.power,
+                              note="The shutter is closed: this cleans the "
+                                   "target, not the sample. The pre-sputter "
+                                   "time counts from your Done."):
             return None
         if self.plasma_started_at is None:
-            self.plasma_started_at = sample["t"]
+            self.plasma_started_at = self._since(engine, engine.hardware.magnetron,
+                                                 sample)
             engine.log("action", f"Plasma on at {self.power:g} W, shutter "
                                  f"closed — pre-sputtering the target")
-        if self.in_phase >= self.presputter:
+        if sample["t"] - self.plasma_started_at >= self.presputter:
             return "deposit"
         return None
 
     def phase_deposit(self, engine: "RunEngine", sample: dict) -> str | None:
         """Open the shutter; this is the part that makes the film."""
-        if not engine.require(engine.hardware.shutter, True):
+        if not engine.require(engine.hardware.shutter, True,
+                              note="The deposition time counts from your Done: "
+                                   "open it, then press Done at once."):
             return None
         if self.deposition_started_at is None:
-            self.deposition_started_at = sample["t"]
+            self.deposition_started_at = self._since(engine, engine.hardware.shutter,
+                                                     sample)
             engine.log("action", "Shutter open — deposition started")
-        if self.in_phase >= self.deposit_time:
-            self.deposition_ended_at = sample["t"]
-            engine.log("action", "Deposition time complete")
+        if sample["t"] - self.deposition_started_at >= self.deposit_time:
+            self.deposit_time_done_at = sample["t"]
+            engine.log("action", "Deposition time complete — closing the shutter")
             return "recover"
         return None
 
     def phase_recover(self, engine: "RunEngine", sample: dict) -> str | None:
         """Shut the process down in the safe order and pump back out."""
-        if not engine.require(engine.hardware.shutter, False):
+        if not engine.require(engine.hardware.shutter, False,
+                              note="The deposition time is over: the film grows "
+                                   "until the shutter is closed. Close it "
+                                   "first, then press Done at once."):
             return None
-        if not engine.require(engine.hardware.magnetron, 0):
+        if self.deposition_ended_at is None and \
+                self.deposition_started_at is not None:
+            # The deposition ends here, not when its time ran out: by hand,
+            # the shutter stays open until somebody closes it.
+            self.deposition_ended_at = self._since(engine, engine.hardware.shutter,
+                                                   sample)
+            late = self.deposition_ended_at - (self.deposit_time_done_at
+                                               or self.deposition_ended_at)
+            engine.log("action", "Shutter closed — deposition ended after "
+                                 f"{_minutes(self.deposition_ended_at - self.deposition_started_at)}"
+                                 + (f", {late:.0f} s past its set time"
+                                    if late >= 1 else ""))
+        if not engine.require(engine.hardware.magnetron, 0,
+                              note="The shutter is closed; now the plasma."):
             return None
         if not engine.require(engine.hardware.gas, 0):
             return None
         if not engine.require(engine.hardware.gate, 100):
             return None
         # A minute of pumping with the gas off, so the run's last samples
-        # record the chamber actually recovering rather than a guess.
-        if self.in_phase >= 60:
+        # record the chamber actually recovering rather than a guess -- from
+        # when the last step took effect, not from the first prompt.
+        if self._recovering_since is None:
+            self._recovering_since = sample["t"]
+        if sample["t"] - self._recovering_since >= 60:
             return "done"
         return None
 
+    def timer(self, now: float) -> dict | None:
+        if self.phase == "presputter":
+            return {"label": "The shutter opens", "total_s": self.presputter,
+                    "elapsed_s": (None if self.plasma_started_at is None
+                                  else max(0.0, now - self.plasma_started_at))}
+        if self.phase == "deposit":
+            return {"label": "Deposition ends", "total_s": self.deposit_time,
+                    "elapsed_s": (None if self.deposition_started_at is None
+                                  else max(0.0, now - self.deposition_started_at))}
+        if self.phase == "recover" and self._recovering_since is not None:
+            return {"label": "Recovery ends", "total_s": 60.0,
+                    "elapsed_s": max(0.0, now - self._recovering_since)}
+        return None
+
     def finish(self, engine: "RunEngine") -> bool:
-        """However this ended, the plasma and the gas must not be left on."""
-        return engine.hardware.safe_shutdown(log=engine.log)
+        """However this ended, the plasma and the gas must not be left on.
+
+        What nothing drives is left to a person, on the engine's checklist:
+        on every screen, sounding, until each step is confirmed.
+        """
+        steps: list[dict] = []
+        done = engine.hardware.safe_shutdown(log=engine.log, steps=steps)
+        engine.leave_by_hand(steps)
+        # A driven shutter closed just now ends the deposition now. (Called
+        # again on an instance that never began, there is none to end.)
+        shutter = engine.hardware.shutter
+        if getattr(self, "deposition_started_at", None) is not None \
+                and getattr(self, "deposition_ended_at", None) is None \
+                and shutter.available:
+            reading = shutter.known()          # False, or a relay's 0
+            if reading is not None and not reading:
+                self.deposition_ended_at = engine.run_time()
+        return done
 
     def summarise(self, engine: "RunEngine", samples: list[dict]) -> dict:
         summary = self.vacuum_summary()
@@ -1471,8 +1568,10 @@ class Deposition(VacuumSequence):
 
         deposited = None
         if self.deposition_started_at is not None:
+            # Until the shutter was confirmed closed; without that, to the
+            # end of the run -- and it may have gone on after it.
             end = self.deposition_ended_at or (samples[-1]["t"] if samples else 0)
-            deposited = end - self.deposition_started_at
+            deposited = max(0.0, end - self.deposition_started_at)
 
         summary.update({
             "working_mbar_setpoint": self.working,
@@ -1482,7 +1581,10 @@ class Deposition(VacuumSequence):
             "magnetron_w": self.power,
             "presputter_s": self.presputter,
             "deposition_s": deposited,
-            "deposition_complete": self.deposition_ended_at is not None,
+            "deposition_set_s": self.deposit_time,
+            "deposition_complete": self.deposit_time_done_at is not None,
+            "shutter_closed": self.deposition_ended_at is not None
+            or self.deposition_started_at is None,
             "duration_s": samples[-1]["t"] if samples else 0,
         })
         if pressures:
@@ -1494,7 +1596,14 @@ class Deposition(VacuumSequence):
                     f"its setpoint during deposition. Film uniformity and "
                     f"composition depend on it holding steady — check the gas "
                     f"flow and the gate valve throttle.")
-        if not summary["deposition_complete"]:
+        if not summary["shutter_closed"]:
+            # Before the dose caveat: the risk here is the opposite one, and
+            # the worse to miss.
+            summary["caveat"] = (
+                "Nobody confirmed the shutter closed before the run ended: "
+                "the deposition time is counted to the end of the run, and "
+                "the sample may have been coated for longer.")
+        elif not summary["deposition_complete"]:
             summary.setdefault(
                 "caveat", "The run ended before the deposition step finished, "
                           "so this sample did not receive its full dose.")
@@ -1803,7 +1912,7 @@ def not_installed(label: str, missing: list[str]) -> str:
     return (f"{label} needs the {listed}, which "
             f"{'are' if plural else 'is'} not installed on this rig yet. Once "
             f"{'they are' if plural else 'it is'} in place, mark "
-            f"{'them' if plural else 'it'} installed in Settings → Rig equipment.")
+            f"{'them' if plural else 'it'} installed under Settings → Rig.")
 
 
 def catalogue() -> list[dict]:
@@ -1856,6 +1965,10 @@ class RunEngine:
     ORPHAN_RETRY_S = 60.0
     ORPHAN_TRIES = 5
 
+    #: How long an admin's "checked by hand" waits for its record to be
+    #: written before it gives up and changes nothing.
+    MARK_WAIT_S = 15.0
+
     def __init__(self, database: "dbmod.Database", registry,
                  hardware: "process.ProcessHardware | None" = None,
                  pump_key: str = "pump", gauge_key: str = "gauge",
@@ -1897,8 +2010,16 @@ class RunEngine:
         self.orphans: list[dict] = []
         self._orphan_thread: threading.Thread | None = None
         self._orphan_lock = threading.Lock()
+        #: Held through each attempt at an owed clean-up, so an admin's
+        #: "checked by hand" lands either before an attempt -- which is then
+        #: not made -- or after it, never in the middle of one.
+        self._attempt_lock = threading.Lock()
         #: Set by close(): nothing is started or tried again from then on.
         self._closing = threading.Event()
+        #: While an admin's install of a new version is under way (lab/
+        #: updates.py): why runs and power-downs are refused, and until when
+        #: (monotonic). The restart ends it, or the installer saying no.
+        self._hold: tuple[str, float] | None = None
         self._procedure: Procedure | None = None
         self._run: dict | None = None
         self._samples: list[dict] = []
@@ -1946,6 +2067,33 @@ class RunEngine:
         #: shutter open over the sample for the whole recovery. Found exactly
         #: that way in the first end-to-end simulated deposition.
         self._satisfied: dict[str, str] = {}
+        #: When each actuator's current value took effect (monotonic): the
+        #: moment a person pressed Done, or a driver accepted it. A recipe's
+        #: timers count from here -- never from when the step was asked for,
+        #: or a pre-sputter is cut short by however long the walk took.
+        self._confirmed_at: dict[str, float] = {}
+        #: Guards the prompt, the confirmed values and the checklist: Done
+        #: arrives on an HTTP thread while the run thread asks for the next
+        #: step, and a run ending clears what the next one must not inherit.
+        self._prompt_lock = threading.Lock()
+        #: Numbers every prompt and checklist step, never reused while the
+        #: panel runs: a Done pressed for one step cannot confirm another
+        #: that replaced it on screen meanwhile. From a random start, so a
+        #: page left open across a restart cannot name a step of the new
+        #: process by the number an old one had.
+        self._step_ids = itertools.count(secrets.randbelow(2 ** 40) + 1)
+        #: The run whose `finish()` is running on this thread, for the steps
+        #: it leaves by hand: the ending run, or an owed clean-up's.
+        self._finishing = threading.local()
+        #: What a person must still do by hand after a run ended -- the
+        #: plasma off, the argon shut, the shutter closed, where nothing
+        #: drives them -- kept on every screen until each is confirmed. No
+        #: run starts meanwhile.
+        self._checklist: list[dict] = []
+        #: When the run in progress started (monotonic): its time `t` zero.
+        self._run_started: float | None = None
+        #: The guided step last confirmed: {"id", "user"}, or None.
+        self.last_confirmed: dict | None = None
 
         self._close_orphans()
 
@@ -1958,10 +2106,15 @@ class RunEngine:
         its phase. Deliberately non-blocking: the sampler keeps running and
         the abort checks keep firing while somebody walks to the chamber,
         which is exactly when a plasma-on chamber must not go unwatched.
+
+        `note` is said with the instruction: why this step, now -- the same
+        shutter closes for different reasons before the plasma and after
+        the deposition.
         """
         want = repr(value)
-        if self._satisfied.get(actuator.key) == want:
-            return True
+        with self._prompt_lock:
+            if self._satisfied.get(actuator.key) == want:
+                return True
 
         try:
             actuator.set(value)
@@ -1971,9 +2124,17 @@ class RunEngine:
                     f"this run was set to automatic, but {actuator.label} is "
                     f"not under software control yet. Run it in guided mode, "
                     f"or wire the hardware up.", dbmod.FAILED)
-            if (not self._prompt or self._prompt.get("actuator") != actuator.key
-                    or self._prompt.get("want") != want):
+            with self._prompt_lock:
+                if self._satisfied.get(actuator.key) == want:
+                    # Done was pressed while this was asking again, and the
+                    # ask marked it unconfirmed: it was done, so it stands.
+                    actuator.confirm()
+                    return True
+                if (self._prompt and self._prompt.get("actuator") == actuator.key
+                        and self._prompt.get("want") == want):
+                    return False
                 self._prompt = {
+                    "id": next(self._step_ids),
                     "actuator": actuator.key,
                     "want": want,
                     "label": actuator.label,
@@ -1982,33 +2143,191 @@ class RunEngine:
                     "value": actuator.format(value),
                     "since": time.time(),
                 }
-                self.log("action", f"MANUAL STEP: {prompt.instruction}")
+            self.log("action", f"MANUAL STEP: {prompt.instruction}")
             return False
         except process.ActuatorError as exc:
             raise Abort(str(exc), dbmod.FAILED)
 
-        self._satisfied[actuator.key] = want
+        with self._prompt_lock:
+            self._satisfied[actuator.key] = want
+            self._confirmed_at[actuator.key] = time.monotonic()
         self.log("action", f"{actuator.label} set to {actuator.format(value)}")
         return True
 
-    def acknowledge(self, note: str = "") -> dict:
-        """Operator says the manual step is done; the recipe may continue."""
-        if not self._prompt:
-            return {"ok": False, "error": "nothing is waiting on you"}
-        pending = self._prompt
-        self._satisfied[pending["actuator"]] = pending["want"]
-        try:
-            self.hardware.get(pending["actuator"]).confirm()
-        except process.ActuatorError:
-            pass
-        self._prompt = None
+    def acknowledge(self, note: str = "", prompt_id: int | None = None,
+                    user=None) -> dict:
+        """A person says the manual step is done; the recipe may continue.
+
+        `prompt_id` is the step they were shown. The panel sends it, and a
+        Done for a step that is no longer the one waiting -- the run moved
+        on, ended, or another began -- is refused rather than taken as
+        confirming whatever is on screen now: the two may differ by a plasma.
+        `user` is who said so (lab/auth.py's Principal), for the record.
+        """
+        with self._prompt_lock:
+            pending = self._prompt
+            if not pending:
+                return {"ok": False, "code": 409,
+                        "error": "nothing is waiting on you: the step was "
+                                 "already confirmed, or the run has ended"}
+            if prompt_id is not None and prompt_id != pending.get("id"):
+                return {"ok": False, "code": 409,
+                        "error": "that step is no longer the one waiting -- "
+                                 "the run has moved on. Read the new "
+                                 "instruction and confirm that one."}
+            # The actuator must still be asked for what the prompt asked: a
+            # run ending meanwhile sets it to off, and a Done for "strike
+            # the plasma" must never be recorded as the plasma confirmed off.
+            try:
+                asked = repr(self.hardware.get(pending["actuator"]).requested)
+            except process.ActuatorError:
+                asked = None
+            if asked != pending["want"]:
+                return {"ok": False, "code": 409,
+                        "error": "that step is no longer the one waiting: the "
+                                 "run is ending and has asked for it to be "
+                                 "switched off"}
+            self._satisfied[pending["actuator"]] = pending["want"]
+            self._confirmed_at[pending["actuator"]] = time.monotonic()
+            try:
+                self.hardware.get(pending["actuator"]).confirm()
+            except process.ActuatorError:
+                pass
+            self._prompt = None
+            #: The step last confirmed, and by whom: the supervisor takes it
+            #: as the answer to that step's waiting alarm, if one was raised.
+            self.last_confirmed = {"id": pending.get("id"), "user": user}
         self.log("action",
-                 f"Operator confirmed: {pending['instruction']}"
-                 + (f" ({note})" if note else ""))
-        return {"ok": True, "acknowledged": pending["instruction"]}
+                 (f"{user.name} " if user is not None else "Operator ")
+                 + f"confirmed: {pending['instruction']}"
+                 + (f" ({note})" if note else ""),
+                 user=getattr(user, "username", None))
+        return {"ok": True, "acknowledged": pending["instruction"],
+                "id": pending.get("id")}
 
     def prompt(self) -> dict | None:
-        return self._prompt
+        prompt = self._prompt
+        return dict(prompt) if prompt else None
+
+    def run_time(self) -> float | None:
+        """The run in progress's time `t` now -- through its ending's clean-up
+        -- or None between runs."""
+        started = self._run_started
+        return None if started is None else round(time.monotonic() - started, 3)
+
+    def satisfied_at(self, actuator) -> float | None:
+        """The run time `t` at which this actuator's current value took
+        effect -- confirmed by a person, or accepted by its driver -- or
+        None. What a recipe's process timers count from."""
+        with self._prompt_lock:
+            at = self._confirmed_at.get(actuator.key)
+        started = self._run_started
+        if at is None or started is None:
+            return None
+        return round(at - started, 3)
+
+    # --- what is left to do by hand ---------------------------------------
+
+    def leave_by_hand(self, steps: list[dict]) -> None:
+        """Steps a run's ending could not do itself, for a person to do.
+
+        From `ProcessHardware.safe_shutdown`. One entry per actuator: a
+        later ending asking the same of it replaces the earlier one.
+        """
+        if not steps:
+            return
+        run_id = getattr(self._finishing, "run", None) or self.run_id()
+        with self._prompt_lock:
+            for step in steps:
+                same = next((s for s in self._checklist
+                             if s["actuator"] == step["actuator"]
+                             and s["instruction"] == step["instruction"]), None)
+                if same is not None:
+                    # Asked again -- an owed clean-up tried once more: the
+                    # same step, with the number already on screen.
+                    continue
+                self._checklist = [s for s in self._checklist
+                                   if s["actuator"] != step["actuator"]]
+                self._checklist.append({**step, "id": next(self._step_ids),
+                                        "run_id": run_id, "since": time.time()})
+
+    def by_hand_for(self, run_id) -> list[dict]:
+        """The steps still left by hand from one run, as its record keeps them:
+        a restart rebuilds the checklist from there."""
+        with self._prompt_lock:
+            return [{key: step.get(key) for key in
+                     ("actuator", "label", "instruction", "value")}
+                    for step in self._checklist if step.get("run_id") == run_id]
+
+    def _store_by_hand(self, run_id) -> None:
+        """Write a run's outstanding steps into its record (on the writer).
+
+        The list is taken when the write runs, not when it is queued: two
+        confirmations close together must not store one that still holds a
+        step already confirmed."""
+        if run_id is None:
+            return
+
+        def write():
+            steps = self.by_hand_for(run_id)
+            record = self.db.run(run_id)
+            if not record or record.get("status") == dbmod.RUNNING:
+                return
+            result = record.get("result") or {}
+            # Nothing to change -- a bake-out's clean-up tried again leaves no
+            # steps -- is nothing written: a record rewritten for no reason is
+            # one more read-and-write for anything else to race.
+            if steps == (result.get("by_hand") or []):
+                return
+            self.db.set_result(run_id, {**result, "by_hand": steps})
+        self._write(write, f"the steps left by hand after run {run_id}")
+
+    def _rebuild_by_hand(self, run_id, steps: list[dict]) -> None:
+        """At a start: what a run left by hand, back on the checklist, and its
+        actuators shown as asked for and not confirmed."""
+        for step in steps:
+            try:
+                actuator = self.hardware.get(step["actuator"])
+            except process.ActuatorError:
+                continue
+            if not actuator.available:
+                try:
+                    actuator.set(0 if actuator.key != "shutter" else False)
+                except (process.OperatorRequired, process.ActuatorError):
+                    pass
+        with self._prompt_lock:
+            for step in steps:
+                if any(s["actuator"] == step["actuator"] for s in self._checklist):
+                    continue
+                self._checklist.append({**step, "id": next(self._step_ids),
+                                        "run_id": run_id, "since": time.time()})
+
+    def checklist(self) -> list[dict]:
+        with self._prompt_lock:
+            return [dict(step) for step in self._checklist]
+
+    def confirm_step(self, step_id: int, user=None) -> dict:
+        """A person says one step left by a run's ending is done."""
+        with self._prompt_lock:
+            step = next((s for s in self._checklist if s["id"] == step_id), None)
+            if step is None:
+                return {"ok": False, "code": 409,
+                        "error": "that step is not waiting any more: somebody "
+                                 "confirmed it already"}
+            self._checklist.remove(step)
+            try:
+                self.hardware.get(step["actuator"]).confirm()
+            except process.ActuatorError:
+                pass
+        self._store_by_hand(step.get("run_id"))
+        # The rig's record, not a run's: the run has ended.
+        self._write(lambda: self.db.add_event(
+            step.get("run_id"), "action",
+            (f"{user.name} " if user is not None else "Operator ")
+            + f"confirmed after the run: {step['instruction']}",
+            user=getattr(user, "username", None)),
+            f"confirmed: {step['instruction']}")
+        return {"ok": True, "confirmed": step["instruction"]}
 
     # --- pump policy ------------------------------------------------------
 
@@ -2091,6 +2410,13 @@ class RunEngine:
         """
         remember = self._remember
         for run in self.db.orphaned_runs():
+            # What it may have left on by hand, nobody can know now: a
+            # deposition cut off mid-run may have its plasma burning. Every
+            # manual one it uses goes on the checklist, and no run starts
+            # until each is confirmed.
+            procedure = CATALOGUE.get(run.get("procedure"))
+            unknown = self.hardware.unknown_steps(
+                procedure.requires if procedure else ())
             # Marked as still owing its clean-up until that has run against
             # a pump that answered: a second restart before then must find
             # it again, or a heater stays on with nobody to switch it off.
@@ -2098,7 +2424,8 @@ class RunEngine:
                 run["id"], dbmod.FAILED,
                 {"error": "the control process stopped while this run was "
                           "in progress", "cleanup_pending": True,
-                 "cut_off": True})
+                 "cut_off": True, "by_hand": unknown})
+            self._rebuild_by_hand(run["id"], unknown)
             self.db.add_event(run["id"], "error",
                               "Run abandoned: the control process stopped")
             remember(run, "waiting for the pump", None, "crash")
@@ -2107,13 +2434,22 @@ class RunEngine:
                 cut_off = (run.get("result") or {}).get("cut_off")
                 remember(run, "waiting for the pump", None,
                          "crash" if cut_off else "unfinished")
+        # Steps a run's ending left by hand and nobody confirmed before the
+        # restart: back on the checklist.
+        for run in self.db.runs_with_steps_by_hand():
+            self._rebuild_by_hand(run["id"], [
+                s for s in run["result"]["by_hand"]
+                if isinstance(s, dict) and s.get("actuator")])
         for run in self.db.runs(status=dbmod.ABORTED, limit=5):
             result = run.get("result") or {}
             if result.get("interrupted") and not result.get("reported"):
                 if run["id"] not in {o["id"] for o in self.orphans}:
-                    remember(run, "the panel was stopped (a restart or a "
-                                  "shutdown) while it was going; its clean-up "
-                                  "ran then", True, "restart")
+                    entry = remember(run, "the panel was stopped (a restart or "
+                                          "a shutdown) while it was going; its "
+                                          "clean-up ran then", True, "restart")
+                    entry["by_hand"] = [s.get("instruction") for s in
+                                        (result.get("by_hand") or [])
+                                        if isinstance(s, dict)]
                 self.db.set_result(run["id"], {**result, "reported": True})
         self._start_cleanups()
 
@@ -2172,9 +2508,12 @@ class RunEngine:
             for orphan in owed:
                 if self._closing.is_set():
                     break
-                orphan["attempts"] += 1
-                self._clean_up_one(orphan, orphan["attempts"],
-                                   orphan["attempts"] >= self.ORPHAN_TRIES)
+                with self._attempt_lock:
+                    if orphan["ok"] is not None:
+                        continue          # checked by hand since the list
+                    orphan["attempts"] += 1
+                    self._clean_up_one(orphan, orphan["attempts"],
+                                       orphan["attempts"] >= self.ORPHAN_TRIES)
             if any(orphan["ok"] is None for orphan in owed):
                 self._closing.wait(self.ORPHAN_RETRY_S)
         with self._orphan_lock:
@@ -2187,12 +2526,16 @@ class RunEngine:
             done, why = True, ("no clean-up is known for this procedure; check "
                                "the rig by eye")
         else:
+            self._finishing.run = orphan["id"]
             try:
                 done = procedure(orphan["config"]).finish(self) is not False
                 why = ("its clean-up was run" if done else
                        "its clean-up did not succeed")
             except Exception as exc:              # never lose the thread
                 done, why = False, f"its clean-up failed: {exc}"
+            finally:
+                self._finishing.run = None
+            self._store_by_hand(orphan["id"])
         if done:
             orphan.update(ok=True, state=why)
         elif last:
@@ -2212,6 +2555,90 @@ class RunEngine:
         if ok:
             # Owed no longer: the next start has nothing to repeat.
             self._write(lambda: self._settle_cleanup(run_id))
+
+    def mark_cleanup_checked(self, run_id: int, reason: str, user=None) -> dict:
+        """An admin says a run's owed clean-up was dealt with by hand.
+
+        Otherwise it is owed for ever: weeks after somebody switched the
+        heater off themselves, a restart replays the old heater-off -- ending
+        a bake-out started by hand since -- and one the drive keeps refusing
+        holds every new run back for minutes at each start. `reason` says
+        what was checked; it is kept with the run and in the rig's log,
+        under `user` (lab/auth.py's Principal).
+        """
+        reason = " ".join(str(reason or "").split())[:300]
+        if len(reason) < 3:
+            return {"ok": False, "code": 400,
+                    "error": "say what you checked, in a sentence"}
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive() \
+                    and self._run and self._run.get("id") == run_id:
+                return {"ok": False, "code": 409,
+                        "error": f"run {run_id} is in progress"}
+        if not self._attempt_lock.acquire(timeout=30):
+            return {"ok": False, "code": 409,
+                    "error": "the panel is trying that clean-up right now; "
+                             "try again in a minute"}
+        try:
+            record = self.db.run(run_id)
+            if not record:
+                return {"ok": False, "code": 404, "error": f"no run {run_id}"}
+            if record.get("status") == dbmod.RUNNING:
+                return {"ok": False, "code": 409,
+                        "error": f"run {run_id} is still marked as running; "
+                                 f"the panel closes it at its next start"}
+            result = record.get("result") or {}
+            with self._orphan_lock:
+                listed = [o for o in self.orphans
+                          if o["id"] == run_id and o["ok"] is not True]
+            if result.get("cleanup_pending") is not True and not listed:
+                return {"ok": False, "code": 409,
+                        "error": f"run {run_id} owes no clean-up"}
+            name = getattr(user, "name", None) or "An admin"
+            checked = {"by": getattr(user, "username", None), "name": name,
+                       "reason": reason, "at": time.time()}
+            # Through the run's writer, and waited for: every other change to
+            # a run's record -- a clean-up settled, steps left by hand -- is
+            # read and written there, and one of those still queued would
+            # otherwise put the old record, still owing, back over this.
+            written = {"ok": False, "cancelled": False}
+            guard = threading.Lock()
+
+            def mark():
+                with guard:
+                    if written["cancelled"]:
+                        return            # the request gave up: not done
+                    current = self.db.run(run_id) or {}
+                    self.db.set_result(run_id, {**(current.get("result") or {}),
+                                                "cleanup_pending": False,
+                                                "cleanup_checked": checked})
+                    written["ok"] = True
+            self._write(mark, f"run {run_id}'s clean-up checked by hand")
+            self._flush(self.MARK_WAIT_S)
+            with guard:
+                if not written["ok"]:
+                    # Called off, so the answer below stays true: a write
+                    # still queued would otherwise land after it.
+                    written["cancelled"] = True
+                    return {"ok": False, "code": 503,
+                            "error": "the record could not be written in time; "
+                                     "nothing was changed -- try again"}
+            with self._orphan_lock:
+                for orphan in listed:
+                    orphan.update(ok=True, kind="checked",
+                                  state=f"checked by hand by {name}: {reason}")
+        finally:
+            self._attempt_lock.release()
+        try:
+            # Under the run, but the rig's record: kept if the run is deleted.
+            self.db.add_event(run_id, "action",
+                              f"{name} marked run {run_id}'s clean-up as done by "
+                              f"hand: {reason}",
+                              {"run": run_id, "reason": reason},
+                              user=getattr(user, "username", None))
+        except Exception as exc:
+            self.note_write_failure(exc, "a clean-up checked by hand")
+        return {"ok": True, "run": run_id, "checked": checked}
 
     def _settle_cleanup(self, run_id: int) -> None:
         record = self.db.run(run_id)
@@ -2236,8 +2663,8 @@ class RunEngine:
         if str(code).strip() not in pumpmod.NO_FAULT:
             title = pumpmod.describe_error(code).get("title", "drive fault")
             return (f"the drive has fault {str(code).strip()} latched "
-                    f"({title.lower()}). Find the cause and use Make safe on "
-                    f"the pump page, then start the run.")
+                    f"({title.lower()}). Find the cause and use Make safe under "
+                    f"Equipment → Pump, then start the run.")
         return None
 
     # --- device access ----------------------------------------------------
@@ -2352,7 +2779,8 @@ class RunEngine:
 
     # --- logging ----------------------------------------------------------
 
-    def log(self, level: str, message: str, detail: dict | None = None) -> None:
+    def log(self, level: str, message: str, detail: dict | None = None,
+            user: str | None = None) -> None:
         run = self._run                          # read once: _forget may clear it
         run_id = run["id"] if run else None
         # The run's own log is what its own thread writes. Everything else
@@ -2363,7 +2791,7 @@ class RunEngine:
         # Stamped now: the writer may get to it seconds later.
         at = time.time()
         self._write(lambda: self.db.add_event(run_id, level, message, detail,
-                                              at=at, origin=origin),
+                                              user=user, at=at, origin=origin),
                     f"{level}: {message}")
 
     def _write(self, write, what: str = "") -> None:
@@ -2406,6 +2834,53 @@ class RunEngine:
 
     # --- lifecycle --------------------------------------------------------
 
+    def hold_for_update(self, reason: str, seconds: float,
+                        force: bool = False) -> str | None:
+        """Refuse new runs and power-downs for `seconds`, because the panel
+        is about to be restarted into a new version; or, if the rig is not
+        idle, say why and hold nothing -- unless `force`, for a panel that
+        comes up while an install is still being judged. Judged under
+        `start()`'s lock, so a run cannot begin between the look and the
+        hold."""
+        with self._lock:
+            busy = None if force else self._restart_problem()
+            if busy:
+                return busy
+            self._hold = (reason, time.monotonic() + seconds)
+            return None
+
+    def unhold(self) -> None:
+        # Not under the lock: a start() writing its record holds it, and
+        # this is called from the supervisor's tick.
+        self._hold = None
+
+    def held(self) -> str | None:
+        """Why runs are held back for an install, or None."""
+        hold = self._hold
+        if hold and time.monotonic() < hold[1]:
+            return hold[0]
+        return None
+
+    def _restart_problem(self) -> str | None:
+        """What a restart would cut short: the same as tools/release.py's
+        idle_problem reads from the status file, asked of the engine."""
+        if self._thread and self._thread.is_alive():
+            run = self._run or {}
+            return f"run {run.get('id')} is going: a restart would end it"
+        if self._shutdown_thread and self._shutdown_thread.is_alive():
+            return "a power-down is under way: a restart would leave it unfinished"
+        if self._secure_thread and self._secure_thread.is_alive():
+            return "the pump is being made safe after a fault"
+        if self.checklist():
+            return ("the last run left steps to do by hand that nobody has "
+                    "confirmed")
+        if self._orphan_thread and self._orphan_thread.is_alive() \
+                and any(o["ok"] is None for o in list(self.orphans)):
+            return "the clean-up of an earlier run is being tried"
+        if self._closing.is_set():
+            return "the panel is shutting down"
+        return None
+
     def start(self, procedure_name: str, config: dict, name: str = "",
               operator: str = "", notes: str = "",
               started_by: str | None = None) -> dict:
@@ -2413,6 +2888,11 @@ class RunEngine:
             if self._thread and self._thread.is_alive():
                 return {"ok": False,
                         "error": "a run is already in progress; stop it first"}
+            held = self.held()
+            if held:
+                return {"ok": False,
+                        "error": f"{held}. Start the run once that is "
+                                 f"done, in a minute or two."}
             if procedure_name not in CATALOGUE:
                 return {"ok": False,
                         "error": f"unknown procedure {procedure_name!r}"}
@@ -2443,9 +2923,10 @@ class RunEngine:
                 return {"ok": False,
                         "error": "the pump is still being powered down. Wait "
                                  "until the rotor is at rest, or cancel the "
-                                 "power-down on the Pump page, then start "
+                                 "power-down under Equipment → Pump, then start "
                                  "the run."}
-            if self._orphan_thread and self._orphan_thread.is_alive():
+            if self._orphan_thread and self._orphan_thread.is_alive() \
+                    and any(o["ok"] is None for o in list(self.orphans)):
                 waiting = "; ".join(f"run {o['id']}: {o['state']}"
                                     for o in self.orphans if o["ok"] is None)
                 return {"ok": False,
@@ -2455,6 +2936,16 @@ class RunEngine:
                                  f"answers; if that fails, an alarm asks for "
                                  f"the rig to be checked by hand -- do that "
                                  f"before starting a run."}
+            left = self.checklist()
+            if left:
+                return {"ok": False,
+                        "error": "the last run left steps to do by hand that "
+                                 "nobody has confirmed yet: "
+                                 + "; ".join(s["instruction"].rstrip(".")
+                                             for s in left)
+                                 + ". The panel cannot see them. Do them, "
+                                   "confirm each at the top of the page, then "
+                                   "start the run."}
             if self._closing.is_set():
                 return {"ok": False, "error": "the panel is shutting down"}
 
@@ -2503,8 +2994,11 @@ class RunEngine:
             self._silent_since = None
             self._last_tick = None
             self._cleanup_since = None
-            self._prompt = None
-            self._satisfied = {}
+            with self._prompt_lock:
+                self._prompt = None
+                self._satisfied = {}
+                self._confirmed_at = {}
+            self._run_started = None
             self._stop.clear()
             self._thread = threading.Thread(
                 target=self._drive, name=f"run-{run['id']}", daemon=True)
@@ -2606,6 +3100,11 @@ class RunEngine:
         """
         in_progress = {"ok": False, "code": 409,
                        "error": f"run {run_id} is in progress; stop it first"}
+        if self.by_hand_for(run_id):
+            # Its record is where they survive a restart.
+            return {"ok": False, "code": 409,
+                    "error": f"run {run_id} left steps to do by hand that "
+                             f"nobody has confirmed; confirm them first"}
         with self._lock:
             if self._thread is not None and self._thread.is_alive() \
                     and self._run and self._run.get("id") == run_id:
@@ -2671,6 +3170,13 @@ class RunEngine:
         with self._lock:
             if self._shutdown_thread and self._shutdown_thread.is_alive():
                 return {"ok": False, "error": "a shutdown is already running"}
+            # The restart would cut it short half way; the rotor is left as
+            # it is meanwhile, backed by the forevacuum pump.
+            held = self.held()
+            if held:
+                return {"ok": False,
+                        "error": f"{held}. Power the pump down once that "
+                                 f"is done, in a minute or two."}
             if self.pump() is None:
                 return {"ok": False, "error": "no pump is configured"}
             # Cut short by the process ending, a power-down could stop half
@@ -2876,7 +3382,13 @@ class RunEngine:
         if not running or run is None or procedure is None:
             return {"running": False, "run": None,
                     "shutdown": self._shutdown, "secure": self._secure,
-                    "last": self._last}
+                    "last": self._last, "checklist": self.checklist()}
+        started = self._run_started
+        try:
+            timer = (procedure.timer(round(time.monotonic() - started, 3))
+                     if started is not None else None)
+        except Exception:                 # a display aid: never the status
+            timer = None
         return {
             "running": True,
             "run": run,
@@ -2893,7 +3405,9 @@ class RunEngine:
             "latest": self._samples[-1] if self._samples else None,
             "stopping": self._stop.is_set(),
             "mode": self.mode,
-            "prompt": self._prompt,
+            "prompt": self.prompt(),
+            "timer": timer,
+            "checklist": self.checklist(),
             "requires": list(procedure.requires),
             "actuators": self.actuators(),
             "shutdown": self._shutdown,
@@ -3025,6 +3539,7 @@ class RunEngine:
         procedure, run = self._procedure, self._run
         assert procedure is not None and run is not None
         started = time.monotonic()
+        self._run_started = started
         status, result, message = dbmod.COMPLETED, {}, ""
         pump_trouble = False
         by_operator = False
@@ -3099,18 +3614,26 @@ class RunEngine:
         self._last_tick = None
         self._cleanup_since = time.monotonic()
 
+        # Nothing is left waiting on an operator who has no run to answer --
+        # and before the clean-up, which sets what the prompt asked for to
+        # off: a Done pressed meanwhile must not confirm that. What the
+        # ending cannot do itself goes on the checklist instead.
+        with self._prompt_lock:
+            self._prompt = None
+
         # The hardware first, each step on its own, and only then the record:
         # a write that fails -- a full or worn SD card -- used to replace the
         # abort and skip everything after it, the heater and the gas included.
+        self._finishing.run = run["id"]
         try:
             cleaned = procedure.finish(self) is not False
         except Exception as exc:
             cleaned = False
             self.log("error", f"Cleanup after the run failed: {exc}")
+        finally:
+            self._finishing.run = None
 
-        # Whatever happened, the manual controls come back and nothing is
-        # left waiting on an operator who has no run to acknowledge.
-        self._prompt = None
+        # The manual controls come back.
         pump = self.pump()
         if pump is not None:
             try:
@@ -3139,6 +3662,14 @@ class RunEngine:
         result["status"] = status
         if message:
             result["message"] = message
+        if by_operator:
+            # Ended because a person chose to, not because something went
+            # wrong: the panel says "stopped", not "aborted".
+            result["stopped"] = True
+        # Kept with the run, so a restart puts them back on the checklist.
+        left = self.by_hand_for(run["id"])
+        if left:
+            result["by_hand"] = left
         result["samples"] = len(self._samples)
         if interrupted:
             # Stopped by the panel shutting down: the next start says so.
@@ -3150,6 +3681,10 @@ class RunEngine:
 
         self._write(lambda: self.db.finish_run(run["id"], status, result),
                     f"the end of run {run['id']}")
+        if left:
+            # Once more after the record exists: a step confirmed between
+            # taking `left` and the write above must not stay stored.
+            self._store_by_hand(run["id"])
         self.log("info" if status == dbmod.COMPLETED else "warning",
                  f"Run {status}" + (f": {message}" if message else ""))
         self._flush()
@@ -3173,3 +3708,4 @@ class RunEngine:
             self._remember({**run, "procedure": procedure.name},
                            "trying again", None, "retry")
             self._start_cleanups()
+        self._run_started = None

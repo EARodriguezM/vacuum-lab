@@ -4,15 +4,16 @@
 // The server's supervisor raises them (lab/alarms.py) and keeps each until it
 // is acknowledged, even once its condition has cleared -- a fault at night is
 // still on screen in the morning. This module shows them on every page, puts
-// the worst one in the browser tab's title, and can sound an alarm for the
-// critical ones.
+// the worst one in the browser tab's title, and sounds -- for the critical
+// ones, for a step a run's ending left to a person, and with a chime of its
+// own for a guided run waiting on somebody.
 //
 // Every alarm says what was already done -- "motor off, fault acknowledged,
 // forevacuum pump kept on" -- because an alarm that only says "fault" leaves
 // the reader to guess whether the chamber is still under vacuum.
 
 import { html } from "./html.js";
-import { useEffect, useRef } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { settings } from "./api.js";
 import * as fmt from "./format.js";
 
@@ -33,19 +34,48 @@ export function ActionList({ actions }) {
     </ul>`;
 }
 
-export function AlarmBar({ alarms, onAcknowledge, busy }) {
+/**
+ * The button that answers an alarm or a step, for whoever is looking.
+ *
+ * `may`: "yes" -- press it; "reauth" -- an idle session, which types the
+ * password and then the action goes ahead; "signin" -- a paired tablet,
+ * where a person signs in first; "no" -- a viewer. Never a dead grey button
+ * with no reason on a screen where something is wrong.
+ */
+export function SafetyButton({ may, busy, onPress, label, test, tone = "", small = true,
+                              signin = null }) {
+  if (may === "no") {
+    return html`<span class="small muted" title="Needs the operator role">
+      An operator answers this</span>`;
+  }
+  const text = may === "signin" ? (signin || `Sign in to ${label.toLowerCase()}`) : label;
+  return html`
+    <button class=${`${small ? "small " : ""}${tone}`} disabled=${busy}
+            data-test=${test} onClick=${onPress}
+            title=${may === "reauth" ? "Asks for your password, then does it" : ""}>
+      ${text}</button>`;
+}
+
+export function AlarmBar({ alarms, onAcknowledge, busy, may = "yes", silence = null }) {
   const list = alarms?.alarms || [];
   if (!list.length) return null;
   const critical = list.filter((a) => a.level === "critical").length;
+  // What a screen reader announces: only when the alarms themselves change,
+  // never because "12 s ago" became "14 s ago".
+  const spoken = list.slice(0, 4).map((a) => `${a.level}: ${a.title}`).join(". ");
   return html`
-    <section class=${`alarm-bar ${critical ? "crit" : "warn"}`} role="alert" data-test="alarm-bar">
+    <section class=${`alarm-bar ${critical ? "crit" : "warn"}`} aria-label="Alarms"
+             data-test="alarm-bar">
+      <div class="sr-only" role="alert">${spoken}</div>
       <header>
         <strong>${critical ? `${critical} critical alarm${critical > 1 ? "s" : ""}` : "Warning"}
           ${list.length > critical ? ` · ${list.length - critical} warning${list.length - critical > 1 ? "s" : ""}` : ""}</strong>
-        ${list.length > 1 && html`
-          <button class="small" disabled=${busy} onClick=${() => onAcknowledge("all")}
-                  data-test="alarm-ack-all">
-            Acknowledge all</button>`}
+        <span class="row tight">
+          ${silence}
+          ${list.length > 1 && html`
+            <${SafetyButton} may=${may} busy=${busy} label="Acknowledge all"
+                             test="alarm-ack-all" onPress=${() => onAcknowledge("all")} />`}
+        </span>
       </header>
       ${list.slice(0, 4).map((alarm) => html`
         <div class=${`alarm ${alarm.level}`} key=${alarm.id}>
@@ -53,10 +83,12 @@ export function AlarmBar({ alarms, onAcknowledge, busy }) {
             <span class=${`pill ${alarm.level === "critical" ? "crit" : "warn"}`}>
               <span class="dot" />${alarm.active ? alarm.level : "cleared"}</span>
             <strong class="alarm-title">${alarm.title}</strong>
-            <span class="small muted">${fmt.clock(alarm.raised_at)} · ${since(alarm.raised_at)} ago
+            <span class="small muted" aria-hidden="true">${fmt.clock(alarm.raised_at)} · ${since(alarm.raised_at)} ago
               ${!alarm.active && alarm.cleared_at ? ` · cleared ${fmt.clock(alarm.cleared_at)}` : ""}</span>
-            <button class="small right" disabled=${busy} data-test="alarm-ack"
-                    onClick=${() => onAcknowledge(alarm.id)}>Acknowledge</button>
+            <span class="right">
+              <${SafetyButton} may=${may} busy=${busy} label="Acknowledge" test="alarm-ack"
+                               onPress=${() => onAcknowledge(alarm.id)} />
+            </span>
           </div>
           <p class="alarm-detail">${alarm.detail}</p>
           ${alarm.actions?.length > 0 && html`
@@ -64,7 +96,7 @@ export function AlarmBar({ alarms, onAcknowledge, busy }) {
               <${ActionList} actions=${alarm.actions} /></div>`}
         </div>`)}
       ${list.length > 4 && html`<div class="small muted">and ${list.length - 4} more — see the
-        alarm log on the Overview tab.</div>`}
+        alarm log on the Dashboard, under Recent activity.</div>`}
     </section>`;
 }
 
@@ -94,13 +126,13 @@ if (typeof window !== "undefined") {
   window.addEventListener("keydown", unlockAudio, { once: true });
 }
 
-/** Two short tones: distinct from anything a browser plays by itself. */
-export function beep() {
+/** Tones as [frequency, start offset], played and then back to silence. */
+function play(tones) {
   if (!audio) return false;
   clearTimeout(quiet);
-  const play = () => {
+  const sound = () => {
     const now = audio.currentTime;
-    [[880, 0], [660, 0.22]].forEach(([frequency, offset]) => {
+    tones.forEach(([frequency, offset]) => {
       const oscillator = audio.createOscillator();
       const gain = audio.createGain();
       oscillator.frequency.value = frequency;
@@ -111,32 +143,104 @@ export function beep() {
       oscillator.start(now + offset);
       oscillator.stop(now + offset + 0.2);
     });
-    // Back to silence once both tones have played.
-    quiet = setTimeout(() => audio.suspend().catch(() => {}), 1000);
+    // Back to silence once the tones have played.
+    quiet = setTimeout(() => audio.suspend().catch(() => {}), 1200);
   };
   // Always through resume(): it queues behind a suspend still in flight --
   // the one unlockAudio sends when the same tap both unlocks and beeps.
-  audio.resume().then(play, () => {});
+  audio.resume().then(sound, () => {});
   return true;
 }
 
+/** Two falling tones: an alarm, distinct from anything a browser plays. */
+export function beep() {
+  return play([[880, 0], [660, 0.22]]);
+}
+
+/** Three rising tones: a guided run is waiting for somebody -- not a fault. */
+export function chime() {
+  return play([[523, 0], [659, 0.18], [784, 0.36]]);
+}
+
+/** Everything sounding now, by key, that "Silence here" has not quietened. */
+const silenced = new Set();
+
 /**
- * Title and sound for unacknowledged alarms. The title carries the worst one,
- * so a panel left in a background tab still says something is wrong; the
- * sound repeats every few seconds while a critical alarm is unacknowledged.
+ * What sounds and what the tab's title says, for everything that wants a
+ * person: unacknowledged critical alarms (every 4 s), steps a run's ending
+ * left by hand (every 4 s), a guided run waiting on somebody (a chime, then
+ * again each minute), and a kiosk that has lost the lab PC (every 10 s for
+ * two minutes, then every five: nobody can sign in to silence it while the
+ * lab PC is gone, and it may be off for the night).
+ *
+ * "Silence here" (operators and above, this browser only) quietens what is
+ * sounding now; anything new sounds again. The server never hears of it.
+ * The lost-contact beep has a silence of its own, for anyone at the screen
+ * (the user's decision, 2026-10-16): nobody can sign in while the lab PC
+ * does not answer.
+ * Returns [what is sounding, the silence function, the lost-contact silence
+ * or null when that beep is not sounding].
  */
-export function useAlarmSignals(alarms) {
+export function useAlarmSignals({ alarms, prompt, checklist, lost }) {
   const base = useRef(typeof document !== "undefined" ? document.title : "");
+  const [, setTick] = useState(0);
   const list = alarms?.alarms || [];
   const critical = list.find((a) => a.level === "critical");
   const worst = critical || list[0];
+  const steps = checklist || [];
+
+  const title = worst ? `⚠ ${worst.title}`
+    : steps.length ? `⚠ To do by hand: ${steps[0].label}`
+    : prompt ? `▶ Waiting for you: ${prompt.label}`
+    : lost ? "⚠ No contact with the lab PC" : null;
   useEffect(() => {
-    document.title = worst ? `⚠ ${worst.title} — Vacuum Lab` : base.current;
-  }, [worst?.id, worst?.title]);
+    document.title = title ? `${title} — Vacuum Lab` : base.current;
+  }, [title]);
+
+  const urgent = [
+    ...list.filter((a) => a.level === "critical").map((a) => `alarm:${a.id}`),
+    ...steps.map((s) => `step:${s.id}`),
+  ].filter((key) => !silenced.has(key));
+  const promptKey = prompt && !silenced.has(`prompt:${prompt.id}`) ? `prompt:${prompt.id}` : null;
+  const lostKey = lost && !silenced.has(`lost:${lost}`) ? `lost:${lost}` : null;
+  const on = settings().alarmSound !== false;
+
   useEffect(() => {
-    if (!critical || settings().alarmSound === false) return undefined;
+    if (!on || !urgent.length) return undefined;
     beep();
     const timer = setInterval(beep, 4000);
     return () => clearInterval(timer);
-  }, [critical?.id]);
+  }, [on, urgent.join(",")]);
+  useEffect(() => {
+    if (!on || !promptKey || urgent.length) return undefined;
+    chime();
+    const timer = setInterval(chime, 60000);
+    return () => clearInterval(timer);
+  }, [on, promptKey, urgent.length > 0]);
+  useEffect(() => {
+    if (!on || !lostKey) return undefined;
+    let count = 0;
+    let timer = null;
+    const next = () => {
+      count += 1;
+      timer = setTimeout(() => { beep(); next(); }, count <= 12 ? 10000 : 300000);
+    };
+    next();
+    return () => clearTimeout(timer);
+  }, [on, lostKey]);
+
+  // Only what can actually be heard: before the first touch unlocks sound,
+  // there is nothing to silence.
+  const sounding = on && !!audio && (urgent.length > 0 || !!promptKey || !!lostKey);
+  const silence = () => {
+    urgent.forEach((key) => silenced.add(key));
+    if (promptKey) silenced.add(promptKey);
+    if (lostKey) silenced.add(lostKey);
+    setTick((t) => t + 1);
+  };
+  const silenceLost = on && !!audio && lostKey ? () => {
+    silenced.add(lostKey);
+    setTick((t) => t + 1);
+  } : null;
+  return [sounding, silence, silenceLost];
 }

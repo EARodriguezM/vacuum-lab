@@ -19,12 +19,83 @@ function Account({ run }) {
     ? html`<span class="muted small">${" "}(${run.started_by})</span>` : null;
 }
 
-const STATUS_TONE = {
-  completed: "good", running: "accent", aborted: "warn", failed: "crit",
-};
+/** A run's status as said on screen: "stopped" when its operator ended it. */
+function StatusPill({ run }) {
+  const said = fmt.runStatus(run);
+  return html`<${Pill} tone=${fmt.STATUS_TONE[said] || "idle"}>${said}<//>`;
+}
 
-function RunDetail({ run, onClose, onChanged, notify, devices, runs,
-                    canEdit = true, canDelete = true }) {
+/**
+ * A run whose clean-up -- the heater off, the gas and the plasma off -- is
+ * still owed. The panel tries it again at every start until it works; an
+ * admin who dealt with it by hand says so here, with what they checked, and
+ * the panel stops: otherwise it would one day switch off a heater somebody
+ * has switched on since.
+ */
+function OwedCleanup({ run, canAdmin, notify, onChanged }) {
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState("");
+  const [sure, setSure] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState(null);
+  const result = run.result || {};
+  const checked = result.cleanup_checked;
+  if (checked) {
+    return html`<${Banner}>Its clean-up was marked as done by hand by
+      ${" "}<strong>${checked.name}</strong> on ${fmt.dateTime(checked.at)}:
+      ${" "}${checked.reason}<//>`;
+  }
+  if (result.cleanup_pending !== true) return null;
+  const send = async () => {
+    setSending(true);
+    setError(null);
+    try {
+      const answer = await api.cleanupChecked(run.id, reason.trim());
+      setOpen(false);
+      notify(`Run ${run.id}'s clean-up is marked as done by hand.`, "ok");
+      onChanged(answer);
+    } catch (problem) {
+      setError(problem.message);
+    } finally {
+      setSending(false);
+    }
+  };
+  return html`
+    <${Banner} tone="crit">
+      <strong>Its clean-up is still owed.</strong> Switching off what it left on
+      (${run.procedure === "bakeout" ? "the pump's heater"
+        : run.procedure === "deposition" ? "the plasma and the argon" : "its process hardware"})
+      did not succeed, and the panel tries again at every start — no run starts
+      while it does.
+      ${canAdmin
+        ? html`<div style="margin-top:8px">
+            <button class="small" data-test="cleanup-checked-open"
+                    onClick=${() => { setOpen(true); setReason(""); setSure(false); setError(null); }}>
+              Mark as done by hand…</button></div>`
+        : " If somebody has dealt with it by hand, an admin can say so here."}
+    <//>
+    <${Confirm} open=${open} title=${`Run ${run.id}: clean-up done by hand`}
+      tone="danger" confirmLabel="Mark as done" busy=${sending} error=${error}
+      disabled=${!sure || reason.trim().length < 3}
+      onCancel=${() => setOpen(false)} onConfirm=${send}
+      body=${html`<p>The panel stops trying it, at this start and every later
+        one. Say what you checked; it is kept with the run and in the rig's
+        log under your name.</p>`}
+      extra=${html`
+        <label class="field"><span>What you checked</span>
+          <input value=${reason} maxlength="300" data-test="cleanup-checked-reason"
+                 placeholder="e.g. the TMS reads the heater off"
+                 onInput=${(e) => setReason(e.target.value)} />
+        </label>
+        <label class="check">
+          <input type="checkbox" checked=${sure} data-test="cleanup-checked-tick"
+                 onChange=${(e) => setSure(e.target.checked)} />
+          <span>I have checked the rig myself.</span>
+        </label>`} />`;
+}
+
+function RunDetail({ run, onClose, onSaved, onDeleted, onReload, notify, devices,
+                    runs, canEdit = true, canDelete = true, canAdmin = false }) {
   const [samples, setSamples] = useState([]);
   const [events, setEvents] = useState([]);
   // Who ran it is not here: it is the account that started the run.
@@ -48,12 +119,13 @@ function RunDetail({ run, onClose, onChanged, notify, devices, runs,
     return () => { cancelled = true; };
   }, [run.id]);
 
+  // Saving keeps the run open: a note is often written in two goes.
   const saveMeta = async () => {
     setSaving(true);
     try {
-      await api.updateRun(run.id, meta);
+      const answer = await api.updateRun(run.id, meta);
       notify("Saved.", "ok");
-      onChanged();
+      onSaved(answer.run);
     } catch (error) {
       notify(error.message, "error");
     } finally {
@@ -66,8 +138,7 @@ function RunDetail({ run, onClose, onChanged, notify, devices, runs,
     try {
       await api.deleteRun(run.id);
       notify(`Deleted run ${run.id}.`, "ok");
-      onChanged();
-      onClose();
+      onDeleted();
     } catch (error) {
       notify(error.message, "error");
     }
@@ -79,7 +150,7 @@ function RunDetail({ run, onClose, onChanged, notify, devices, runs,
         hint=${`${fmt.titleCase(run.procedure)} · ${fmt.dateTime(run.started_at)}` +
                `${run.operator ? ` · ${run.operator}` : ""}`}
         actions=${html`
-          <${Pill} tone=${STATUS_TONE[run.status] || "idle"}>${run.status}<//>
+          <${StatusPill} run=${run} />
           <button onClick=${() => save(`/api/runs/${run.id}/export.csv`, notify)}>CSV</button>
           <button onClick=${() => save(`/api/runs/${run.id}/export.json`, notify)}>JSON</button>
           <button data-test="history-close" onClick=${onClose}>Close</button>`}>
@@ -90,6 +161,9 @@ function RunDetail({ run, onClose, onChanged, notify, devices, runs,
           ["Samples", fmt.integer(run.sample_count ?? samples.length)],
         ]} />
       <//>
+
+      <${OwedCleanup} run=${run} canAdmin=${canAdmin} notify=${notify}
+                      onChanged=${onReload} />
 
       <div class="grid two">
         <${Card} title="Result">
@@ -133,16 +207,17 @@ function RunDetail({ run, onClose, onChanged, notify, devices, runs,
             <button class="primary" disabled=${saving || !canEdit} onClick=${saveMeta}
                     data-test="history-save"
                     title=${canEdit ? "" : "Editing a run needs the operator role"}>Save</button>
-            <button class="danger right" disabled=${!canDelete}
-                    title=${canDelete ? "" : "Deleting a run is an admin's"}
-                    onClick=${() => setConfirmDelete(true)}>Delete run</button>
+            ${run.status !== "running" && html`
+              <button class="danger right" disabled=${!canDelete}
+                      title=${canDelete ? "" : "Deleting a run is an admin's"}
+                      onClick=${() => setConfirmDelete(true)}>Delete run</button>`}
           </div>
         <//>
       </div>
 
       <${Confirm} open=${confirmDelete} title=${`Delete run ${run.id}?`}
         tone="danger" confirmLabel="Delete permanently"
-        body=${html`<p>This removes <strong>${run.name}</strong> and all
+        body=${html`<p>This removes <strong>${run.name}</strong> and all${" "}
           ${fmt.integer(run.sample_count ?? samples.length)} of its samples.
           It cannot be undone. Export it first if you might want it.</p>`}
         onCancel=${() => setConfirmDelete(false)} onConfirm=${remove} />
@@ -200,11 +275,20 @@ export function HistoryView({ notify, state }) {
   useEffect(load, [filters.procedure, filters.status, filters.search]);
 
   if (selected) {
+    const reopen = () => api.run(selected.id).then((data) => data.run
+      && setSelectedState({ ...data.run, sample_count: data.sample_count }))
+      .catch(() => {});
     return html`<${RunDetail} run=${selected} onClose=${() => setSelected(null)}
-                              onChanged=${() => { load(); setSelected(null); }}
+                              onSaved=${(updated) => {
+                                load();
+                                if (updated) setSelectedState({ ...selected, ...updated });
+                              }}
+                              onDeleted=${() => { load(); setSelected(null); }}
+                              onReload=${() => { load(); reopen(); }}
                               notify=${notify} devices=${state?.devices} runs=${runs}
                               canEdit=${(state?.me?.rank ?? 3) >= 1}
-                              canDelete=${state?.me?.can?.admin !== false} />`;
+                              canDelete=${state?.me?.can?.admin !== false}
+                              canAdmin=${!!state?.me?.can?.admin} />`;
   }
 
   const procedures = [...new Set(runs.map((r) => r.procedure))];
@@ -251,7 +335,7 @@ export function HistoryView({ notify, state }) {
                     onChange=${(e) => setFilters({ ...filters, status: e.target.value })}>
               <option value="">all</option>
               <option value="completed">completed</option>
-              <option value="aborted">aborted</option>
+              <option value="aborted">aborted or stopped</option>
               <option value="failed">failed</option>
               <option value="running">running</option>
             </select>
@@ -284,8 +368,7 @@ export function HistoryView({ notify, state }) {
                       <td>${fmt.dateTime(run.started_at)}</td>
                       <td class="wrap-cell">${run.name}</td>
                       <td>${fmt.titleCase(run.procedure)}</td>
-                      <td><${Pill} tone=${STATUS_TONE[run.status] || "idle"}>
-                          ${run.status}<//></td>
+                      <td><${StatusPill} run=${run} /></td>
                       <td class="num">${fmt.duration(run.duration)}</td>
                       <td class="num">${headline(run)}</td>
                       <td>${run.operator || "—"}<${Account} run=${run} /></td>

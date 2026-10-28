@@ -643,6 +643,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--chamber-id", default="chamber-1")
     p.add_argument("--keep", default=",".join(map(str, DEFAULT_KEEP)),
                    help="daily,weekly,monthly backups to keep (14,8,12)")
+    p.add_argument("--no-status", action="store_true",
+                   help="do not record this backup in backup-status.json: a "
+                        "copy kept before an install, on the same disk, is not "
+                        "the lab's backup, and must not quiet the panel's alarm "
+                        "about that one")
 
     p = sub.add_parser("verify", help="check every backup in a folder")
     p.add_argument("folder")
@@ -704,7 +709,8 @@ def _make(args) -> int:
     print(f"Backing up {db}")
     record = make(db, dests, args.chamber_id, keep)
     try:
-        write_status(db, record)
+        if not args.no_status:
+            write_status(db, record)
     except OSError as exc:
         print(f"backup: could not record the status beside {db}: {exc}",
               file=sys.stderr)

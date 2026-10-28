@@ -1,5 +1,6 @@
 // Accounts, where the panel points, how often it polls, what is on the rig,
-// and what the server is running.
+// and what the server is running -- one sub-tab each, so nobody scrolls past
+// the port survey to change the theme.
 //
 // What changes the rig's set-up -- equipment, ports, the port search -- is an
 // admin's (lab/api.py POST_RULES); for everyone else those controls are
@@ -8,7 +9,7 @@
 import { html } from "../html.js";
 import { useEffect, useState } from "preact/hooks";
 import { Banner, Card, Confirm, Empty, Pairs, Pill } from "../ui.js";
-import { api, normaliseHost, settings, updateSettings } from "../api.js";
+import { POLL_MAX_MS, api, normaliseHost, settings, updateSettings } from "../api.js";
 import { MyAccount, People, Tablets } from "./people.js";
 import { beep } from "../alarms.js";
 import * as fmt from "../format.js";
@@ -314,7 +315,137 @@ function PortPicker({ devices, notify, onChanged, admin = true }) {
     <//>`;
 }
 
-export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
+
+/**
+ * Which version runs, and a newer one the updater on the lab PC has found
+ * (tools/autoupdate.py). It looks on GitHub every 15 minutes, accepts only a
+ * version signed with a key trusted on that machine, runs its selftest there
+ * while the rig is idle, and says so here. An admin installs it: the panel
+ * restarts, and goes back to the version before by itself if the new one
+ * does not come up healthy.
+ */
+function SoftwareVersion({ state, notify, admin = false }) {
+  const [asking, setAsking] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState("");
+  const update = state?.update;
+  const latest = update?.latest;
+  const running = update?.running;
+  const install = update?.install;
+  const control = state?.control;
+  const controlFree = !control?.enabled || !control.held || control.mine;
+  const ready = latest?.state === "ready";
+  const versionOf = (v) => v?.tag ? `${v.tag} (${v.release})` : v?.release || state?.release || "—";
+
+  const send = async () => {
+    setSending(true);
+    setError("");
+    try {
+      const result = await api.installUpdate(latest.release);
+      if (!result.ok) throw new Error(result.error);
+      setAsking(false);
+      notify(`Installing ${result.tag}: the panel restarts in a moment.`, "ok");
+    } catch (failure) {
+      setError(failure.message);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  if (!update) {
+    return html`
+      <${Card} title="Software version">
+        <${Pairs} items=${[["Running", state?.release || "—"]]} />
+        <p class="hint">This machine has no updater (tools/autoupdate.py): new versions
+          are deployed from a laptop with tools/release.py.</p>
+      <//>`;
+  }
+  const outcome = install && !update.pending && {
+    started: ["warn", `An install of ${install.tag} began at ${fmt.dateTime(install.at)} and has not said how it went. On the lab PC: journalctl -u vacuum-lab-install`],
+    installed: ["good", `Installed ${install.tag} at ${fmt.dateTime(install.at)}, asked for by ${install.name}.`],
+    refused: ["warn", `Installing ${install.tag} did not go ahead (${fmt.dateTime(install.at)}): ${install.detail}`],
+    rolled_back: ["crit", `${install.tag} was installed and went back by itself (${fmt.dateTime(install.at)}): ${install.detail}`],
+    failed: ["crit", `Installing ${install.tag} failed (${fmt.dateTime(install.at)}): ${install.detail}`],
+  }[install.state];
+
+  return html`
+    <div data-test="update-card"><${Card} title="Software version"
+      hint="New versions come from GitHub, signed by the lab. This machine looks every 15 minutes, checks the signature and the files, and runs the selftest on the new version while the rig is idle. Only an admin installs it: the panel restarts, and goes back to the version before by itself if the new one does not come up healthy.">
+      <${Pairs} items=${[
+        ["Running", versionOf(running)],
+        ["Last looked", update.checked_at ? fmt.dateTime(update.checked_at) : "not yet"],
+      ]} />
+      ${update.check_error && html`
+        <${Banner} tone="warn">Could not ask GitHub: ${update.check_error}. It tries again
+          in 15 minutes.<//>`}
+      ${update.problem && html`<${Banner} tone="crit">${update.problem}<//>`}
+      ${outcome && html`<${Banner} tone=${outcome[0]}>${outcome[1]}<//>`}
+      ${!latest && !update.check_error && update.checked_at && html`
+        <p class="small">This is the newest version.</p>`}
+      ${latest && html`
+        <div class="grid" style="gap:8px">
+          <div class="row">
+            <strong>${latest.title || `Version ${latest.tag}`}</strong>
+            <${Pill} tone=${ready ? "good" : latest.state === "refused" ? "crit" : "accent"}>
+              ${{ ready: "ready to install", waiting: "waiting to be tested",
+                  testing: "being tested", refused: "refused" }[latest.state] || latest.state}<//>
+          </div>
+          <p class="small">${ready
+            ? `Signed by ${latest.signed_by}, tagged ${fmt.dateTime(latest.tagged_at)}; the selftest passed here at ${fmt.dateTime(latest.tested_at)}.`
+            : latest.detail}</p>
+          ${latest.older_than_running && html`
+            <${Banner} tone="warn">The panel runs a release deployed by hand after this
+              version was made: installing it may go back in time.<//>`}
+          ${latest.notes && html`<p class="small" style="white-space:pre-wrap">${latest.notes}</p>`}
+          ${ready && html`
+            <div class="row">
+              <button class="primary" data-test="update-install"
+                      disabled=${!admin || !controlFree || !!update.pending}
+                      title=${!admin ? "Installing a version is an admin's"
+                              : !controlFree ? `${control.holder} has control of the rig` : ""}
+                      onClick=${() => { setError(""); setAsking(true); }}>
+                Install ${latest.tag}…</button>
+              ${!admin && html`<span class="small muted">An admin installs it.</span>`}
+              ${admin && !controlFree && html`<span class="small muted">${control.holder} has
+                control of the rig: take control first.</span>`}
+            </div>`}
+        </div>`}
+      ${(update.refused || []).length > 0 && html`
+        <details>
+          <summary class="small">Versions not installed (${update.refused.length})</summary>
+          <ul class="small">${update.refused.map((r) => html`
+            <li key=${r.tag}><span class="mono">${r.tag}</span>: ${r.reason}</li>`)}</ul>
+        </details>`}
+      <${Confirm} open=${asking} title=${`Install version ${latest?.tag}?`}
+        confirmLabel="Install and restart" busy=${sending} error=${error}
+        onCancel=${() => setAsking(false)} onConfirm=${send}
+        body=${html`
+          <p>The panel restarts to run ${latest?.tag}. For about a minute nothing watches
+            the rig: the pump and the gauge keep doing what they were told, but no
+            interlock, alarm, recording or automatic recovery runs. Every open screen
+            reloads once it is back.</p>
+          <p>From now until then, new runs and power-downs are refused. A backup of the
+            database is made first. If the new version is not running healthy within a
+            minute, the panel goes back to ${versionOf(running)} by itself.</p>`} />
+    <//></div>`;
+}
+
+/** The sub-tabs this person sees, in order. */
+function settingsTabs(me, connected = true) {
+  // Before the panel has ever answered, only this screen's own settings --
+  // where it points -- mean anything.
+  if (!connected) return [{ key: "screen", label: "This screen" }];
+  return [
+    me?.kind === "person" && { key: "account", label: "My account" },
+    me?.kind === "person" && me?.can?.admin && { key: "people", label: "People" },
+    { key: "rig", label: "Rig" },
+    { key: "screen", label: "This screen" },
+    { key: "server", label: "Server" },
+  ].filter(Boolean);
+}
+
+export function SettingsView({ state, onSettingsChanged, notify, onSignOut, sub = "",
+                               onSelect = () => {} }) {
   const current = settings();
   const [draft, setDraft] = useState({ ...current });
   const [stats, setStats] = useState(null);
@@ -328,7 +459,7 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
   const apply = () => {
     updateSettings({
       host: draft.host.trim(),
-      pollMs: Math.max(500, Number(draft.pollMs) || 2000),
+      pollMs: Math.min(POLL_MAX_MS, Math.max(500, Number(draft.pollMs) || 2000)),
       theme: draft.theme,
       alarmSound: draft.alarmSound !== false,
     });
@@ -339,15 +470,34 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
   const devices = state?.devices || {};
   const me = state?.me;
   const admin = !!me?.can?.admin;
+  const tabs = settingsTabs(me, !!state);
+  const active = tabs.find((tab) => tab.key === sub) || tabs[0];
+  const page = active.key;
 
   return html`
     <div class="grid" style="gap:16px">
-      <${MyAccount} me=${me} notify=${notify} onSignOut=${onSignOut}
-                    onChanged=${onSettingsChanged} />
-      <${People} me=${me} notify=${notify} />
-      <${Tablets} me=${me} notify=${notify} />
+      <nav class="tabs subtabs" aria-label="Settings">
+        ${tabs.map((tab) => html`
+          <button key=${tab.key} aria-current=${tab.key === page ? "page" : null}
+                  data-test=${`subtab-${tab.key}`} onClick=${() => onSelect(tab.key)}>
+            ${tab.label}
+            ${tab.key === "people" && me?.waiting > 0
+              ? html`<span class="badge pill warn">${me.waiting}<span class="sr-only"> waiting</span></span>`
+              : null}
+            ${tab.key === "server" && admin && state?.update?.latest?.state === "ready"
+              ? html`<span class="badge pill good">new<span class="sr-only"> version ready</span></span>`
+              : null}
+          </button>`)}
+      </nav>
 
-      <${Card} title="Connection"
+      ${page === "account" && html`
+        <${MyAccount} me=${me} notify=${notify} onSignOut=${onSignOut}
+                      onChanged=${onSettingsChanged} />`}
+      ${page === "people" && html`
+        <${People} me=${me} notify=${notify} />
+        <${Tablets} me=${me} notify=${notify} />`}
+
+      ${page === "screen" && html`<${Card} title="Connection"
                hint="Leave the address empty when this page is served by the lab PC itself. To drive that machine from a page served elsewhere, fill it in — and start that server with --allow-origin naming this page's origin, or it refuses the requests.">
         <label class="field">
           <span>Controller address</span>
@@ -363,10 +513,12 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
           <label class="field">
             <span>Poll interval</span>
             <span class="suffix">
-              <input type="number" min="500" step="500" value=${draft.pollMs}
+              <input type="number" min="500" max=${POLL_MAX_MS} step="500" value=${draft.pollMs}
                      onInput=${(e) => setDraft({ ...draft, pollMs: e.target.value })} />
               <span class="unit">ms</span>
             </span>
+            <span class="help">0.5 to 10 s. Holding control needs a poll at least
+              every 15 s.</span>
           </label>
           <label class="field">
             <span>Theme</span>
@@ -395,8 +547,9 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
           <button class="primary" onClick=${apply}>Save</button>
           <span class="small muted">Stored in this browser only.</span>
         </div>
-      <//>
+      <//>`}
 
+      ${page === "rig" && html`
       <${RigEquipment} state=${state} notify=${notify} admin=${admin} />
 
       <${AutoPorts} state=${state} notify=${notify} admin=${admin} />
@@ -431,8 +584,10 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
                 </tbody>
               </table>
             </div>`}
-      <//>
+      <//>`}
 
+      ${page === "server" && html`
+      <${SoftwareVersion} state=${state} notify=${notify} admin=${admin} />
       <div class="grid two">
         <${Card} title="Server">
           <${Pairs} items=${[
@@ -466,7 +621,7 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut }) {
               ${stats.stats.path && html`<div class="small muted mono">${stats.stats.path}</div>`}`
             : html`<${Empty}>Not available.<//>`}
         <//>
-      </div>
+      </div>`}
     </div>`;
 }
 

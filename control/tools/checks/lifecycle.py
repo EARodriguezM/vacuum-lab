@@ -270,7 +270,8 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
             up = wait_until(lambda: _try(lambda: call("/api/state")["devices"]
                                          ["pump"]["connected"]), 30, 0.3)
             started = _try(lambda: call("/api/run/start",
-                                        {"procedure": "bakeout", "config": {}}))
+                                        {"procedure": "bakeout", "config": {},
+                                         "confirm": True}))
             heating = wait_until(lambda: _try(lambda: call("/api/state")
                                               ["devices"]["pump"]["status"]
                                               .get("Heating") is True), 20, 0.3)
@@ -1244,6 +1245,12 @@ def test_lifecycle(pump_port: str, gauge_port: str) -> None:
 
             def stop_choice(self):
                 return None
+
+            def leave_by_hand(self, steps):
+                # Bookkeeping only: what is left for a person to confirm.
+                # Every actuator here is driven, so a replay leaves nothing.
+                asked.extend((f"by hand {step['actuator']}", step.get("value"))
+                             for step in steps)
 
             def __getattr__(self, name):
                 raise AttributeError(f"the clean-up used engine.{name}")

@@ -49,7 +49,8 @@ sys.path.insert(0, ROOT)
 SECTIONS = ("pump", "gauge", "cold_cathode", "analysis", "process", "equipment",
             "deposition", "database", "accounts", "history", "engine", "faults",
             "timing", "lifecycle", "authority", "security", "addresses",
-            "discovery", "chambers", "observability", "backup", "release")
+            "discovery", "chambers", "observability", "backup", "release",
+            "update")
 
 #: Where a section's code lives, and how it is called: (module, function,
 #: which simulator ports it takes).
@@ -76,6 +77,7 @@ WHERE = {
     "observability": ("observability", "test_observability", ()),
     "backup": ("backup", "test_backup", ()),
     "release": ("release", "test_release", ()),
+    "update": ("update", "test_update", ()),
 }
 
 #: Module names whose constants a section may change and must not keep.

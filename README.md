@@ -94,8 +94,8 @@ no Node toolchain.
 * **`lab/`** — the application: one service per instrument and actuator,
   the interlocks, the run engine and its recipes, the alarm supervisor, the
   SQLite store, accounts and the HTTP API.
-* **`web/`** — the panel: Dashboard, Overview, Equipment, Process, History
-  and Settings, responsive from a phone to a wall monitor, light and dark.
+* **`web/`** — the panel: Dashboard, Equipment, Process, History and
+  Settings, responsive from a phone to a wall monitor, light and dark.
 * **`tools/`** — simulators of both instruments and of the whole rig, the
   self test and the browser test, backups, releases and the morning report.
 * **`deploy/`** — the systemd units and udev rules for the lab PC.

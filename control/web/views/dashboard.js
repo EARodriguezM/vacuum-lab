@@ -19,7 +19,10 @@
 //     activity feed, with every run one click from its record.
 //
 // The rules the first version set still hold: bigger type than the rest of
-// the panel, every colour paired with a word, one measure per chart.
+// the panel, every colour paired with a word, one measure per chart. It is
+// also the landing page -- the Overview it replaced redirects here -- and on
+// the kiosk's 1024×600 screen the guide and the four figures sit side by
+// side, so nothing that matters is below the fold.
 
 import { html } from "../html.js";
 import { useEffect, useMemo, useState } from "preact/hooks";
@@ -177,12 +180,17 @@ function nextStep(run, config, samples, pump) {
   const inPhase = run.in_phase_s || 0;
   const limits = pumpLimits(pump);
   const pressure = [...samples].reverse().find((s) => finite(s.p_best))?.p_best;
-  const timed = (minutes, ending) => {
-    const total = (Number(minutes) || 0) * 60;
-    const left = Math.max(0, total - inPhase);
-    return { text: `${ending} in ${countdown(left)}`, progress: total ? inPhase / total : null,
-             countdown: left };
-  };
+  // The engine's own process timer, which starts when the step took effect
+  // -- the plasma struck, the shutter opened -- not when the phase began.
+  const timer = run.timer;
+  if (timer) {
+    if (!finite(timer.elapsed_s)) {
+      return { text: `${timer.label} ${countdown(timer.total_s)} after the step above is confirmed.` };
+    }
+    const left = Math.max(0, timer.total_s - timer.elapsed_s);
+    return { text: `${timer.label} in ${countdown(left)}`,
+             progress: timer.total_s ? timer.elapsed_s / timer.total_s : null, countdown: left };
+  }
   switch (phase) {
     case "rough": {
       const limit = pump?.interlocks?.motor_on?.limit_mbar ?? 0.8;
@@ -218,13 +226,11 @@ function nextStep(run, config, samples, pump) {
         + `; it settles for ${fmt.number(Number(config.settle_min) || 2, 1)} min inside ½× to 2× before the plasma strikes.` };
     }
     case "presputter":
-      return timed(config.presputter_min, "The shutter opens");
     case "deposit":
-      return timed(config.deposit_min, "Deposition ends");
     case "recover":
-      return timed(1, "Recovery ends");
+      return { text: "Waiting for the step above to be confirmed." };
     case "holding":
-      return { text: `Holding for ${fmt.duration(inPhase)}. Stop the run from the Process tab when you are done.` };
+      return { text: `Holding for ${fmt.duration(inPhase)}, until somebody stops the run.` };
     default:
       return { text: `${fmt.phaseLabel(phase)} for ${fmt.duration(inPhase)}.` };
   }
@@ -252,7 +258,7 @@ function idleStage(pump, gaugeState, pressure, rate) {
   if (sp.MotorPump !== true) {
     if (speed > 0) return { stage: "recover", text: `The turbopump is coasting down (${fmt.integer(speed)} Hz), backed by the forevacuum pump.` };
     if (finite(pressure) && pressure <= limit) {
-      return { stage: "crossover", text: `Roughed to ${fmt.pressure(pressure, 2)} mbar: the turbopump may be started (Pump tab), or a recipe can take over.` };
+      return { stage: "crossover", text: `Roughed to ${fmt.pressure(pressure, 2)} mbar: the turbopump may be started (Equipment → Pump), or a recipe can take over.` };
     }
     if (finite(rate) && rate < -0.5) {
       return { stage: "rough", text: "The backing pump is roughing the chamber; the turbopump is off." };
@@ -267,7 +273,7 @@ function idleStage(pump, gaugeState, pressure, rate) {
   return { stage: "spinup", text: `The turbopump is spinning up (${fmt.integer(speed)} Hz).` };
 }
 
-function Guide({ state, samples, config, explain }) {
+function Guide({ state, samples, config, explain, onStop, stopBusy, may }) {
   const run = state?.run;
   const pump = state?.devices?.pump;
   const gaugeState = status.gaugeSummary(state?.devices?.gauge);
@@ -286,6 +292,10 @@ function Guide({ state, samples, config, explain }) {
           <div class="guide-time">
             <span class="num">${fmt.duration(run.elapsed_s)}</span>
             <span class="muted small">elapsed · started ${fmt.clock(run.run?.started_at)}</span>
+            ${onStop && html`
+              <button class="danger small" data-test="dash-stop" disabled=${stopBusy}
+                      onClick=${onStop}>${run.stopping ? "Stopping…"
+                        : may === "signin" ? "Sign in to stop" : "Stop run"}</button>`}
           </div>
         </div>
         <${Stepper} phases=${phases} current=${run.phase} title="Run phases" />
@@ -302,11 +312,6 @@ function Guide({ state, samples, config, explain }) {
               <div class="bar big"><span style=${`width:${Math.min(100, next.progress * 100).toFixed(1)}%`} /></div>`}
           </div>
         </div>
-        ${run.prompt && html`
-          <div class="guide-prompt" role="alert">
-            <strong>Your turn:</strong> ${run.prompt.instruction}
-            <a class="btn small" href="#tests">Open the Process tab to confirm</a>
-          </div>`}
       </section>`;
   }
 
@@ -314,6 +319,8 @@ function Guide({ state, samples, config, explain }) {
   const where = idleStage(pump, gaugeState, pressure, A.latestRate(samples));
   const depositionOff = state?.unavailable?.deposition;
   const recent = last && last.ended_at && (state?.server_time || Date.now() / 1000) - last.ended_at < 12 * 3600;
+  const lastSaid = last && fmt.runStatus({ status: last.status,
+                                           result: { stopped: last.by_operator, message: last.message } });
   return html`
     <section class="guide card">
       <div class="guide-head">
@@ -323,8 +330,8 @@ function Guide({ state, samples, config, explain }) {
         </div>
       </div>
       ${recent && html`
-        <div class=${`guide-last ${last.status === "completed" ? "good" : last.status === "failed" ? "crit" : "warn"}`}>
-          <strong>Last run ${last.status}</strong> at ${fmt.clock(last.ended_at)}: ${last.name || last.label}.
+        <div class=${`guide-last ${lastSaid === "completed" ? "good" : lastSaid === "failed" ? "crit" : lastSaid === "stopped" ? "idle" : "warn"}`}>
+          <strong>Last run ${lastSaid}</strong> at ${fmt.clock(last.ended_at)}: ${last.name || last.label}.
           ${last.message && html`<span class="muted"> ${last.message}</span>`}
           <a href=${`#history/${last.id}`}>Open its record</a>
         </div>`}
@@ -334,7 +341,7 @@ function Guide({ state, samples, config, explain }) {
       ${depositionOff && html`
         <p class="guide-off">From argon backfill on, the route needs hardware that is not on
           the rig yet — ${depositionOff.map((name) => name.toLowerCase()).join(", ")} — so deposition
-          is switched off. Pumping to base pressure works today. <a href="#settings">Rig equipment</a></p>`}
+          is switched off. Pumping to base pressure works today. <a href="#settings/rig">Rig equipment</a></p>`}
       ${explain && html`<p class="explain">Each step needs the one before it: the turbopump
         cannot start until the backing pump has roughed the chamber, and a plasma needs argon
         at the working pressure. A recipe walks the rig through them and checks every limit on
@@ -540,9 +547,33 @@ function Health({ state, samples, calibration }) {
     </ul>`;
 }
 
-const ACTIVITY = /run (completed|aborted|failed)|alarm|turbopump started|power-down|made safe|recovery|shutter open|plasma on|operator|found on another port/i;
+const ACTIVITY = /run (completed|aborted|failed)|alarm|turbopump started|power-down|made safe|recovery|shutter (open|closed)|plasma on|operator|confirmed|by hand|found on another port/i;
 
-function Activity({ events, recent }) {
+/** Every alarm the supervisor has raised since the server started. */
+function AlarmLog({ alarms }) {
+  const recent = alarms?.recent || [];
+  if (!recent.length) {
+    return html`<p class="small muted">No alarms since the server started.</p>`;
+  }
+  return html`
+    <details class="alarm-log-box">
+      <summary>Alarm log — ${recent.length} since the server started · automatic
+        recovery ${alarms?.auto_recover ? "on" : "off"}</summary>
+      <div class="alarm-log">
+        ${recent.map((alarm) => html`
+          <div class="entry" key=${alarm.id}>
+            <span class="mono small muted">${fmt.clock(alarm.raised_at)}</span>
+            <${Pill} tone=${alarm.level === "critical" ? "crit" : "warn"}>
+              ${alarm.active ? alarm.level : "cleared"}<//>
+            <span><strong>${alarm.title}</strong>
+              ${alarm.acknowledged ? html` <span class="small muted">· acknowledged</span>` : null}
+              <div class="small muted">${alarm.detail}</div></span>
+          </div>`)}
+      </div>
+    </details>`;
+}
+
+function Activity({ events, recent, alarms }) {
   // One line per happening: an abort is logged by the run as an error and
   // again as its outcome, and the supervisor raises an alarm for it too --
   // "Run 9 aborted: <recipe>. <reason>" against "Run aborted: <reason>".
@@ -571,6 +602,7 @@ function Activity({ events, recent }) {
               </li>`)}
           </ul>`
         : html`<${Empty}>Nothing has happened yet today.<//>`}
+      <${AlarmLog} alarms=${alarms} />
       ${recent.length > 0 && html`
         <div class="scroll-x">
           <table class="runs-mini">
@@ -581,8 +613,7 @@ function Activity({ events, recent }) {
                   <td class="num">${r.id}</td>
                   <td>${fmt.dateTime(r.started_at)}</td>
                   <td>${fmt.titleCase(r.procedure)}</td>
-                  <td><${Pill} tone=${r.status === "completed" ? "good" : r.status === "running" ? "accent"
-                    : r.status === "failed" ? "crit" : "warn"}>${r.status}<//></td>
+                  <td><${Pill} tone=${fmt.STATUS_TONE[fmt.runStatus(r)] || "idle"}>${fmt.runStatus(r)}<//></td>
                   <td class="num">${headline(r)}</td>
                 </tr>`)}
             </tbody>
@@ -593,11 +624,14 @@ function Activity({ events, recent }) {
 
 // --- the view ---------------------------------------------------------------------
 
-export function DashboardView({ state, live }) {
+export function DashboardView({ state, live, kiosk = false, onStop = null, stopBusy = false,
+                               may = "yes" }) {
   const [recent, setRecent] = useState([]);
   const [calibration, setCalibration] = useState(null);
   const [events, setEvents] = useState([]);
-  const [explain, setExplain] = useStored("vacuum-lab-explain", true);
+  // Off by default on a kiosk: the wall screen is 600 px tall, and its
+  // readers have seen the explanations before. Anyone may switch them on.
+  const [explain, setExplain] = useStored("vacuum-lab-explain", !kiosk);
   const [windowS, setWindowS] = useStored("vacuum-lab-dash-window", 3600);
   const [wall, setWall] = useState(false);
   const procedures = useCatalogue();
@@ -747,7 +781,9 @@ export function DashboardView({ state, live }) {
         </div>
       </div>
 
-      <${Guide} state=${state} samples=${samples} config=${config} explain=${explain} />
+      <div class="dash-top">
+      <${Guide} state=${state} samples=${samples} config=${config} explain=${explain}
+                onStop=${onStop} stopBusy=${stopBusy} may=${may} />
 
       <div class="dash-grid four">
         <${Panel} title="Chamber pressure" tone=${regimeTone(pressure)}
@@ -825,12 +861,13 @@ export function DashboardView({ state, live }) {
             <dt>Gate valve</dt><dd class="num">${shown(gate)}</dd>
           </dl>
           <div class="stat-foot">${notInstalled
-            ? html`${notInstalled === actuators.length ? "Not on the rig yet" : `${notInstalled} not installed`} — deposition is switched off. <a href="#settings">Rig equipment</a>`
+            ? html`${notInstalled === actuators.length ? "Not on the rig yet" : `${notInstalled} not installed`} — deposition is switched off. <a href="#settings/rig">Rig equipment</a>`
             : manualCount ? `${manualCount} manual — a guided run asks you to do them`
             : "all under software control"}</div>
           <${Explain} on=${explain}>Argon is let in, the magnetron strikes a plasma that
             sputters the target, and the shutter decides whether the sample is being coated.<//>
         <//>
+      </div>
       </div>
 
       <${Panel} title="Where the chamber is" wide=${true}
@@ -857,7 +894,7 @@ export function DashboardView({ state, live }) {
           <${Health} state=${state} samples=${history.samples} calibration=${calibration} />
         <//>
         <${Panel} title="Recent activity">
-          <${Activity} events=${events} recent=${recent} />
+          <${Activity} events=${events} recent=${recent} alarms=${state?.alarms} />
         <//>
       </div>
     </div>`;

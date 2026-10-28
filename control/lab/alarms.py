@@ -118,6 +118,10 @@ class Supervisor:
     BACKUP_MAX_AGE_S = 48 * 3600.0
     #: A chart recorder silent this long has stopped.
     RECORDER_STALL_S = 30.0
+    #: A guided step waiting this long for a person becomes a critical alarm
+    #: (the user's decision, 2026-10-16): its chime may go unheard, and a
+    #: deposition waiting with the plasma on must not wait unnoticed.
+    PROMPT_ALARM_S = 600.0
     #: How often `on_tick` (the status file) is called, at most.
     TICK_HOOK_S = 5.0
 
@@ -181,6 +185,8 @@ class Supervisor:
         self._moves_seen: dict[str, float] = {}
         self._orphans_seen: dict[str, str] = {}
         self._storage_seen = None
+        #: The guided step waiting now, and since when (monotonic), by its id.
+        self._prompt_seen: tuple | None = None
         #: The current or last automatic recovery, for the panel.
         self.recovering: dict | None = None
         #: What the last panel left: its heartbeat, read once, announced at
@@ -438,6 +444,40 @@ class Supervisor:
         else:
             self.clear("backup")
 
+    def _watch_prompt(self) -> None:
+        """A guided run waiting on a person for too long: an alarm, cleared
+        once the step is confirmed or the run ends. Timed from when this
+        supervisor first saw the step, on the monotonic clock."""
+        prompt_of = getattr(self.engine, "prompt", None)
+        prompt = prompt_of() if prompt_of else None
+        seen = self._prompt_seen
+        current = prompt.get("id") if prompt else None
+        if seen is not None and seen[0] != current:
+            key = f"prompt_{seen[0]}"
+            self.clear(key)
+            # Done is the answer to its own waiting alarm: acknowledged too,
+            # under whoever pressed it, so it does not go on sounding. A run
+            # that ended instead leaves it for somebody to acknowledge.
+            done = getattr(self.engine, "last_confirmed", None)
+            if isinstance(done, dict) and done.get("id") == seen[0]:
+                for alarm in self.describe()["alarms"]:
+                    if alarm["key"] == key:
+                        self.acknowledge(alarm["id"], user=done.get("user"))
+            self._prompt_seen = seen = None
+        if current is None:
+            return
+        if seen is None:
+            self._prompt_seen = seen = (current, time.monotonic())
+        waited = time.monotonic() - seen[1]
+        if waited >= self.PROMPT_ALARM_S:
+            self.raise_alarm(
+                f"prompt_{current}", "critical",
+                f"A guided step has waited {waited / 60:.0f} min: "
+                f"{prompt.get('label') or 'a manual step'}",
+                f"The run is waiting for somebody to do this by hand: "
+                f"{prompt.get('instruction') or '(no instruction)'} Its checks "
+                f"keep running. Do the step and press Done, or stop the run.")
+
     def _watch_recorder(self) -> None:
         age = self.recorder.beat_age() if self.recorder is not None and \
             hasattr(self.recorder, "beat_age") else None
@@ -578,6 +618,7 @@ class Supervisor:
         self._watch_recorder()
         if gauge and gsnap and gsnap.get("connected"):
             self._watch_pressure(gauge, gsnap, psnap)
+        self._watch_prompt()
 
     def _watch_link(self, key: str, snap: dict | None, label: str,
                     service=None) -> None:
@@ -746,7 +787,7 @@ class Supervisor:
                        "be turning — a coasting rotor needs backing"
                        if still is None else "")
                     + ". If nobody meant to, switch the station back on from "
-                      "the Pump page.")
+                      "Equipment → Pump.")
         if self._station.value is True:
             self.clear("station_off")
 
@@ -870,7 +911,7 @@ class Supervisor:
                 f"The drive faulted {len(self._recoveries) + 1} times in "
                 f"{self.RETRY_WINDOW_S / 60:.0f} min, so the fault is not "
                 f"transient. It is left latched for a person to look at: find "
-                f"the cause, then use Make safe on the Pump page.")
+                f"the cause, then use Make safe under Equipment → Pump.")
             return
         self._recoveries.append(now)
         # Keep the backing pump only if it was running before the fault: a
@@ -923,7 +964,7 @@ class Supervisor:
                 "Automatic recovery ran without its own thread",
                 f"The panel could not start a thread ({exc}): too many "
                 f"connections or threads at once. The pump is being made safe "
-                f"anyway; check the Pump page, and who is connecting to the "
+                f"anyway; check Equipment → Pump, and who is connecting to the "
                 f"panel.")
             self._recovery_thread = None
             work()
@@ -940,6 +981,12 @@ class Supervisor:
                     orphan["id"] > (self._last_run_seen or 0):
                 continue                      # its run's own alarm comes first
             self._orphans_seen[key] = orphan.get("state")
+            if orphan.get("kind") == "checked":
+                # An admin dealt with it by hand: nothing is owed any more.
+                # The alarms stay on screen until acknowledged, cleared.
+                for suffix in ("cut_off", "cleanup_failed", "retry_failed"):
+                    self.clear(f"run_{orphan['id']}_{suffix}")
+                continue
             check = {
                 "deposition": " Check by eye that the argon is shut, the "
                               "magnetron supply is off and the shutter is "
@@ -984,12 +1031,17 @@ class Supervisor:
                     f"{check}")
                 continue
             if orphan.get("kind") == "restart":
+                by_hand = [step.rstrip(".") for step in orphan.get("by_hand") or []
+                           if isinstance(step, str)]
                 self.raise_alarm(
-                    key, "warning",
+                    key, "critical" if by_hand else "warning",
                     f"Run {orphan['id']} was ended by a restart of the panel: "
                     f"{orphan.get('label')}",
                     f"{orphan.get('state')[:1].upper()}{orphan.get('state')[1:]}."
-                    f"{check}")
+                    + (f" It left these to do by hand, still not confirmed: "
+                       f"{'; '.join(by_hand)}. They are at the top of every "
+                       f"page, and no run starts until each is confirmed."
+                       if by_hand else check))
                 continue
             self.raise_alarm(
                 key, "critical",
@@ -1059,14 +1111,21 @@ class Supervisor:
                    "The panel tries it again at its next start."))
         if last.get("status") == "completed" or last.get("by_operator"):
             return
+        checklist = getattr(self.engine, "checklist", None)
+        by_hand = [step["instruction"].rstrip(".")
+                   for step in (checklist() if checklist else [])]
         self.raise_alarm(
             f"run_{last.get('id')}",
-            "critical" if last.get("status") == "failed" else "warning",
+            "critical" if last.get("status") == "failed" or by_hand
+            else "warning",
             f"Run {last.get('id')} {last.get('status')}: {last.get('label')}",
             (last.get("message") or "").rstrip(". ")
             + (". The turbopump motor has been switched off and the forevacuum "
                "pump kept running." if last.get("pump_trouble") else
-               ". The pump has been left running."))
+               ". The pump has been left running.")
+            + (" Check by eye -- the panel cannot see what is worked by hand: "
+               + "; ".join(by_hand) + ". Each is listed at the top of every "
+               "page until somebody confirms it." if by_hand else ""))
 
     def _watch_pressure(self, gauge, gsnap: dict, psnap: dict | None) -> None:
         now = time.monotonic()
