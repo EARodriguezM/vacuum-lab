@@ -22,7 +22,8 @@ import { html } from "./html.js";
 import { render } from "preact";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { AuthError, api, onAuthProblem, onSessionChange, pollParticipants,
-         sessionTokens, setPersonSession, settings, updateSettings } from "./api.js";
+         sessionTokens, setGuestSession, setPersonSession, settings,
+         updateSettings } from "./api.js";
 import { Banner, Choose, Confirm, Pill, Toasts, useDialog, useToasts } from "./ui.js";
 import { AlarmBar, useAlarmSignals } from "./alarms.js";
 import { ChecklistBar, PromptBar } from "./guided.js";
@@ -194,7 +195,7 @@ function OverrideDialog({ request, onCancel, onConfirm }) {
 
 /** Who holds control of the rig, and the one button that changes it. */
 function ControlChip({ control, me, onTake, onRelease, onTakeOver }) {
-  if (!control?.enabled || !me || me.kind === "device") return null;
+  if (!control?.enabled || !me || me.kind === "device" || me.kind === "guest") return null;
   if (control.held && control.mine) {
     return html`
       <span class="chip-group">
@@ -229,8 +230,9 @@ function ControlChip({ control, me, onTake, onRelease, onTakeOver }) {
   return null;
 }
 
-/** Who is looking: a person, a paired tablet, or nobody (accounts off). */
-function UserChip({ me, onSignIn, onSignOut, onAccount }) {
+/** Who is looking: a person, a paired tablet, a guest, or nobody (accounts
+ *  off). */
+function UserChip({ me, onSignIn, onSignOut, onAccount, onLeaveGuest }) {
   if (!me) return null;
   if (me.kind === "local") {
     return html`<${Pill} tone="crit"
@@ -242,6 +244,14 @@ function UserChip({ me, onSignIn, onSignOut, onAccount }) {
       <span class="chip-group">
         <span class="small muted">${me.name} · watching</span>
         <button class="small primary" onClick=${onSignIn}>Sign in</button>
+      </span>`;
+  }
+  if (me.kind === "guest") {
+    return html`
+      <span class="chip-group">
+        <span class="small muted">Guest · watching</span>
+        <button class="small primary" data-test="guest-signin" onClick=${onLeaveGuest}>
+          Sign in</button>
       </span>`;
   }
   return html`
@@ -263,6 +273,14 @@ function WatchingNotice({ me, control, tab, onReauth, onTakeOver }) {
     if (tab === "dashboard") return null;
     return html`<${Banner}>This tablet only watches. A person signs in on it to
       act, and is signed out again after a quarter of an hour without a touch.<//>`;
+  }
+  if (me.kind === "guest") {
+    // On every page, the Dashboard too: a screen that never sounds an alarm
+    // must say so wherever somebody may be relying on it.
+    return html`<div data-test="guest-notice"><${Banner}>You are watching as a
+      guest: the rig live, its runs and its log. Nothing can be changed or
+      downloaded, and <strong>alarms are silent on this screen</strong>. To do
+      more, sign in with an account.<//></div>`;
   }
   if (me.role === "viewer") {
     return html`<${Banner}>You are a viewer here: everything is visible, nothing
@@ -370,6 +388,9 @@ function App() {
   const contactRef = useRef({ okAt: Date.now() / 1000, failures: 0 });
   // A safety action waiting for the password: it goes ahead once typed.
   const afterReauth = useRef(null);
+  // A guest whose session lapsed joins again by itself -- at most every
+  // 10 s, so a refusal ends at the sign-in page instead of a loop.
+  const rejoin = useRef({ at: 0, busy: false });
   // Whether the tab strip has more to the right than fits (phones).
   const tabsRef = useRef(null);
   const [tabsMore, setTabsMore] = useState(false);
@@ -413,6 +434,24 @@ function App() {
   useEffect(() => { api.ping().then(setPing).catch(() => {}); }, [held]);
 
   useEffect(() => onSessionChange((next, reason) => {
+    // A guest's session is in the server's memory only: a restart, or a page
+    // hidden for a couple of minutes, ends it. Join again while guests are
+    // still allowed; the sign-in page only if that is refused.
+    if (reason === "guest-ended") {
+      const now = Date.now();
+      if (!rejoin.current.busy && now - rejoin.current.at > 10000) {
+        rejoin.current = { at: now, busy: true };
+        api.guest()
+          .then((result) => setGuestSession(result.token))
+          .catch(() => {
+            setHeld({ ...sessionTokens() });
+            setNeedLogin(true);
+            setState(null);
+          })
+          .finally(() => { rejoin.current.busy = false; });
+        return;
+      }
+    }
     // A person's session ended under them -- whichever request found out
     // first -- on a browser that keeps watching as a paired tablet.
     if (reason === "ended" && next.device) {
@@ -441,6 +480,13 @@ function App() {
     try { await api.logout(); } catch { /* the session may already be gone */ }
     setPersonSession(null);
     if (message) notify(message, "ok");
+  }, []);
+
+  // A guest who wants to sign in stops watching first: the sign-in page then
+  // has every choice, "Watch as a guest" among them, to go back.
+  const leaveGuest = useCallback(async () => {
+    try { await api.logout(); } catch { /* it may already be gone */ }
+    setGuestSession(null);
   }, []);
 
   // A deliberate touch keeps a person's session able to act. Reported at
@@ -545,8 +591,18 @@ function App() {
           // The person's session is gone. A tablet falls back to watching
           // at once; with nothing to fall back to, the sign-in page.
           const tokens = sessionTokens();
-          if (tokens.person || tokens.device) {
+          if (tokens.person || tokens.device || tokens.guest) {
             schedule(0);
+          } else if (rejoin.current.busy) {
+            // A guest joining again: until that answers, nothing is new --
+            // counted like any poll without an answer, so a slow one greys
+            // the page out instead of leaving old numbers looking live.
+            const contact = contactRef.current;
+            contact.failures += 1;
+            if (contact.failures >= LOST_AFTER) {
+              setLost({ since: contact.okAt, failures: contact.failures, offline: false });
+            }
+            schedule(Math.max(500, settings().pollMs));
           } else {
             setNeedLogin(true);
             setState(null);
@@ -847,6 +903,8 @@ function App() {
   const [sounding, silenceSounds, silenceLost] = useAlarmSignals({
     alarms: state?.alarms, prompt: run?.prompt, checklist: run?.checklist,
     lost: kiosk && lost ? lost.since : null,
+    // A guest can answer nothing, nor silence it: its screen stays quiet.
+    mute: me?.kind === "guest",
   });
 
   // The guided power-down, reachable without a run to stop: switch the
@@ -984,6 +1042,7 @@ function App() {
                           onTakeOver=${() => setTakingOver(true)} />
           <${UserChip} me=${me} onSignIn=${() => setShowLogin(true)}
                        onSignOut=${() => signOut("Signed out.")}
+                       onLeaveGuest=${leaveGuest}
                        onAccount=${() => navigate("settings/account")} />
           <button class="ghost small" onClick=${cycleTheme}
                   title=${`Theme: ${theme}`}>

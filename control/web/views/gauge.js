@@ -331,8 +331,11 @@ export function GaugeView({ state, onCommand, busy }) {
 
   const reload = () => api.gaugeDetails("gauge").then(setDetails)
     .catch((error) => setDetails({ ok: false, error: error.message }));
+  // Not for a guest: reading these holds the gauge's serial line for
+  // seconds, and its pressure readings wait meanwhile (lab/api.py).
+  const guest = state?.me?.kind === "guest";
 
-  useEffect(() => { if (gauge?.connected) reload(); }, [gauge?.connected]);
+  useEffect(() => { if (gauge?.connected && !guest) reload(); }, [gauge?.connected, guest]);
 
   if (!gauge) return html`<${Empty}>No gauge is configured on this server.<//>`;
 

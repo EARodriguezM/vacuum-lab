@@ -95,7 +95,8 @@ function OwedCleanup({ run, canAdmin, notify, onChanged }) {
 }
 
 function RunDetail({ run, onClose, onSaved, onDeleted, onReload, notify, devices,
-                    runs, canEdit = true, canDelete = true, canAdmin = false }) {
+                    runs, canEdit = true, canDelete = true, canAdmin = false,
+                    canDownload = true }) {
   const [samples, setSamples] = useState([]);
   const [events, setEvents] = useState([]);
   // Who ran it is not here: it is the account that started the run.
@@ -151,8 +152,9 @@ function RunDetail({ run, onClose, onSaved, onDeleted, onReload, notify, devices
                `${run.operator ? ` · ${run.operator}` : ""}`}
         actions=${html`
           <${StatusPill} run=${run} />
-          <button onClick=${() => save(`/api/runs/${run.id}/export.csv`, notify)}>CSV</button>
-          <button onClick=${() => save(`/api/runs/${run.id}/export.json`, notify)}>JSON</button>
+          ${canDownload && html`
+            <button onClick=${() => save(`/api/runs/${run.id}/export.csv`, notify)}>CSV</button>
+            <button onClick=${() => save(`/api/runs/${run.id}/export.json`, notify)}>JSON</button>`}
           <button data-test="history-close" onClick=${onClose}>Close</button>`}>
         <${Pairs} items=${[
           ["Started", fmt.dateTime(run.started_at)],
@@ -225,6 +227,8 @@ function RunDetail({ run, onClose, onSaved, onDeleted, onReload, notify, devices
 }
 
 export function HistoryView({ notify, state }) {
+  // A guest watches: the server refuses its downloads, so none are offered.
+  const guest = state?.me?.kind === "guest";
   const [runs, setRuns] = useState([]);
   const [total, setTotal] = useState(0);
   const [stats, setStats] = useState(null);
@@ -269,7 +273,7 @@ export function HistoryView({ notify, state }) {
       .then((data) => { setRuns(data.runs || []); setTotal(data.total || 0); })
       .catch((error) => notify(error.message, "error"))
       .finally(() => setLoading(false));
-    api.stats().then(setStats).catch(() => {});
+    if (!guest) api.stats().then(setStats).catch(() => {});
   };
 
   useEffect(load, [filters.procedure, filters.status, filters.search]);
@@ -288,7 +292,8 @@ export function HistoryView({ notify, state }) {
                               notify=${notify} devices=${state?.devices} runs=${runs}
                               canEdit=${(state?.me?.rank ?? 3) >= 1}
                               canDelete=${state?.me?.can?.admin !== false}
-                              canAdmin=${!!state?.me?.can?.admin} />`;
+                              canAdmin=${!!state?.me?.can?.admin}
+                              canDownload=${!guest} />`;
   }
 
   const procedures = [...new Set(runs.map((r) => r.procedure))];
@@ -302,18 +307,18 @@ export function HistoryView({ notify, state }) {
             `${fmt.bytes(stats.stats.bytes)}` +
             (stats.stats.path ? ` · ${stats.stats.path}` : "")
           : ""}
-        actions=${html`
+        actions=${!guest && html`
           <button onClick=${() => save("/api/export/runs.csv", notify)}>All runs (CSV)</button>
           <button onClick=${() => save("/api/export/runs.json", notify)}>Index (JSON)</button>
           <button onClick=${() => save("/api/export/archive.json", notify)}>Full archive</button>
           <button onClick=${() => save("/api/export/database.db", notify)}>SQLite file</button>`}>
-        <p class="hint">
+        ${!guest && html`<p class="hint">
           <strong>All runs (CSV)</strong> is one row per test with its result —
           the spreadsheet view. <strong>Full archive</strong> and the${" "}
           <strong>SQLite file</strong> both include every recorded curve; the
           SQLite file is the database itself, taken as a consistent online backup —
           without the accounts, which never leave the machine.
-        </p>
+        </p>`}
         <div class="row">
           <label class="field" style="flex:2 1 220px">
             <span>Search</span>

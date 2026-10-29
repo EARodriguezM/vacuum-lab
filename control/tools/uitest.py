@@ -52,7 +52,7 @@ from tools.cdp import Chrome, Page, attach  # noqa: E402
 
 PARTS = ("pages", "maths", "gating", "override", "prompt", "fault", "idle",
          "deploy", "form", "history", "signup", "start", "guided", "lost",
-         "sending", "update")
+         "sending", "update", "guests")
 SIZES = {"tablet": (1024, 600, False), "phone": (390, 844, True)}
 ROLES = ("viewer", "operator", "admin", "tablet")
 PASSWORD = "uitest-pass-1"
@@ -62,10 +62,12 @@ TOUCH_PX = 40
 POLL_S = 2.0
 
 #: Loaded before the panel's own code in every page: counts the state polls,
-#: keeps the requests that failed, and keeps every AudioContext made.
+#: keeps the requests that failed, keeps every AudioContext made, and counts
+#: the tones played (`tones`).
 INSTRUMENT = r"""
 (() => {
-  const ui = window.__ui = { polls: 0, failed: [], audio: [], loaded: Date.now() };
+  const ui = window.__ui = { polls: 0, failed: [], audio: [], tones: 0,
+                             loaded: Date.now() };
   const real = window.fetch.bind(window);
   window.fetch = async (input, init) => {
     const url = String(input && input.url || input);
@@ -97,6 +99,7 @@ INSTRUMENT = r"""
     if (!Real) continue;
     window[name] = class extends Real {
       constructor(...args) { super(...args); ui.audio.push(this); }
+      createOscillator(...args) { ui.tones += 1; return super.createOscillator(...args); }
     };
   }
 })();
@@ -1217,6 +1220,148 @@ def part_update(chrome, server, sessions, report, shots):
         server.call("/api/control/release", {}, sessions["admin"]["person"])
 
 
+def part_guests(chrome, server, sessions, report, shots):
+    """Watching without an account: an admin allows it under Settings ->
+    People, the sign-in page then offers it, and a guest sees every page and
+    can press, download and hear nothing; a guest dropped by a restart joins
+    again by itself, and switching guests off sends it back to signing in."""
+    auth = server.app.auth
+    owner = sessions["admin"]["person"]
+    present_js = "!!document.querySelector(\"[data-test='%s']\")"
+    admin = chrome.page(*SIZES["tablet"])
+    open_as(admin, server.base, sessions["admin"], "settings/people")
+    admin.wait(present_js % "guests-toggle", timeout=10)
+    card = admin.js("document.querySelector(\"[data-test='guests-card']\").innerText")
+    report.check("guests are off until an admin allows them",
+                 "Not allowed" in (card or ""), (card or "")[:60])
+    click(admin, "guests-toggle")
+    said = admin.wait("document.querySelector('.dialog') && "
+                      "document.querySelector('.dialog').innerText", timeout=10)
+    report.check("allowing guests asks first, saying what they will see",
+                 said and "activity log" in said and "cannot change" in said,
+                 (said or "")[:80])
+    click(admin, "confirm-ok")
+    allowed = admin.wait("(document.querySelector(\"[data-test='guests-card']\")"
+                         " || {}).innerText.includes('Allowed.')", timeout=10)
+    report.check("... and then they may", allowed
+                 and auth.status().get("guests") is True)
+    audit(admin, report, "settings/people with guests allowed", shots)
+
+    page = chrome.page(*SIZES["phone"])
+    open_as(page, server.base, None, "dashboard")
+    page.wait(present_js % "guest-watch", timeout=10)
+    audit(page, report, "signed out, guests allowed", shots)
+    click(page, "guest-watch")
+    joined = page.wait(present_js % "guest-signin", timeout=10)
+    chip = page.js("document.querySelector('header.top').innerText") or ""
+    report.check("Watch as a guest opens the panel, watching, with Sign in "
+                 "beside it", joined and "Guest" in chip, chip[:80])
+    report.check("... and nothing that acts is offered: no control, no "
+                 "Silence, no Take control",
+                 not page.js(present_js % "silence")
+                 and "Take control" not in chip)
+
+    click(page, "tab-history")
+    page.wait(present_js % "guest-notice", timeout=10)
+    text = page.js("document.body.innerText") or ""
+    report.check("History offers a guest no downloads, and says why "
+                 "nothing can be pressed",
+                 "All runs (CSV)" not in text and "SQLite file" not in text
+                 and "watching as a guest" in text)
+
+    # A restart drops every guest: the page joins again by itself.
+    before = page.js("JSON.parse(localStorage.getItem('vacuum-lab-session')"
+                     " || '{}').guest")
+    with auth._lock:
+        auth._guests.clear()
+    again = page.wait(
+        "(JSON.parse(localStorage.getItem('vacuum-lab-session') || '{}').guest"
+        f" || '') !== {json.dumps(before)}"
+        " && !!document.querySelector(\"[data-test='guest-signin']\")"
+        " && !document.querySelector(\"[data-test='signin-submit']\")",
+        timeout=20)
+    report.check("a guest dropped by a restart joins again without the "
+                 "sign-in page", again
+                 and auth.guests_report()["watching"] >= 1)
+
+    click(page, "guest-signin")
+    back = page.wait(present_js % "signin-submit", timeout=10)
+    report.check("Sign in from a guest's page ends the guest and offers "
+                 "every choice, watching again among them",
+                 back and page.js(present_js % "guest-watch"))
+
+    # A kiosk that lost its pairing is paired again, never left as a guest:
+    # a guest's screen sounds no alarm. (`?pair` stands for the kiosk here.)
+    kiosk = chrome.page(*SIZES["tablet"])
+    kiosk.goto(f"{server.base}/?seed")
+    kiosk.wait("document.readyState === 'complete'")
+    kiosk.js("localStorage.clear()")
+    kiosk.goto(f"{server.base}/?pair&r={time.time()}#dashboard")
+    kiosk.wait(present_js % "signin-mode-pair", timeout=15)
+    report.check("a kiosk's sign-in page offers pairing, never watching as a "
+                 "guest", not kiosk.js(present_js % "guest-watch"))
+
+    # Every page, as a guest, at both sizes: nothing refused on the way.
+    for size in SIZES:
+        code, body = server.call("/api/guest", {})
+        report.guarded(f"the guest@{size} sweep", lambda s=size, b=body: sweep(
+            chrome, server, "guest", s, {"guest": b.get("token")}, report, shots))
+
+    # A critical alarm: an operator's screen sounds it, a guest's never does,
+    # and says so on the Dashboard too.
+    from tools import fake_tc600
+
+    def touched(page):
+        # A real press, which a browser counts as the gesture that allows
+        # sound -- a script's event is not one.
+        for kind in ("mousePressed", "mouseReleased"):
+            page.call("Input.dispatchMouseEvent", type=kind, x=40, y=30,
+                      button="left", clickCount=1)
+
+    quiet = chrome.page(*SIZES["tablet"])
+    open_as(quiet, server.base, {"guest": server.call("/api/guest", {})[1]
+                                 .get("token")}, "dashboard")
+    notice = quiet.wait("(document.querySelector(\"[data-test='guest-notice']\")"
+                        " || {}).innerText", timeout=10) or ""
+    report.check("a guest's Dashboard says it only watches and that alarms are "
+                 "silent there", "silent" in notice, notice[:80])
+    loud = chrome.page(*SIZES["tablet"])
+    open_as(loud, server.base, sessions["operator"], "dashboard")
+    touched(quiet)
+    touched(loud)
+    fake_tc600.STATE[303] = "Err006"
+    try:
+        alarm = ("(document.querySelector(\"[data-test='alarm-bar']\") || {})"
+                 ".innerText || ''")
+        shown = quiet.wait(f"({alarm}).includes('Err006')", timeout=20)
+        loud.wait(f"({alarm}).includes('Err006')", timeout=20)
+        time.sleep(6)
+        heard = loud.js("window.__ui.tones")
+        silent = quiet.js("window.__ui.tones")
+        report.check("a critical alarm sounds on an operator's screen and never "
+                     "on a guest's", shown and heard and silent == 0,
+                     f"operator {heard} tones, guest {silent}")
+    finally:
+        fake_tc600.STATE[303] = "000000"
+        _wait(lambda: not (server.app.supervisor.recovering or {}).get("active"), 30)
+        server.call("/api/alarms/ack", {"id": "all"}, sessions["operator"]["person"])
+
+    try:
+        watcher = chrome.page(*SIZES["tablet"])
+        open_as(watcher, server.base, {"guest": server.call("/api/guest", {})[1]
+                                       .get("token")}, "dashboard")
+        watcher.wait(present_js % "guest-signin", timeout=10)
+        server.call("/api/users/guests", {"allowed": False}, owner)
+        # The sign-in page first, then the server asked again whether guests
+        # are allowed: the button goes with that answer.
+        out = watcher.wait(f"{present_js % 'signin-submit'}"
+                           f" && !{present_js % 'guest-watch'}", timeout=20)
+        report.check("switching guests off sends a guest's page to the sign-in "
+                     "page, which no longer offers watching", out)
+    finally:
+        server.call("/api/users/guests", {"allowed": False}, owner)
+
+
 def _wait(predicate, timeout: float) -> bool:
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -1232,7 +1377,8 @@ PART_FUNCTIONS = {"pages": part_pages, "maths": part_maths,
                   "idle": part_idle, "deploy": part_deploy, "form": part_form,
                   "history": part_history, "signup": part_signup,
                   "start": part_start, "guided": part_guided, "lost": part_lost,
-                  "sending": part_sending, "update": part_update}
+                  "sending": part_sending, "update": part_update,
+                  "guests": part_guests}
 
 
 # --- the kiosk -------------------------------------------------------------------

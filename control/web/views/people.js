@@ -128,7 +128,7 @@ export function People({ me, notify }) {
 
   return html`
     <${Card} title="People"
-      hint="Everyone who can sign in to this chamber. Watching needs an account too; nobody gets in until an admin approves them."
+      hint="Everyone who can sign in to this chamber. Watching needs an account too, unless guests are allowed below; nobody gets in until an admin approves them."
       actions=${html`<button class="small" onClick=${load}>Refresh</button>`}>
       ${error && html`<${Banner} tone="crit">${error}<//>`}
 
@@ -266,6 +266,69 @@ export function People({ me, notify }) {
           await act(api.transferOwner(person.id, password),
                     `${person.display_name} now owns this chamber.`);
         }} />
+    <//>`;
+}
+
+/**
+ * Watching without an account, for a class or a visitor: an admin's switch,
+ * off until somebody switches it on. Guests see what a viewer sees and can
+ * do nothing, download nothing and hear no alarm (lab/auth.py); switching it
+ * off signs every guest out at once.
+ */
+export function Guests({ me, notify }) {
+  const [guests, setGuests] = useState(null);
+  const [asking, setAsking] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const allowed = !!me?.can?.admin && me?.kind === "person";
+  const load = () => api.users()
+    .then((data) => setGuests(data.guests || null))
+    .catch(() => {});
+  useEffect(() => { if (allowed) load(); }, [allowed]);
+  if (!allowed || !guests) return null;
+
+  const change = async (on) => {
+    setAsking(false);
+    setBusy(true);
+    try {
+      const result = await api.setGuests(on);
+      setGuests(result.guests);
+      notify(on ? "Guests may now watch without an account."
+                : "Guests switched off. Anyone watching as a guest was signed out.", "ok");
+    } catch (problem) {
+      notify(problem.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return html`
+    <${Card} title="Guests" hint="Watching without an account, from the sign-in page."
+      actions=${html`<button class="small" onClick=${load}>Refresh</button>`}>
+      <div class="grid" style="gap:10px" data-test="guests-card">
+        <p class="small">${guests.allowed
+          ? html`<strong>Allowed.</strong> Anyone who can reach this panel may press
+              "Watch as a guest" and see the rig live, its runs and its activity
+              log, with the names and usernames in it. A guest cannot change
+              anything, download data or hear alarms. Watching now: ${guests.watching} (at most
+              ${guests.max}).`
+          : html`<strong>Not allowed.</strong> Everyone needs an account, even to
+              watch.`}</p>
+        <div class="row">
+          <button class=${guests.allowed ? "danger" : "primary"} data-test="guests-toggle"
+                  disabled=${busy}
+                  onClick=${() => (guests.allowed ? change(false) : setAsking(true))}>
+            ${guests.allowed ? "Stop guests watching" : "Allow guests…"}</button>
+        </div>
+      </div>
+      <${Confirm} open=${asking} title="Let people watch without an account?"
+        confirmLabel="Allow guests"
+        body=${html`<p>Anyone on the network who reaches this panel will see the
+          rig live, its runs and its activity log, including who did what: names,
+          usernames (and so institutional addresses) and override reasons. They
+          cannot change anything, download data or hear alarms. Switching it off
+          again signs every guest out.</p>`}
+        onCancel=${() => setAsking(false)} onConfirm=${() => change(true)} />
     <//>`;
 }
 

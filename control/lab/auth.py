@@ -47,6 +47,14 @@ sounding its alarms -- with nobody signed in. An admin pairs it once with a
 one-time code; it gets a viewer session that never expires and can never be
 given a higher role.
 
+**Guests.** Somebody without an account -- a class watching a deposition --
+may watch, once an admin has allowed it (Settings -> People; off until then).
+A guest is a viewer that can never act, take control, sound alarms or
+download, and is kept in memory only: nothing a stranger does is written to
+the database (the request log in the journal still names its address), and a
+restart ends every guest (the panel joins again by itself).
+At most GUESTS_MAX at once, each dropped GUEST_IDLE_S after its last poll.
+
 Passwords are scrypt hashes from hashlib, so there is no new dependency.
 Sessions are random tokens of which only a SHA-256 is stored.
 """
@@ -137,6 +145,22 @@ GOOGLE_STARTS_PER_HOUR = 10
 GOOGLE_STARTS_PER_HOUR_ALL = 60
 #: Google asks to be polled no faster than this (and slower when it says so).
 GOOGLE_POLL_MIN_S = 5.0
+#: Watching without an account (see the top of this file): at most this many
+#: at once -- each polls every two seconds, on a machine that also watches the
+#: rig -- each dropped this long after its last poll (a hidden page stops
+#: polling; it joins again when shown) and after this long in any case; and
+#: this many guest sessions an hour from one address.
+GUESTS_MAX = 20
+GUEST_IDLE_S = 120.0
+GUEST_SESSION_S = 12 * 3600.0
+GUEST_STARTS_PER_HOUR = 30
+#: Guests from one address at once, so one machine cannot take every place
+#: for half a day (loopback -- the lab PC's own screen -- is not held to it);
+#: and the requests one guest may make a minute: a page polls a few routes
+#: every two seconds -- a few tabs share one guest -- and a script on sixteen
+#: connections is held to the same.
+GUESTS_PER_ADDRESS = 10
+GUEST_REQUESTS_PER_MINUTE = 600
 
 
 # --- passwords and tokens --------------------------------------------------
@@ -337,7 +361,7 @@ class Principal:
     user_id: int
     username: str
     name: str
-    kind: str                   # person | device | local
+    kind: str                   # person | device | guest | local
     role: str
     session: str | None         # the token's hash; None with accounts off
     #: Seconds since this session's last deliberate touch.
@@ -514,6 +538,15 @@ class Auth:
         except (TypeError, ValueError):
             self._high_water = 0.0
         self._high_water_written = time.monotonic() - HIGH_WATER_WRITE_S
+        #: Guests watching, by the hash of their token; memory only. Whether
+        #: an admin allows them is kept in the database and read once here.
+        self._guests: dict[str, dict] = {}
+        self._guest_starts = Budget(GUEST_STARTS_PER_HOUR, 3600.0)
+        self._guest_requests = Budget(GUEST_REQUESTS_PER_MINUTE)
+        try:
+            self._guests_on = database.meta("guests") == "on"
+        except Exception:
+            self._guests_on = False
 
     # --- sessions -----------------------------------------------------------
 
@@ -591,6 +624,9 @@ class Auth:
         if not token:
             return None
         hashed = token_hash(token)
+        guest = self._guest(hashed)
+        if guest is not None:
+            return guest
         row = self.db.session(hashed)
         if row is None:
             return None
@@ -767,6 +803,10 @@ class Auth:
         return {"ok": True, "token": token, "me": self.me(self.resolve(token))}
 
     def logout(self, principal: Principal) -> dict:
+        if principal.kind == "guest":
+            with self._lock:
+                self._guests.pop(principal.session, None)
+            return {"ok": True}
         if principal.session:
             self.release(principal, quiet=True)
             self.db.delete_session(principal.session)
@@ -1347,6 +1387,116 @@ class Auth:
                           user=user["username"])
         return {"ok": True, "token": token, "me": self.me(self.resolve(token))}
 
+    # --- guests -------------------------------------------------------------
+
+    def guest(self, address: str = "") -> dict:
+        """A session that only watches, for somebody with no account: only
+        while an admin allows it, and never written to the database."""
+        refused = refusal("Watching without an account is not allowed here. "
+                          "Sign in, or ask an admin to allow guests.", 403)
+        if not self.enabled or not self._guests_on:
+            return refused
+        local = _loopback(address)
+        keys = () if local else (f"addr:{address}",)
+        wait = self._guest_starts.take(*keys) if keys else 0.0
+        if wait > 0:
+            seconds = math.ceil(wait)
+            return refusal(f"Too many guest sessions from here. Try again in "
+                           f"{seconds} s, or sign in.", 429, retry_after=seconds)
+        token = new_token()
+        hashed = token_hash(token)
+        now = time.monotonic()
+        with self._lock:
+            # Asked again under the lock: switched off meanwhile is refused.
+            allowed = self._guests_on
+            self._prune_guests(now)
+            here = sum(1 for g in self._guests.values()
+                       if g["address"] == address)
+            full = (len(self._guests) >= GUESTS_MAX
+                    or (not local and here >= GUESTS_PER_ADDRESS))
+            if allowed and not full:
+                self._guests[hashed] = {"since": now, "seen": now,
+                                        "address": address}
+        if not allowed or full:
+            if keys:
+                self._guest_starts.give_back(*keys)
+            if not allowed:
+                return refused
+            return refusal("Too many guests are watching already. Try again "
+                           "later, or sign in.", 503, retry_after=60)
+        return {"ok": True, "token": token,
+                "me": self.me(Principal(-2, "guest", "Guest", "guest",
+                                        "viewer", hashed))}
+
+    def guest_request_wait(self, principal: Principal) -> float:
+        """0 with this guest's request counted, or the seconds it must wait."""
+        return self._guest_requests.take(f"guest:{principal.session}")
+
+    def _guest(self, hashed: str) -> Principal | None:
+        """The guest behind a token's hash, its poll counted; None if it is
+        not one -- or no longer: guests switched off, idle, or too old."""
+        now = time.monotonic()
+        with self._lock:
+            entry = self._guests.get(hashed)
+            if entry is None:
+                return None
+            if (not self._guests_on or now - entry["seen"] > GUEST_IDLE_S
+                    or now - entry["since"] > GUEST_SESSION_S):
+                self._guests.pop(hashed, None)
+                return None
+            entry["seen"] = now
+        return Principal(-2, "guest", "Guest", "guest", "viewer", hashed)
+
+    def _prune_guests(self, now: float) -> None:
+        """Drop the guests that stopped polling or are too old. Caller holds
+        the lock."""
+        self._guests = {k: v for k, v in self._guests.items()
+                        if now - v["seen"] <= GUEST_IDLE_S
+                        and now - v["since"] <= GUEST_SESSION_S}
+
+    def guests_report(self) -> dict:
+        with self._lock:
+            self._prune_guests(time.monotonic())
+            watching = len(self._guests)
+        return {"allowed": self._guests_on, "watching": watching,
+                "max": GUESTS_MAX}
+
+    def set_guests(self, actor: Principal, allowed: bool) -> dict:
+        """Let people watch without an account, or stop it -- which ends
+        every guest session at once."""
+        if not self.enabled:
+            return refusal("Accounts are switched off on this server.", 400)
+        problem = self._not_admin(actor, "Allowing guests needs the admin role.")
+        if problem:
+            return problem
+        allowed = allowed is True
+        if allowed:
+            try:
+                self.db.set_meta("guests", "on")
+            except Exception as exc:
+                return refusal(f"Guests stay off: the change could not be "
+                               f"recorded ({exc}).", 500)
+        with self._lock:
+            changed = self._guests_on != allowed
+            self._guests_on = allowed
+            ended = 0 if allowed else len(self._guests)
+            if not allowed:
+                self._guests.clear()
+        if changed:
+            self._log(actor, "action", f"{actor.name} " + (
+                "allowed guests to watch without an account" if allowed else
+                f"stopped guests watching ({ended} signed out)"))
+        if not allowed:
+            # Shut first, recorded after: a full SD card must not keep the
+            # door open. Unrecorded, it would open again at the next start.
+            try:
+                self.db.set_meta("guests", "off")
+            except Exception as exc:
+                return refusal(f"Guests are off now, but the change could not "
+                               f"be recorded ({exc}): after a restart of the "
+                               f"panel they would be allowed again.", 500)
+        return {"ok": True, "guests": self.guests_report()}
+
     # --- administration -----------------------------------------------------
 
     def _admin(self, actor: Principal) -> bool:
@@ -1404,6 +1554,7 @@ class Auth:
                           "google": self.verifying,
                           "usable": bool(self.verifying
                                          and self.google.settings() is not None)},
+                "guests": self.guests_report(),
                 "you": {"username": actor.username, "role": actor.role}}
 
     def _target(self, actor: Principal, user_id: int,
@@ -1643,7 +1794,9 @@ class Auth:
         return {"enabled": True,
                 "owner": bool(self.db.holders(self.chamber, "owner")),
                 "email_domain": self.email_domain,
-                "google_signin": self.verifying}
+                "google_signin": self.verifying,
+                # Whether the sign-in page offers "Watch as a guest".
+                "guests": self._guests_on}
 
 
 def bootstrap_owner(database, chamber: str, username: str, password: str,

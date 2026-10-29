@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import mimetypes
 import os
 import posixpath
@@ -74,10 +75,58 @@ POST_RULES = {
 
 #: Reachable without a session: how a sign-in page finds out where it is.
 PUBLIC_POSTS = ("/api/login", "/api/signup", "/api/signup/google/start",
-                "/api/signup/google/poll", "/api/pair")
+                "/api/signup/google/poll", "/api/pair", "/api/guest")
 
 #: GETs that need more than watching.
 ADMIN_GETS = ("/api/ports/survey",)
+
+#: What a guest -- watching without an account (lab/auth.py) -- may GET, and
+#: nothing else: closed by default, like an unlisted POST. Left out on
+#: purpose: every download (each holds the one download slot for seconds),
+#: the serial ports, the store's figures (a count over every sample), and any
+#: read of an instrument itself -- a gauge's details hold its serial line for
+#: seconds, and its pressure readings wait meanwhile.
+GUEST_GETS = ("/api/me", "/api/state", "/api/live", "/api/history",
+              "/api/devices", "/api/procedures", "/api/equipment",
+              "/api/trends", "/api/events", "/api/actuators", "/api/runs")
+#: What a stored run shows a guest: itself, its curves and its log.
+GUEST_RUN_VIEWS = ("samples", "events")
+#: The most a guest's one request may carry -- what the panel itself asks
+#: for, no more: a week-long run encoded in one reply holds the interpreter
+#: for over a second, and the run engine's safety tick with it.
+GUEST_HISTORY_POINTS = 3000
+GUEST_LIVE_ROWS = 600
+GUEST_LIVE_POINTS = 1500
+GUEST_SAMPLES_MAX = 3000
+GUEST_RUNS_MAX = 200
+
+#: What a guest is told whenever it asks for more than watching.
+GUESTS_ONLY_WATCH = "Guests only watch. Sign in to do that."
+
+
+def canonical_id(text: str) -> bool:
+    """A run id as the panel writes it: digits, no leading zero, and short
+    -- int() refuses past 4300 digits by raising, which is no answer at
+    all."""
+    return (0 < len(text) <= 18 and text.isascii() and text.isdigit()
+            and (text == "0" or not text.startswith("0")))
+
+
+def guest_may_get(route: str) -> bool:
+    """Whether a guest may GET `route`: one of GUEST_GETS, a stored run
+    (`/api/runs/<id>`, its samples or its events) or an instrument's live
+    snapshot (`/api/device/<key>/state`) -- each spelled exactly, so no
+    variant of a path reaches what this does not name."""
+    if route in GUEST_GETS:
+        return True
+    parts = route.split("/")
+    if parts[:3] == ["", "api", "runs"] and len(parts) in (4, 5):
+        if not canonical_id(parts[3]):
+            return False
+        return len(parts) == 4 or parts[4] in GUEST_RUN_VIEWS
+    return (parts[:3] == ["", "api", "device"] and len(parts) == 5
+            and bool(parts[3]) and parts[4] == "state")
+
 
 #: The most rows one listing returns, whatever the request asks for.
 MAX_LIST = 1000
@@ -122,8 +171,7 @@ def run_route(route: str) -> tuple[int, str] | None:
     parts = route.split("/")
     if len(parts) not in (4, 5) or parts[:3] != ["", "api", "runs"]:
         return None
-    if not (parts[3].isascii() and parts[3].isdigit()) \
-            or parts[3] != str(int(parts[3])):
+    if not canonical_id(parts[3]):
         return None
     action = parts[4] if len(parts) == 5 else "update"
     return (int(parts[3]), action) if action in RUN_ACTIONS else None
@@ -567,17 +615,24 @@ class Application:
                 raise
 
     def live(self, limit: int = 600, points: int | None = None,
-             since: float | None = None) -> dict:
+             since: float | None = None, cap: bool = False) -> dict:
         """The in-progress run's samples, for the live chart.
 
         `points` asks for the whole run decimated to about that many rows;
         `since` for only the samples after that run time (`t`, seconds) --
         what a panel already holding the run needs on each poll, one or two
         rows instead of the whole run again. Without either, the most recent
-        `limit` samples.
+        `limit` samples. `cap` -- a guest -- holds each to what the panel
+        asks for (GUEST_LIVE_ROWS, GUEST_LIVE_POINTS).
         """
+        limit = max(1, limit)                    # [-0:] would be the whole run
+        if cap:
+            limit = min(limit, GUEST_LIVE_ROWS)
+            points = min(points, GUEST_LIVE_POINTS) if points else points
         if since is not None:
             samples = self.engine.samples_since(since)
+            if cap:
+                samples = samples[-GUEST_LIVE_ROWS:]
         elif points:
             samples = self.engine.run_samples(points)
         else:
@@ -790,6 +845,8 @@ class Handler(BaseHTTPRequestHandler):
         if principal.kind == "device":
             return authmod.refusal("This tablet only watches. Sign in to act.",
                                    403)
+        if principal.kind == "guest":
+            return authmod.refusal(GUESTS_ONLY_WATCH, 403)
         if principal.must_change:
             return authmod.refusal("Choose a new password first.", 403,
                                    must_change=True)
@@ -923,6 +980,18 @@ class Handler(BaseHTTPRequestHandler):
         # The controller's own polling is what keeps control alive.
         self.app.auth.renew(principal)
 
+        if principal.kind == "guest":
+            if not guest_may_get(route):
+                self._json({"ok": False, "error": GUESTS_ONLY_WATCH}, 403)
+                return
+            # A page polls a few times every two seconds; a script on many
+            # connections is held to the same pace.
+            wait = self.app.auth.guest_request_wait(principal)
+            if wait > 0:
+                self._json({"ok": False, "error": "Too many requests from this "
+                                                  "guest. Slow down.",
+                            "retry_after": math.ceil(wait)}, 429)
+                return
         if route in ADMIN_GETS or route == "/api/users":
             if route in ADMIN_GETS:
                 refusal = self._check(principal, "admin", False)
@@ -948,11 +1017,14 @@ class Handler(BaseHTTPRequestHandler):
             "/api/live": lambda: self._json(
                 self.app.live(self._int("limit", 600),
                               self._int("points", 0) or None,
-                              self._float("since", None))),
+                              self._float("since", None),
+                              cap=principal.kind == "guest")),
             "/api/history": lambda: self._json(
                 self.app.history_window(
                     self._float("seconds", 3600.0),
-                    max(50, min(self._int("points", 1500), 20000)),
+                    max(50, min(self._int("points", 1500),
+                                GUEST_HISTORY_POINTS
+                                if principal.kind == "guest" else 20000)),
                     self._float("since", None))),
             "/api/devices": lambda: self._json(
                 {"ok": True, "devices": self.app.registry.descriptors()}),
@@ -989,7 +1061,7 @@ class Handler(BaseHTTPRequestHandler):
         if route.startswith("/api/device/"):
             self._device_get(route)
             return
-        if route.startswith("/api/runs"):
+        if route == "/api/runs" or route.startswith("/api/runs/"):
             self._runs_get(route)
             return
         if route.startswith("/api/export/"):
@@ -1317,6 +1389,8 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/signup/google/poll":
                 result = auth.google_poll(str(payload.get("flow", "")),
                                           self._address())
+            elif route == "/api/guest":
+                result = auth.guest(self._address())
             else:
                 result = auth.pair(str(payload.get("code", "")),
                                    self._address(), agent)
@@ -1339,6 +1413,11 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 return -1
 
+        # A guest has no account to touch, wake or administer: it may only
+        # stop watching.
+        if principal.kind == "guest" and route != "/api/logout":
+            self._refused(authmod.refusal(GUESTS_ONLY_WATCH, 403))
+            return
         if route.startswith(("/api/users/", "/api/devices/",
                              "/api/role-requests/decide")) \
                 and self._admin_refused():
@@ -1402,6 +1481,9 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/api/users/status":
             result = auth.set_status(principal, number("id"),
                                      bool(payload.get("enabled")))
+        elif route == "/api/users/guests":
+            # True and only true opens the door: "false" is a string.
+            result = auth.set_guests(principal, payload.get("allowed") is True)
         elif route == "/api/users/reset-password":
             result = auth.reset_password(principal, number("id"))
         elif route == "/api/users/transfer-owner":
@@ -1453,10 +1535,13 @@ class Handler(BaseHTTPRequestHandler):
         parts = [p for p in route.split("/") if p]   # ['api', 'runs', ...]
 
         if len(parts) == 2:
+            limit = self._limit("limit", 100)
+            if self._who().kind == "guest":
+                limit = min(limit, GUEST_RUNS_MAX)
             self._json({
                 "ok": True,
                 "runs": self.app.db.runs(
-                    limit=self._limit("limit", 100),
+                    limit=limit,
                     offset=max(0, self._int("offset", 0)),
                     procedure=(self._query().get("procedure") or [None])[0],
                     status=(self._query().get("status") or [None])[0],
@@ -1493,6 +1578,9 @@ class Handler(BaseHTTPRequestHandler):
             # pump, which is the one feature of the curve that matters.
             samples = self.app.db.samples(run_id)
             requested = self._int("max", 2000)
+            if self._who().kind == "guest":
+                requested = (min(requested, GUEST_SAMPLES_MAX) if requested > 0
+                             else 2000)
             if requested and len(samples) > requested:
                 columns = [[s.get(key) for s in samples]
                            for key in history.SHAPE_KEYS]

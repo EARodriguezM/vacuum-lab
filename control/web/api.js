@@ -9,7 +9,9 @@
 // never in a cookie, which a browser would attach to other sites' requests,
 // and never in a URL, which ends up in logs and history. A browser holds up
 // to two: a person's, after signing in, and a paired tablet's, which only
-// watches and is what the panel falls back to when the person signs out.
+// watches and is what the panel falls back to when the person signs out --
+// or, instead of a tablet's, a guest's, which also only watches and which
+// the server keeps in memory only.
 
 const SETTINGS_KEY = "vacuum-lab-settings";
 const SESSION_KEY = "vacuum-lab-session";
@@ -73,9 +75,10 @@ export function url(path) {
 function loadSessions() {
   try {
     const stored = JSON.parse(localStorage.getItem(SESSION_KEY) || "{}");
-    return { person: stored.person || null, device: stored.device || null };
+    return { person: stored.person || null, device: stored.device || null,
+             guest: stored.guest || null };
   } catch {
-    return { person: null, device: null };
+    return { person: null, device: null, guest: null };
   }
 }
 
@@ -90,13 +93,14 @@ function storeSessions(next, reason = "") {
   listeners.forEach((listener) => listener(sessions, reason));
 }
 
-/** The sessions this browser holds: { person, device }. */
+/** The sessions this browser holds: { person, device, guest }. */
 export function sessionTokens() { return sessions; }
 
 /**
  * Called whenever a session is gained or lost, with the sessions and why:
  * "ended" when the server refused one that was in use (expired, signed out
- * when idle on a tablet, reset elsewhere). Returns the unsubscribe.
+ * when idle on a tablet, reset elsewhere), "guest-ended" when it refused a
+ * guest's (a restart, a page hidden for minutes). Returns the unsubscribe.
  */
 export function onSessionChange(listener) {
   listeners.add(listener);
@@ -105,6 +109,7 @@ export function onSessionChange(listener) {
 
 export function setPersonSession(token) { storeSessions({ person: token || null }); }
 export function setDeviceSession(token) { storeSessions({ device: token || null }); }
+export function setGuestSession(token) { storeSessions({ guest: token || null }); }
 
 /** Why a request was refused, when the answer is "sign in", not an error. */
 export class AuthError extends Error {
@@ -136,7 +141,7 @@ const REQUEST_TIMEOUT_MS = 45000;
 
 async function request(path, options = {}) {
   const headers = { ...(options.headers || {}) };
-  const token = sessions.person || sessions.device;
+  const token = sessions.person || sessions.device || sessions.guest;
   if (token) headers.Authorization = `Bearer ${token}`;
   if (options.body) headers["Content-Type"] = "application/json";
   const { raw, ...sent } = options;
@@ -172,6 +177,7 @@ async function request(path, options = {}) {
     // Drop whichever one was used; a tablet falls back to watching.
     if (sessions.person && token === sessions.person) storeSessions({ person: null }, "ended");
     else if (token && token === sessions.device) setDeviceSession(null);
+    else if (token && token === sessions.guest) storeSessions({ guest: null }, "guest-ended");
     throw new AuthError(payload.error || "sign in", payload);
   }
   if (payload.reauth || payload.must_change) {
@@ -330,6 +336,8 @@ export const api = {
   googleStart: (password, note) => post("/api/signup/google/start", { password, note }),
   googlePoll: (flow) => post("/api/signup/google/poll", { flow }),
   pair:    (code) => post("/api/pair", { code }),
+  // Watching without an account, when an admin allows it (lab/auth.py).
+  guest:   () => post("/api/guest", {}),
   logout:  () => post("/api/logout", {}),
   me:      () => get("/api/me"),
   // A deliberate touch on the screen: keeps a person's session able to act.
@@ -348,6 +356,7 @@ export const api = {
   setRole:      (id, role) => post("/api/users/role", { id, role }),
   setEnabled:   (id, enabled) => post("/api/users/status", { id, enabled }),
   resetPassword: (id) => post("/api/users/reset-password", { id }),
+  setGuests:    (allowed) => post("/api/users/guests", { allowed: !!allowed }),
   transferOwner: (id, password) => post("/api/users/transfer-owner", { id, password }),
   decideRequest: (id, approve) => post("/api/role-requests/decide", { id, approve }),
   addTablet:    (label) => post("/api/devices/add", { label }),
