@@ -488,6 +488,23 @@ you may do depends on your role in this chamber:
   points at a panel on another machine, that machine must be started with
   `--allow-origin` for the page you are on.
 
+#### Watching as a guest
+
+An admin can let people watch without an account, for a class or a visit:
+Settings → People → Guests. It is off until then, and switching it off signs
+every guest out at once. While it is on, the sign-in page shows **Watch as a
+guest**.
+
+- A guest sees the live rig, the runs and the activity log (with the names
+  in it). A guest cannot change anything, download data, read an instrument
+  directly or hear alarms; every page says so.
+- Guests are never offered on the kiosk tablet, which must be paired.
+- At most 20 guests watch at once, 10 from one address. A guest is dropped
+  two minutes after the page stops polling; a page shown again joins by
+  itself.
+- Guests are kept in the panel's memory only, so a restart ends them and
+  their pages join again.
+
 #### Setting up the Google sign-in
 
 The panel uses Google's sign-in for devices (the one a TV uses: a code typed

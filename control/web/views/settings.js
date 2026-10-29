@@ -10,7 +10,7 @@ import { html } from "../html.js";
 import { useEffect, useState } from "preact/hooks";
 import { Banner, Card, Confirm, Empty, Pairs, Pill } from "../ui.js";
 import { POLL_MAX_MS, api, normaliseHost, settings, updateSettings } from "../api.js";
-import { MyAccount, People, Tablets } from "./people.js";
+import { Guests, MyAccount, People, Tablets } from "./people.js";
 import { beep } from "../alarms.js";
 import * as fmt from "../format.js";
 
@@ -452,7 +452,8 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut, sub 
   const [ping, setPing] = useState(null);
 
   useEffect(() => {
-    api.stats().then(setStats).catch(() => setStats(null));
+    // A count over every stored sample: not for a guest (lab/api.py).
+    if (state?.me?.kind !== "guest") api.stats().then(setStats).catch(() => setStats(null));
     api.ping().then(setPing).catch((error) => setPing({ error: error.message }));
   }, []);
 
@@ -495,6 +496,7 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut, sub 
                       onChanged=${onSettingsChanged} />`}
       ${page === "people" && html`
         <${People} me=${me} notify=${notify} />
+        <${Guests} me=${me} notify=${notify} />
         <${Tablets} me=${me} notify=${notify} />`}
 
       ${page === "screen" && html`<${Card} title="Connection"
@@ -554,8 +556,9 @@ export function SettingsView({ state, onSettingsChanged, notify, onSignOut, sub 
 
       <${AutoPorts} state=${state} notify=${notify} admin=${admin} />
 
-      <${PortPicker} devices=${devices} notify=${notify} admin=${admin}
-                     onChanged=${onSettingsChanged} />
+      ${me?.kind !== "guest" && html`
+        <${PortPicker} devices=${devices} notify=${notify} admin=${admin}
+                       onChanged=${onSettingsChanged} />`}
 
       <${Card} title="Instruments"
                hint="Each instrument owns its serial port on the server and is polled on its own thread.">

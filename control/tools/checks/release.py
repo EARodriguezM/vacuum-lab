@@ -4,6 +4,7 @@ against a stand-in for the target machine, so no SSH is needed."""
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -659,3 +660,119 @@ def _sections(folder: Path) -> None:
                 == "vacuum-lab-web", f"{before} -> {rel.panel_service(stand_in)}")
     attempt("rollback restarts the unit the panel runs under, old name or new",
             which_unit)
+
+    # --- found deploying 2026-10-28 ---------------------------------------------------
+    added = ("vacuum-lab-update.service", "vacuum-lab-update.timer",
+             "vacuum-lab-install.service", "vacuum-lab-install.path")
+
+    def only_missing(name, install_units):
+        # The panel, its rules and the backup in place and right; the
+        # updater's four units never installed -- the lab PC that morning.
+        stand_in, args = fresh(name)
+        args.install_units = install_units
+        for installed, source in stand_in.units.items():
+            if Path(installed).name not in added:
+                shutil.copy2(Path(ROOT) / source, installed)
+        stand_in.on_restart = reports(current_name)
+        said = []
+        try:
+            made, error = rel.deploy(args, log=lambda *a, **k: said.append(
+                " ".join(map(str, a))), target=stand_in, wait=0.3,
+                sleep=lambda s: None, info=INFO), None
+        except rel.ReleaseError as exc:
+            made, error = None, str(exc)
+        etc = folder / name / "etc"
+        return made, error, said, [n for n in added if (etc / n).exists()], \
+            systemctl(stand_in)
+
+    def missing_installed():
+        made, error, _, there, done = only_missing("missing", True)
+        return (made is not None and list(there) == list(added)
+                and "systemctl enable --now vacuum-lab-update.timer" in done
+                and "systemctl enable --now vacuum-lab-install.path" in done,
+                error or f"installed {there}; systemctl {done}")
+    attempt("--install-units installs the units that are only missing, and "
+            "enables their timer and path", missing_installed)
+
+    def missing_named():
+        made, error, said, there, _ = only_missing("missing-unasked", False)
+        line = next((s for s in said if s.startswith("Not installed")), "")
+        return (made is not None and not there
+                and all(n in line for n in added),
+                error or line or "nothing said about the missing units")
+    attempt("... and a deploy without it says which are left out",
+            missing_named)
+
+    def keeps_alive():
+        seen = []
+
+        def answered(argv, **kwargs):
+            seen.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        real = rel.subprocess.run
+        rel.subprocess.run = answered
+        try:
+            target = rel.Target("lab", "~/vacuum-lab")
+            target.run("true")
+            target.copy(folder, "x")
+        finally:
+            rel.subprocess.run = real
+        ssh, rsync = seen
+        shell = rsync[rsync.index("-e") + 1] if "-e" in rsync else ""
+        return ("ServerAliveInterval=20" in ssh
+                and "ServerAliveInterval=20" in shell,
+                f"ssh {' '.join(ssh[:-2])}; rsync -e {shell!r}")
+    attempt("the SSH link to the target is kept alive through a silent "
+            "selftest, rsync's too", keeps_alive)
+
+    def scripts_run():
+        # Git's mode where there is git: a version installed from GitHub gets
+        # the committed bit, not this working tree's. On disk elsewhere (a
+        # release folder on the lab PC, which rsync copied with its modes).
+        listed = subprocess.run(["git", "ls-files", "-s", "--", "*.py"],
+                                cwd=ROOT, capture_output=True, text=True)
+        modes = ({line.split("\t", 1)[1]: line.split()[0]
+                  for line in listed.stdout.splitlines()}
+                 if listed.returncode == 0 and listed.stdout else {})
+        scripts = [p for p in (*Path(ROOT).glob("*.py"),
+                               *Path(ROOT).glob("tools/*.py"))
+                   if p.read_text(encoding="utf-8").startswith("#!")
+                   and '__name__ == "__main__"' in p.read_text(encoding="utf-8")]
+
+        def runnable(path):
+            name = path.relative_to(ROOT).as_posix()
+            return (modes[name] == "100755" if name in modes
+                    else os.access(path, os.X_OK))
+        stuck = [p.relative_to(ROOT).as_posix() for p in scripts
+                 if not runnable(p)]
+        return (bool(scripts) and not stuck,
+                f"not executable: {stuck}" if stuck
+                else f"{len(scripts)} scripts executable"
+                + (" (as committed)" if modes else " (on disk)"))
+    attempt("every script the guides run as ./tools/NAME.py is executable",
+            scripts_run)
+
+    def missing_undone():
+        # Added only because they were missing; the release then fails its
+        # health check: they go again, the update check stopped first.
+        stand_in, args = fresh("missing-undone")
+        for installed, source in stand_in.units.items():
+            if Path(installed).name not in added:
+                shutil.copy2(Path(ROOT) / source, installed)
+        stand_in.on_restart = reports(
+            lambda t: "20250101-0000-old" if current_name(t).endswith("-old")
+            else "something else")
+        made, error = deploy(stand_in, args)
+        etc = folder / "missing-undone" / "etc"
+        done = systemctl(stand_in)
+        left = [n for n in added if (etc / n).exists()]
+        stopped = "systemctl stop vacuum-lab-update.service" in done
+        return (made is None and not left and stopped
+                and "systemctl disable --now vacuum-lab-update.timer" in done
+                and "systemctl disable --now vacuum-lab-install.path" in done
+                and current_name(stand_in) == "20250101-0000-old",
+                f"{(error or 'deployed')[:60]}; left {left}; update check "
+                f"stopped {stopped}")
+    attempt("units added only because they were missing go again when the "
+            "release does not come up, the update check stopped first",
+            missing_undone)

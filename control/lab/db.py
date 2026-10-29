@@ -122,6 +122,9 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS events_by_run ON events(run_id, at);
+-- The rig's latest events, newest first (the Dashboard, every poll): without
+-- it, a scan and a sort of every event ever kept, under the store's lock.
+CREATE INDEX IF NOT EXISTS events_by_at ON events(at);
 
 -- Accounts. A person signs in with a password; a paired tablet ("device")
 -- has no password at all and only ever watches. `status` is pending until

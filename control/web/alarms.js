@@ -177,11 +177,12 @@ const silenced = new Set();
  * sounding now; anything new sounds again. The server never hears of it.
  * The lost-contact beep has a silence of its own, for anyone at the screen
  * (the user's decision, 2026-10-16): nobody can sign in while the lab PC
- * does not answer.
+ * does not answer. `mute` -- a guest's screen, which can answer nothing --
+ * sounds nothing at all; the tab's title still says what is wrong.
  * Returns [what is sounding, the silence function, the lost-contact silence
  * or null when that beep is not sounding].
  */
-export function useAlarmSignals({ alarms, prompt, checklist, lost }) {
+export function useAlarmSignals({ alarms, prompt, checklist, lost, mute = false }) {
   const base = useRef(typeof document !== "undefined" ? document.title : "");
   const [, setTick] = useState(0);
   const list = alarms?.alarms || [];
@@ -203,7 +204,7 @@ export function useAlarmSignals({ alarms, prompt, checklist, lost }) {
   ].filter((key) => !silenced.has(key));
   const promptKey = prompt && !silenced.has(`prompt:${prompt.id}`) ? `prompt:${prompt.id}` : null;
   const lostKey = lost && !silenced.has(`lost:${lost}`) ? `lost:${lost}` : null;
-  const on = settings().alarmSound !== false;
+  const on = !mute && settings().alarmSound !== false;
 
   useEffect(() => {
     if (!on || !urgent.length) return undefined;

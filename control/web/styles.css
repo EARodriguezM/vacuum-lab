@@ -693,6 +693,8 @@ button.unavailable.primary { background:var(--accent-soft); color:var(--ink); bo
 .login-card { width:100%; max-width:520px; gap:14px; }
 .login-head { display:flex; flex-direction:column; gap:2px; }
 .login-head .sub { color:var(--ink-faint); font-size:13px; }
+.guest-option { display:flex; flex-direction:column; gap:6px; padding-top:12px;
+                border-top:1px solid var(--rule); }
 .card.narrow { max-width:620px; }
 .code-input { font-size:20px; letter-spacing:.12em; text-align:center; }
 .pair-code, .temp-password { font-size:20px; font-weight:640; letter-spacing:.08em; }

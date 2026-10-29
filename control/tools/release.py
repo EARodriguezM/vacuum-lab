@@ -93,6 +93,9 @@ UPDATE_TIMER = "vacuum-lab-update.timer"
 INSTALL_PATH = "vacuum-lab-install.path"
 #: Units enabled -- and started -- once installed, besides the panel's own.
 ENABLED = (BACKUP_TIMER, UPDATE_TIMER, INSTALL_PATH)
+#: Started by those, not enabled: stopped before a rollback removes them.
+TRIGGERED = ("vacuum-lab-backup.service", "vacuum-lab-update.service",
+             "vacuum-lab-install.service")
 #: Installed file -> its source in a release, compared before switching.
 UNITS = {
     "/etc/systemd/system/vacuum-lab-web.service": "deploy/vacuum-lab-web.service",
@@ -113,6 +116,12 @@ OLD_UNITS = (
     "/etc/systemd/system/tc600-backup.service",
     "/etc/systemd/system/tc600-backup.timer",
 )
+#: Every SSH connection to the target, rsync's too. The keep-alive is for the
+#: selftest there: 13 minutes without a byte of output, and on 2026-10-28 the
+#: campus network dropped the idle connection -- the selftest passed, the
+#: deploy never heard it. Two minutes without an answer is a lost link.
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+       "-o", "ServerAliveInterval=20", "-o", "ServerAliveCountMax=6"]
 
 
 class ReleaseError(Exception):
@@ -344,8 +353,7 @@ class Target:
         # that leaves the machine half way.
         try:
             result = subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                 self.host, command], capture_output=True, text=True,
+                [*SSH, self.host, command], capture_output=True, text=True,
                 timeout=timeout)
         except subprocess.TimeoutExpired:
             return 124, f"no answer from {self.host} within {timeout:.0f} s"
@@ -355,7 +363,8 @@ class Target:
         destination = f"{self.host}:{self.base}/releases/{release}/"
         try:
             result = subprocess.run(
-                ["rsync", "-a", "--mkpath", f"{folder}/", destination],
+                ["rsync", "-a", "--mkpath", "-e", shlex.join(SSH),
+                 f"{folder}/", destination],
                 capture_output=True, text=True, timeout=600)
         except subprocess.TimeoutExpired:
             raise ReleaseError("copying the release: no progress in 600 s")
@@ -484,6 +493,24 @@ def unit_differences(target: Target, release: str) -> list[str]:
     return differ
 
 
+def units_missing(target: Target) -> list[str]:
+    """The release's units that are not installed at all and that
+    `unit_differences` lets pass -- the backup and update timers on a
+    machine that never had them. `--install-units` installs them; a deploy
+    without it, and the lab PC's own installer, go ahead without them.
+    Asked in one go, so a link that fails is an error, not "missing"."""
+    optional = [installed for installed, source in target.units.items()
+                if not source.endswith(("web.service", ".rules"))]
+    if not optional:
+        return []
+    code, out = target.run("for f in " + " ".join(map(shlex.quote, optional))
+                           + '; do test -e "$f" || echo "$f"; done')
+    if code != 0:
+        raise ReleaseError(f"checking which units are installed: {out}")
+    absent = set(out.split())
+    return [installed for installed in optional if installed in absent]
+
+
 def _reload(target: Target) -> None:
     for command in ("systemctl daemon-reload", "udevadm control --reload-rules"):
         code, out = target.run(target.sudo + command)
@@ -566,6 +593,13 @@ def restore_units(target: Target, saved: str, old: list[str] = ()) -> list[str]:
             command = (f"{target.sudo}install -m 644 {_q(saved + '/' + name)} "
                        f"{shlex.quote(installed)}")
         else:
+            if name in TRIGGERED:
+                # Its timer or path, enabled with --now, may have started it
+                # already: the update check runs within minutes of install.
+                code, out = target.run(f"{target.sudo}systemctl stop {name}")
+                if code != 0:
+                    failed.append(f"stopping {name}: {out}")
+                    continue
             if name in (*ENABLED, f"{SERVICE}.service"):
                 code, out = target.run(f"{target.sudo}systemctl disable --now {name}")
                 if code != 0:
@@ -757,6 +791,14 @@ def deploy(args, log=print, target: Target | None = None,
         raise ReleaseError("the installed units are not the release's:\n  "
                            + "\n  ".join(differ)
                            + "\nreview them, then pass --install-units")
+    # A unit that is only missing used to pass unseen, --install-units or
+    # not: on 2026-10-28 the four updater units were never installed.
+    missing = units_missing(target)
+    if missing and args.install_units:
+        differ += [f"{installed} is not installed" for installed in missing]
+    elif missing:
+        log("Not installed, and left so (--install-units adds them): "
+            + ", ".join(Path(installed).name for installed in missing))
 
     # Minutes have passed -- a selftest, a backup: somebody may have
     # started a run meanwhile. Asked again, just before anything changes.

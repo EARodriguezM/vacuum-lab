@@ -97,7 +97,8 @@ def test_accounts() -> None:
                   code == 200 and ping.get("service") == "vacuum-lab"
                   and ping.get("auth") == {"enabled": True, "owner": False,
                                            "email_domain": "unal.edu.co",
-                                           "google_signin": False})
+                                           "google_signin": False,
+                                           "guests": False})
             check("the ping does not list the serial ports",
                   "devices" not in ping and bool(ping.get("build")))
             check("no session, no state", call("/api/state")[0] == 401)

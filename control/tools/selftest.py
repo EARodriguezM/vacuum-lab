@@ -50,7 +50,7 @@ SECTIONS = ("pump", "gauge", "cold_cathode", "analysis", "process", "equipment",
             "deposition", "database", "accounts", "history", "engine", "faults",
             "timing", "lifecycle", "authority", "security", "addresses",
             "discovery", "chambers", "observability", "backup", "release",
-            "update")
+            "update", "guests")
 
 #: Where a section's code lives, and how it is called: (module, function,
 #: which simulator ports it takes).
@@ -78,6 +78,7 @@ WHERE = {
     "backup": ("backup", "test_backup", ()),
     "release": ("release", "test_release", ()),
     "update": ("update", "test_update", ()),
+    "guests": ("guests", "test_guests", ()),
 }
 
 #: Module names whose constants a section may change and must not keep.

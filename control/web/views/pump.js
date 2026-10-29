@@ -12,6 +12,9 @@ import * as A from "../analysis.js";
 import * as fmt from "../format.js";
 import * as status from "../status.js";
 
+/** What a guest sees where a read of the drive would be. */
+const GUEST_NOTE = "Shown to people signed in: reading these asks the drive itself.";
+
 const NO_ERROR = new Set(["000000", "000", "0", ""]);
 
 /** Vent modes and backing-pump modes, as the drive unit numbers them. */
@@ -124,10 +127,11 @@ function InterlockNotes({ interlocks }) {
     </div>`;
 }
 
-function Accessories({ data, busy, onWrite, reload }) {
+function Accessories({ data, busy, onWrite, reload, note = null }) {
   const [draft, setDraft] = useState({});
 
   useEffect(() => { setDraft({}); }, [data]);
+  if (note) return html`<${Empty}>${note}<//>`;
   if (!data) return html`<${Empty}>Loading accessory settings…<//>`;
   if (!data.ok) return html`<${Banner} tone="crit">${data.error}<//>`;
 
@@ -251,7 +255,7 @@ const BKP_MODE_NAMES = { 0: "continuous", 1: "intermittent", 2: "delayed" };
 // `safeBusy` locks only Make safe, which every operator may press whoever
 // holds control; switching automatic recovery is an admin's (`canAdmin`).
 function FaultsCard({ pump, alarms, busy, safeBusy, canAdmin = true, onCommand,
-                      onSecure, notify, may }) {
+                      onSecure, notify, may, guest = false }) {
   const [diagnostics, setDiagnostics] = useState(null);
   const [loading, setLoading] = useState(false);
   const [showCodes, setShowCodes] = useState(false);
@@ -264,8 +268,9 @@ function FaultsCard({ pump, alarms, busy, safeBusy, canAdmin = true, onCommand,
       .finally(() => setLoading(false));
   };
   // Read again on a new fault code: the history is what it is about.
-  useEffect(() => { if (pump?.connected) load(); },
-            [pump?.connected, pump?.fault?.code]);
+  // Not for a guest: each read holds the pump's serial line (lab/api.py).
+  useEffect(() => { if (pump?.connected && !guest) load(); },
+            [pump?.connected, pump?.fault?.code, guest]);
 
   const fault = pump?.fault?.code ? pump.fault : null;
   const auto = alarms?.auto_recover;
@@ -522,13 +527,15 @@ function TemperaturePanel({ samples, pump }) {
 export function PumpView({ state, onCommand, onWriteParam, busy, safeBusy,
                            onShutdown, onSecure, notify, shutdown, onOverride, may }) {
   const pump = state?.devices?.pump;
+  // A guest gets the live readings, never a read of the drive itself.
+  const guest = state?.me?.kind === "guest";
   const [accessories, setAccessories] = useState(null);
   const [speed, setSpeed] = useState("");
 
   const reload = (fresh = false) => api.accessories("pump", fresh).then(setAccessories)
     .catch((error) => setAccessories({ ok: false, error: error.message }));
 
-  useEffect(() => { if (pump?.connected) reload(); }, [pump?.connected]);
+  useEffect(() => { if (pump?.connected && !guest) reload(); }, [pump?.connected, guest]);
 
   if (!pump) return html`<${Empty}>No pump is configured on this server.<//>`;
   if (!pump.connected) {
@@ -608,7 +615,7 @@ export function PumpView({ state, onCommand, onWriteParam, busy, safeBusy,
         <${InterlockNotes} interlocks=${interlocks} />
       <//>
 
-      <${FaultsCard} pump=${pump} alarms=${state?.alarms} busy=${busy}
+      <${FaultsCard} pump=${pump} alarms=${state?.alarms} busy=${busy} guest=${guest}
                      safeBusy=${safeBusy} canAdmin=${state?.me?.can?.admin !== false}
                      onCommand=${onCommand} onSecure=${onSecure} notify=${notify}
                      may=${may} />
@@ -671,7 +678,7 @@ export function PumpView({ state, onCommand, onWriteParam, busy, safeBusy,
       <${Card} title="Accessory connectors"
                actions=${html`<button class="small" onClick=${() => reload(true)}>Refresh</button>`}
                hint="Read on demand rather than in the status poll: fourteen extra round trips per refresh.">
-        <${Accessories} data=${accessories} busy=${busy} onWrite=${writeParam}
+        <${Accessories} note=${guest ? GUEST_NOTE : null} data=${accessories} busy=${busy} onWrite=${writeParam}
                         reload=${reload} />
       <//>
     </div>`;

@@ -1,4 +1,5 @@
-// Signing in, asking for an account, pairing a tablet -- and the two prompts
+// Signing in, asking for an account, pairing a tablet, watching as a guest
+// when an admin allows it -- and the two prompts
 // a signed-in person meets later: the password again after an idle spell,
 // and a new password after an admin reset the old one.
 //
@@ -9,7 +10,7 @@
 import { html } from "../html.js";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { Banner, useDialog } from "../ui.js";
-import { api, setDeviceSession, setPersonSession } from "../api.js";
+import { api, setDeviceSession, setGuestSession, setPersonSession } from "../api.js";
 
 const MODES = [
   { key: "signin", label: "Sign in" },
@@ -37,6 +38,7 @@ function SignIn({ onSignedIn }) {
     try {
       const result = await api.login(username.trim(), password);
       setPersonSession(result.token);
+      setGuestSession(null);          // a person now; never back to a guest
       onSignedIn(result.me);
     } catch (problem) {
       setError(problem.message);
@@ -243,6 +245,7 @@ function Pair({ onSignedIn }) {
     try {
       const result = await api.pair(code);
       setDeviceSession(result.token);
+      setGuestSession(null);
       onSignedIn(result.me);
     } catch (problem) {
       setError(problem.message);
@@ -272,6 +275,39 @@ function Pair({ onSignedIn }) {
 }
 
 /**
+ * Watching without an account: the server allows it only after an admin
+ * has (Settings -> People), and a guest can change nothing, hear no alarm
+ * and download nothing -- the server's rules, not this button's.
+ */
+function WatchAsGuest({ onSignedIn }) {
+  const [error, setError] = useState(null);
+  const [working, setWorking] = useState(false);
+
+  const watch = async () => {
+    setWorking(true);
+    setError(null);
+    try {
+      const result = await api.guest();
+      setGuestSession(result.token);
+      onSignedIn(result.me);
+    } catch (problem) {
+      setError(problem.message);
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  return html`
+    <div class="guest-option">
+      <button type="button" data-test="guest-watch" disabled=${working} onClick=${watch}>
+        ${working ? "Opening…" : "Watch as a guest"}</button>
+      <p class="hint">See the rig live without an account. A guest cannot
+        change anything or download data.</p>
+      ${error && html`<${Banner} tone="crit">${error}<//>`}
+    </div>`;
+}
+
+/**
  * The sign-in page. `onCancel` is offered on a paired tablet, which has a
  * live view to go back to.
  */
@@ -292,6 +328,9 @@ export function LoginView({ ping, onSignedIn, onCancel }) {
   // Pairing is for the lab's tablets: a personal phone signs in instead.
   const modes = onCancel ? MODES.filter((m) => m.key === "signin")
     : MODES.filter((m) => m.key !== "pair" || KIOSK);
+  // Watching as a guest, when an admin allows it -- never on a kiosk: a wall
+  // tablet is paired, and sounds its alarms, where a guest's screen is silent.
+  const offerGuest = !noOwner && !onCancel && !KIOSK && !!ping?.auth?.guests;
 
   return html`
     <div class="login">
@@ -317,6 +356,7 @@ export function LoginView({ ping, onSignedIn, onCancel }) {
         ${!noOwner && mode === "signup" && html`<${SignUp} domain=${ping?.auth?.email_domain || "unal.edu.co"}
                                                 google=${!!ping?.auth?.google_signin} />`}
         ${!noOwner && mode === "pair" && html`<${Pair} onSignedIn=${onSignedIn} />`}
+        ${offerGuest && html`<${WatchAsGuest} onSignedIn=${onSignedIn} />`}
         ${onCancel && html`
           <button class="ghost" type="button" onClick=${onCancel}>
             Back to watching</button>`}
