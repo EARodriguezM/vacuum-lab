@@ -74,8 +74,10 @@ INSTRUMENT = r"""
     const method = (init && init.method) || "GET";
     // The lab PC gone, on purpose: `ui.offline = true`. Not a failure.
     if (ui.offline && url.includes("/api/")) throw new TypeError("offline (uitest)");
-    // A command held in flight until `ui.release()`: `ui.hold = true`.
-    if (ui.hold && url.includes("/api/command")) {
+    // A command held in flight until `ui.release()`: `ui.hold = true`; any
+    // other request whose URL has `ui.holdPath` in it, the same way.
+    if ((ui.hold && url.includes("/api/command"))
+        || (ui.holdPath && url.includes(ui.holdPath))) {
       await new Promise((resolve) => { ui.release = resolve; });
     }
     try {
@@ -1284,8 +1286,32 @@ def part_guests(chrome, server, sessions, report, shots):
                  "sign-in page", again
                  and auth.guests_report()["watching"] >= 1)
 
+    # A rejoin that hangs: after two polls without news the page is greyed
+    # out, and comes back once the rejoin answers.
+    time.sleep(10.5)                  # a rejoin is tried at most every 10 s
+    page.js("window.__ui.holdPath = '/api/guest'")
+    with auth._lock:
+        auth._guests.clear()
+    veiled = page.wait(present_js % "lost-contact", timeout=20)
+    page.js("window.__ui.holdPath = null; window.__ui.release && window.__ui.release()")
+    cleared = page.wait(f"!{present_js % 'lost-contact'}"
+                        f" && {present_js % 'guest-signin'}", timeout=20)
+    report.check("a rejoin that hangs greys the page out, and it comes back "
+                 "when the rejoin answers", veiled and cleared,
+                 f"veiled {bool(veiled)}, back {bool(cleared)}")
+
+    # Sign in pressed just as the guest lapsed: the person still gets the
+    # sign-in page, not a guest's page again.
+    with auth._lock:
+        auth._guests.clear()
     click(page, "guest-signin")
     back = page.wait(present_js % "signin-submit", timeout=10)
+    time.sleep(3)
+    stayed = (page.js(present_js % "signin-submit")
+              and not page.js("JSON.parse(localStorage.getItem('vacuum-lab-session')"
+                              " || '{}').guest"))
+    report.check("Sign in on a guest that just lapsed reaches the sign-in page "
+                 "and stays there", back and stayed)
     report.check("Sign in from a guest's page ends the guest and offers "
                  "every choice, watching again among them",
                  back and page.js(present_js % "guest-watch"))

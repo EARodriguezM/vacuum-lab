@@ -485,6 +485,9 @@ function App() {
   // A guest who wants to sign in stops watching first: the sign-in page then
   // has every choice, "Watch as a guest" among them, to go back.
   const leaveGuest = useCallback(async () => {
+    // A session that lapses just now must not be joined again under the
+    // person on their way to signing in.
+    rejoin.current.at = Date.now();
     try { await api.logout(); } catch { /* it may already be gone */ }
     setGuestSession(null);
   }, []);

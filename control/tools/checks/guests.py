@@ -204,6 +204,71 @@ def test_guests() -> None:
                     "a stored curve, the live run, the history, the run list",
                     one_request_bounded)
 
+            def live_points_real():
+                # The engine's own decimation, not a stand-in: a negative
+                # `points` once meant "every row".
+                engine._samples = [{"t": float(i), "p1": 1e-5, "p2": None,
+                                    "speed": 1500.0, "power": 10.0}
+                                   for i in range(5000)]
+                try:
+                    got = {q: len(call(f"/api/live?{q}", token=guest)[1]
+                                  .get("samples") or [])
+                           for q in ("points=-1", "points=-100000",
+                                     "points=100000", "points=0")}
+                finally:
+                    engine._samples = []
+                return all(n <= 1500 for n in got.values()), str(got)
+            attempt("a negative or huge `points` gets a guest no more of the "
+                    "live run than the panel asks for", live_points_real)
+
+            def far_offset():
+                codes = {who: call("/api/runs?offset=10000000000000000000",
+                                   token=token)[0]
+                         for who, token in (("guest", guest), ("owner", owner))}
+                return all(code == 200 for code in codes.values()), str(codes)
+            attempt("an offset past SQLite's integers is an answer, never a "
+                    "dropped connection", far_offset)
+
+            def heavy_turns():
+                slot = application.guest_slot
+                taken = [slot.acquire(timeout=1)
+                         for _ in range(apimod.GUEST_HEAVY_AT_ONCE)]
+                waited = apimod.GUEST_HEAVY_WAIT_S
+                apimod.GUEST_HEAVY_WAIT_S = 0.2
+                try:
+                    as_guest = call(f"/api/runs/{long_run}/samples", token=guest)[0]
+                    as_owner = call(f"/api/runs/{long_run}/samples", token=owner)[0]
+                    light = call("/api/state", token=guest)[0]
+                finally:
+                    apimod.GUEST_HEAVY_WAIT_S = waited
+                    for held in taken:
+                        if held:
+                            slot.release()
+                return (all(taken) and as_guest == 429 and as_owner == 200
+                        and light == 200,
+                        f"guest {as_guest}, account {as_owner}, guest's state {light}")
+            attempt(f"at most {apimod.GUEST_HEAVY_AT_ONCE} heavy guest requests at "
+                    "once: the next waits its turn, then 429 -- accounts and a "
+                    "guest's poll are not held to it", heavy_turns)
+
+            def curve_kept():
+                with application._guest_curves_lock:
+                    application._guest_curves.clear()
+                reads = []
+                real = database.samples
+                database.samples = lambda run_id: reads.append(run_id) or real(run_id)
+                try:
+                    sizes = [len(call(f"/api/runs/{long_run}/samples?max={m}",
+                                      token=guest)[1].get("samples") or [])
+                             for m in (1500, 3000, 2000)]
+                finally:
+                    database.samples = real
+                return (len(reads) == 1 and len(set(sizes)) == 1
+                        and 0 < sizes[0] <= apimod.GUEST_SAMPLES,
+                        f"{len(reads)} reads of the store; sizes {sizes}")
+            attempt("a stored curve is read once for every guest asking, at one "
+                    "size whatever they ask", curve_kept)
+
             def huge_id():
                 digits = "9" * 5000
                 as_guest = call(f"/api/runs/{digits}", token=guest)[0]
