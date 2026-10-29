@@ -22,6 +22,7 @@ the API publishes its `fields` and the UI builds the form from them.
 
 from __future__ import annotations
 
+import bisect
 import itertools
 import math
 import queue
@@ -3439,14 +3440,13 @@ class RunEngine:
     def samples_since(self, t: float) -> list[dict]:
         """The run's samples after run time `t`, oldest first.
 
-        Walks back from the end: a panel polling every couple of seconds is
-        one or two rows behind, so this touches a handful of rows whatever
-        the length of the run.
+        A binary search on `t`, which only ever grows: a panel polling every
+        couple of seconds is one or two rows behind, but one asking from the
+        start (`t` -1, as a panel holding nothing does) must not cost a walk
+        over a week-long run.
         """
         samples = self._samples
-        start = len(samples)
-        while start > 0 and (samples[start - 1].get("t") or 0) > t:
-            start -= 1
+        start = bisect.bisect_right(samples, t, key=lambda s: s.get("t") or 0)
         return samples[start:]
 
     def run_samples(self, points: int = 1500) -> list[dict]:

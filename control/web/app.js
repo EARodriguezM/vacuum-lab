@@ -389,8 +389,9 @@ function App() {
   // A safety action waiting for the password: it goes ahead once typed.
   const afterReauth = useRef(null);
   // A guest whose session lapsed joins again by itself -- at most every
-  // 10 s, so a refusal ends at the sign-in page instead of a loop.
-  const rejoin = useRef({ at: 0, busy: false });
+  // 10 s, so a refusal ends at the sign-in page instead of a loop. `turn`
+  // grows when the person leaves: a rejoin still under way then does nothing.
+  const rejoin = useRef({ at: 0, busy: false, turn: 0 });
   // Whether the tab strip has more to the right than fits (phones).
   const tabsRef = useRef(null);
   const [tabsMore, setTabsMore] = useState(false);
@@ -440,15 +441,18 @@ function App() {
     if (reason === "guest-ended") {
       const now = Date.now();
       if (!rejoin.current.busy && now - rejoin.current.at > 10000) {
-        rejoin.current = { at: now, busy: true };
+        const turn = rejoin.current.turn;
+        rejoin.current = { at: now, busy: true, turn };
+        const mine = () => rejoin.current.turn === turn;
         api.guest()
-          .then((result) => setGuestSession(result.token))
+          .then((result) => { if (mine()) setGuestSession(result.token); })
           .catch(() => {
+            if (!mine()) return;
             setHeld({ ...sessionTokens() });
             setNeedLogin(true);
             setState(null);
           })
-          .finally(() => { rejoin.current.busy = false; });
+          .finally(() => { if (mine()) rejoin.current.busy = false; });
         return;
       }
     }
@@ -486,8 +490,8 @@ function App() {
   // has every choice, "Watch as a guest" among them, to go back.
   const leaveGuest = useCallback(async () => {
     // A session that lapses just now must not be joined again under the
-    // person on their way to signing in.
-    rejoin.current.at = Date.now();
+    // person on their way to signing in -- nor one already being joined.
+    rejoin.current = { at: Date.now(), busy: false, turn: rejoin.current.turn + 1 };
     try { await api.logout(); } catch { /* it may already be gone */ }
     setGuestSession(null);
   }, []);

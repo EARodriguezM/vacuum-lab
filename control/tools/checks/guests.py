@@ -235,21 +235,51 @@ def test_guests() -> None:
                          for _ in range(apimod.GUEST_HEAVY_AT_ONCE)]
                 waited = apimod.GUEST_HEAVY_WAIT_S
                 apimod.GUEST_HEAVY_WAIT_S = 0.2
+                heavy = [f"/api/runs/{long_run}/samples", f"/api/runs/{long_run}",
+                         f"/api/runs/{long_run}/events", "/api/runs?limit=5",
+                         "/api/trends", "/api/live?points=10"]
                 try:
-                    as_guest = call(f"/api/runs/{long_run}/samples", token=guest)[0]
-                    as_owner = call(f"/api/runs/{long_run}/samples", token=owner)[0]
+                    as_guest = {r: call(r, token=guest) for r in heavy}
+                    as_owner = {r: call(r, token=owner)[0] for r in heavy}
                     light = call("/api/state", token=guest)[0]
                 finally:
                     apimod.GUEST_HEAVY_WAIT_S = waited
                     for held in taken:
                         if held:
                             slot.release()
-                return (all(taken) and as_guest == 429 and as_owner == 200
+                turned = [r for r, (code, body) in as_guest.items()
+                          if code == 429 and "busy with other guests"
+                          in body.get("error", "")]
+                return (all(taken) and turned == heavy
+                        and all(c == 200 for c in as_owner.values())
                         and light == 200,
-                        f"guest {as_guest}, account {as_owner}, guest's state {light}")
+                        f"turned away {len(turned)}/{len(heavy)}; accounts "
+                        f"{set(as_owner.values())}; guest's state {light}")
             attempt(f"at most {apimod.GUEST_HEAVY_AT_ONCE} heavy guest requests at "
                     "once: the next waits its turn, then 429 -- accounts and a "
                     "guest's poll are not held to it", heavy_turns)
+
+            def slot_given_back():
+                kept = application.guest_curve
+
+                def broken(run_id):
+                    raise RuntimeError("selftest")
+                application.guest_curve = broken
+                try:
+                    call(f"/api/runs/{long_run}/samples", token=guest)
+                except Exception:
+                    pass                      # the connection is dropped: fine
+                finally:
+                    application.guest_curve = kept
+                slot = application.guest_slot
+                free = [slot.acquire(timeout=0.5)
+                        for _ in range(apimod.GUEST_HEAVY_AT_ONCE)]
+                for held in free:
+                    if held:
+                        slot.release()
+                return all(free), f"free afterwards: {free}"
+            attempt("a guest request that fails gives its place back",
+                    slot_given_back)
 
             def curve_kept():
                 with application._guest_curves_lock:
@@ -263,11 +293,57 @@ def test_guests() -> None:
                              for m in (1500, 3000, 2000)]
                 finally:
                     database.samples = real
-                return (len(reads) == 1 and len(set(sizes)) == 1
-                        and 0 < sizes[0] <= apimod.GUEST_SAMPLES,
-                        f"{len(reads)} reads of the store; sizes {sizes}")
+                    database.add_sample(long_run, {"t": 5000.0, "at": 0.0,
+                                                   "p1": 2e-5})
+                    database.samples = (lambda run_id: reads.append(run_id)
+                                        or real(run_id))
+                    try:
+                        after = call(f"/api/runs/{long_run}/samples",
+                                     token=guest)[1].get("total")
+                    finally:
+                        database.samples = real
+                return (len(reads) == 2 and len(set(sizes)) == 1
+                        and 0 < sizes[0] <= apimod.GUEST_SAMPLES
+                        and after == 5001,
+                        f"{len(reads)} reads of the store; sizes {sizes}; "
+                        f"after a new sample, total {after}")
             attempt("a stored curve is read once for every guest asking, at one "
                     "size whatever they ask", curve_kept)
+
+            def since_searched():
+                # Searched, not walked: asked "since the start" over a long
+                # run, the answer is the same and costs a handful of steps.
+                samples = [{"t": float(i)} for i in range(200000)]
+                engine._samples = samples
+                try:
+                    same = all(
+                        engine.samples_since(x) == [s for s in samples if s["t"] > x]
+                        for x in (-1.0, 0.0, 0.5, 199998.0, 199999.0, 1e9))
+                    reads = []
+
+                    class Counted(list):
+                        def __getitem__(self, index):
+                            reads.append(index)
+                            return list.__getitem__(self, index)
+                    engine._samples = Counted(samples)
+                    engine.samples_since(-1.0)
+                    guest_rows = call("/api/live?since=-1", token=guest)[1]
+                    rows = len(guest_rows.get("samples") or [])
+                finally:
+                    engine._samples = []
+                return (same and len(reads) < 64 and rows == 600,
+                        f"same {same}; {len(reads)} rows looked at; guest got {rows}")
+            attempt("the live run since a time is found by searching, not by "
+                    "walking a week of rows", since_searched)
+
+            def events_indexed():
+                with database._lock:
+                    plan = " ".join(str(tuple(row)) for row in database._db.execute(
+                        "EXPLAIN QUERY PLAN SELECT * FROM events ORDER BY at "
+                        "DESC LIMIT 200").fetchall())
+                return "events_by_at" in plan and "TEMP B-TREE" not in plan, plan
+            attempt("the rig's latest events come from an index, not a sort of "
+                    "every event kept", events_indexed)
 
             def huge_id():
                 digits = "9" * 5000

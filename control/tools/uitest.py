@@ -1300,18 +1300,23 @@ def part_guests(chrome, server, sessions, report, shots):
                  "when the rejoin answers", veiled and cleared,
                  f"veiled {bool(veiled)}, back {bool(cleared)}")
 
-    # Sign in pressed just as the guest lapsed: the person still gets the
-    # sign-in page, not a guest's page again.
+    # Sign in pressed while the page is joining again as a guest: the person
+    # gets the sign-in page, and the rejoin, when it answers, changes nothing.
+    time.sleep(10.5)                  # a rejoin is tried at most every 10 s
+    page.js("window.__ui.release = null; window.__ui.holdPath = '/api/guest'")
     with auth._lock:
         auth._guests.clear()
+    joining = page.wait("!!window.__ui.release", timeout=20)
     click(page, "guest-signin")
     back = page.wait(present_js % "signin-submit", timeout=10)
+    page.js("window.__ui.holdPath = null; window.__ui.release && window.__ui.release()")
     time.sleep(3)
     stayed = (page.js(present_js % "signin-submit")
               and not page.js("JSON.parse(localStorage.getItem('vacuum-lab-session')"
                               " || '{}').guest"))
-    report.check("Sign in on a guest that just lapsed reaches the sign-in page "
-                 "and stays there", back and stayed)
+    report.check("Sign in pressed while the page joins again as a guest reaches "
+                 "the sign-in page and stays there", joining and back and stayed,
+                 f"joining {bool(joining)}, sign-in {bool(back)}, stayed {bool(stayed)}")
     report.check("Sign in from a guest's page ends the guest and offers "
                  "every choice, watching again among them",
                  back and page.js(present_js % "guest-watch"))

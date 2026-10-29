@@ -1607,8 +1607,8 @@ class Handler(BaseHTTPRequestHandler):
         view = parts[3] if len(parts) > 3 else ""
 
         if not view:
-            self._json({"ok": True, "run": run,
-                        "sample_count": self.app.db.sample_count(run_id)})
+            self._heavy(lambda: {"ok": True, "run": run,
+                                 "sample_count": self.app.db.sample_count(run_id)})
         elif view == "samples" and self._who().kind == "guest":
             # A guest's curve is always the same size, and kept (guest_curve).
             self._heavy(lambda: self.app.guest_curve(run_id))
