@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: "Vacuum Lab: control software for thin-film vacuum chambers"
+abstract: "Native Linux control and automation software for a magnetron sputter deposition rig. It drives a Pfeiffer TC 600 turbopump and a TPG 252 A gauge controller over serial, runs deposition recipes with safety interlocks, records every run in a database, serves a web control panel and turns an Android tablet into the lab's locked-down touch display."
+authors:
+  - family-names: "Rodríguez Meléndez"
+    given-names: "Esteban Andrés"
+    affiliation: "Universidad Nacional de Colombia, Sede de La Paz"
+repository-code: "https://github.com/EARodriguezM/vacuum-lab"
+version: "v2026.10.31"
+date-released: "2026-10-31"
+keywords:
+  - "laboratory automation"
+  - "vacuum chamber"
+  - "magnetron sputtering"
+  - "thin films"
+  - "materials science"
+  - "Pfeiffer"
+  - "Python"
